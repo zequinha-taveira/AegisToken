@@ -1,8 +1,9 @@
 # Builds the Universal RP2350 Firmware in release mode and converts it to UF2.
 #
 # Usage:  powershell -File scripts/build-uf2.ps1 [-Board rp2350a|rp2350b|rp2354a|rp2354b]
-# Output: <board>-universal.uf2 (repository root; the RP2350A target keeps the
-#         historical rp2350-universal.uf2 name)
+# Output: AegisToken_<product>-<version>.uf2 (repository root), where <version>
+#         is the workspace version from Cargo.toml and the RP2350A target uses
+#         the `pico2` codename (e.g. AegisToken_pico2-0.1.0.uf2).
 #
 # RP2354A/B share the RP2350A/B die and package and add 2 MiB in-package flash.
 # For a production image, set AEGIS_UPDATE_VENDOR_PUBKEY to the release key
@@ -17,7 +18,17 @@ param(
 $target = "thumbv8m.main-none-eabihf"
 $bin = "firmware-universal-rp2350"
 $elf = "target/$target/release/$bin"
-$out = if ($Board -eq "rp2350a") { "rp2350-universal.uf2" } else { "$Board-universal.uf2" }
+
+# Read the workspace version from the root Cargo.toml.
+$manifest = Join-Path $PSScriptRoot "..\Cargo.toml"
+$match = Select-String -LiteralPath $manifest -Pattern '^version\s*=\s*"([^"]+)"' |
+    Select-Object -First 1
+if (-not $match) { throw "could not read version from $manifest" }
+$version = $match.Matches[0].Groups[1].Value
+
+# RP2350A maps to the Pico 2 product codename; other boards keep the board name.
+$product = if ($Board -eq "rp2350a") { "pico2" } else { $Board }
+$out = "AegisToken_$product-$version.uf2"
 
 if (-not $env:AEGIS_UPDATE_VENDOR_PUBKEY) {
     Write-Warning ("AEGIS_UPDATE_VENDOR_PUBKEY is not set: this image embeds a " +
