@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host:
+    name: host (aegis-core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install target and components
+        run: |
+          rustup target add thumbv8m.main-none-eabihf
+          rustup component add rustfmt clippy
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy -p aegis-core --all-targets -- -D warnings
+      - name: Test
+        run: cargo test -p aegis-core
+
+  host-tool:
+    name: host tool (aegistoken-host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install components
+        run: rustup component add clippy
+      - name: Clippy
+        run: cargo clippy -p aegistoken-host --all-targets -- -D warnings
+      - name: Test
+        run: cargo test -p aegistoken-host
+
+  firmware:
+    name: firmware (${{ matrix.board }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        board: [rp2350a, rp2350b, rp2354a, rp2354b]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install target
+        run: rustup target add thumbv8m.main-none-eabihf
+      - name: Build firmware
+        run: >-
+          cargo build -p firmware-universal-rp2350
+          --no-default-features --features ${{ matrix.board }}
+          --target thumbv8m.main-none-eabihf --release

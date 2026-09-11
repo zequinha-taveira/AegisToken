@@ -1,0 +1,41 @@
+[package]
+name = "firmware-universal-rp2350"
+description = "AegisToken Universal RP2350 Firmware"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "firmware-universal-rp2350"
+path = "src/main.rs"
+
+[features]
+# Board target selection; exactly one applies. Non-default targets require
+# `--no-default-features` because Cargo features are additive.
+default = ["rp2350a"]
+# RP2350A/B (QFN-60/80, external QSPI flash).
+rp2350a = ["board-generic-rp2350/rp235xa"]
+rp2350b = ["board-generic-rp2350/rp235xb"]
+# RP2354A/B (QFN-60/80, 2 MiB in-package flash).
+rp2354a = ["board-generic-rp2350/rp2354a"]
+rp2354b = ["board-generic-rp2350/rp2354b"]
+# Enable destructive on-target storage checks in the self-test.
+selftest = []
+
+[dependencies]
+aegis-core.workspace = true
+minicbor.workspace = true
+heapless.workspace = true
+# Default features off: the firmware feature selects exactly one chip target.
+board-generic-rp2350 = { workspace = true, default-features = false }
+embassy-executor.workspace = true
+embassy-time.workspace = true
+embassy-futures.workspace = true
+embassy-sync.workspace = true
+embassy-usb.workspace = true
+cortex-m.workspace = true
+cortex-m-rt.workspace = true
+panic-probe.workspace = true
+defmt.workspace = true
+defmt-rtt.workspace = true

@@ -1,0 +1,28 @@
+[package]
+name = "board-generic-rp2350"
+description = "Board-agnostic hardware abstraction for the RP2350 family"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["rp235xa"]
+# RP2350A: QFN-60, 30 GPIO, external QSPI flash.
+rp235xa = ["embassy-rp/rp235xa"]
+# RP2350B: QFN-80, 48 GPIO, external QSPI flash.
+rp235xb = ["embassy-rp/rp235xb"]
+# RP2354A / RP2354B: same die and package as RP2350A/B with 2 MiB in-package
+# flash. embassy-rp selects the chip by die, not by flash kind, so the RP2354
+# variants alias the RP2350 chip features. Use a [`BoardProfile`] with
+# `Rp2350Family::Rp2354` to advertise the in-package flash capability.
+rp2354a = ["rp235xa"]
+rp2354b = ["rp235xb"]
+
+[dependencies]
+aegis-core.workspace = true
+critical-section.workspace = true
+embassy-rp.workspace = true
+embassy-time.workspace = true
+embassy-usb.workspace = true
+static_cell.workspace = true

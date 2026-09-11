@@ -1,0 +1,10 @@
+# AegisToken HID access without root (hidraw).
+#
+# Install:
+#   sudo cp scripts/99-aegistoken.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Replace GROUP="plugdev" with a group your user belongs to if needed
+# (some distributions use "uaccess" only).
+
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="0001", MODE="0660", GROUP="plugdev", TAG+="uaccess"

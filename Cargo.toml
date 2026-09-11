@@ -1,0 +1,70 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/aegis-core",
+    "crates/aegistoken-host",
+    "crates/board-generic-rp2350",
+    "crates/firmware-universal-rp2350",
+]
+# Only the host-testable core is built by default so `cargo test` / `cargo build`
+# work on the host without an embedded target. Embedded crates are built
+# explicitly with `--target thumbv8m.main-none-eabihf` (see .cargo aliases).
+default-members = ["crates/aegis-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["AegisToken"]
+
+[workspace.dependencies]
+aegis-core = { path = "crates/aegis-core" }
+# Default features off: consumers must pick exactly one chip target
+# (`rp235xa`/`rp235xb`, or the `rp2354a`/`rp2354b` aliases).
+board-generic-rp2350 = { path = "crates/board-generic-rp2350", default-features = false }
+
+# Host-side USB access via libusb. `vendored` builds libusb from source, so no
+# system library or WinUSB/Zadig driver is required (Windows uses libusb's HID
+# backend, which talks to the device through the inbox HID driver).
+rusb = { version = "0.9", default-features = false, features = ["vendored"] }
+
+# Host-testable core dependencies (no_std, no alloc).
+minicbor = { version = "2.3", default-features = false, features = ["derive"] }
+heapless = { version = "0.9", default-features = false }
+zeroize = { version = "1.9", default-features = false }
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false, features = ["block-padding"] }
+hmac = { version = "0.12", default-features = false }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "ecdh"] }
+sha2 = { version = "0.10", default-features = false }
+
+# Embedded dependencies.
+embassy-executor = { version = "0.10", features = ["defmt"] }
+embassy-time = { version = "0.5", features = ["defmt"] }
+embassy-futures = "0.1"
+embassy-sync = { version = "0.8", features = ["defmt"] }
+embassy-usb = { version = "0.6", features = ["defmt"] }
+embassy-rp = { version = "0.10", features = [
+    "defmt",
+    "unstable-pac",
+    "time-driver",
+    "critical-section-impl",
+    "binary-info",
+    "executor-thread",
+    "executor-interrupt",
+] }
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+critical-section = "1.2"
+panic-probe = { version = "1", features = ["print-defmt"] }
+static_cell = "2"
+defmt = "1"
+defmt-rtt = "1"
+
+[profile.release]
+debug = true
+lto = true
+opt-level = "s"
+codegen-units = 1

@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+__pycache__/
+*.pyc
+*.uf2
+*.elf
+*.bin
+.embuild
+# Secrets: never commit keys or certificates.
+*.pem
+*.key
+*.p12
+*.pfx
+update-vendor-key.pem

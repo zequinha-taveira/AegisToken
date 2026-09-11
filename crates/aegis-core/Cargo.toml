@@ -1,0 +1,20 @@
+[package]
+name = "aegis-core"
+description = "Hardware-agnostic core logic for the AegisToken Universal RP2350 Firmware"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+minicbor.workspace = true
+heapless.workspace = true
+aes.workspace = true
+cbc.workspace = true
+hmac.workspace = true
+aes-gcm.workspace = true
+p256.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+hex-literal = "1"

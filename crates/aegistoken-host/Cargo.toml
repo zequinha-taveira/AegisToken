@@ -1,0 +1,12 @@
+[package]
+name = "aegistoken-host"
+description = "Host-side CLI for the AegisToken device over libusb (Management HID)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aegis-core.workspace = true
+minicbor.workspace = true
+rusb.workspace = true

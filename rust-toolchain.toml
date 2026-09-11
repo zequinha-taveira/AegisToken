@@ -1,0 +1,6 @@
+[toolchain]
+# Bare version pin resolves to the default host triple, keeping the repo
+# portable across Windows/Linux/macOS while fixing the compiler version.
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+targets = ["thumbv8m.main-none-eabihf"]
