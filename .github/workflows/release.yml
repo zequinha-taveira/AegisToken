@@ -1,0 +1,62 @@
+name: release
+
+# Build the firmware with scripts/build-uf2.ps1 and publish the UF2 artifacts as
+# a GitHub release. Triggered by pushing a `v*` tag; tags containing a hyphen
+# (e.g. v0.2.0-rc1) are published as pre-releases. To embed the release update
+# key, set the repository secret AEGIS_UPDATE_VENDOR_PUBKEY (65-byte SEC1 P-256
+# hex, from scripts/gen-update-key.py); otherwise a development key is embedded.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add thumbv8m.main-none-eabihf
+
+      - name: Build picotool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libusb-1.0-0-dev
+          git clone --branch 2.3.0 --depth 1 \
+            https://github.com/raspberrypi/picotool.git "$RUNNER_TEMP/picotool"
+          git clone --branch 2.3.0 --depth 1 \
+            --recurse-submodules --shallow-submodules \
+            https://github.com/raspberrypi/pico-sdk.git "$RUNNER_TEMP/pico-sdk"
+          cmake -S "$RUNNER_TEMP/picotool" -B "$RUNNER_TEMP/picotool/build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPICO_SDK_PATH="$RUNNER_TEMP/pico-sdk"
+          cmake --build "$RUNNER_TEMP/picotool/build" --parallel "$(nproc)"
+          sudo cmake --install "$RUNNER_TEMP/picotool/build"
+          picotool version
+
+      - name: Build UF2 artifacts
+        env:
+          AEGIS_UPDATE_VENDOR_PUBKEY: ${{ secrets.AEGIS_UPDATE_VENDOR_PUBKEY }}
+        run: |
+          for board in rp2350a rp2350b rp2354a rp2354b; do
+            echo "::group::$board"
+            pwsh -NoProfile -File scripts/build-uf2.ps1 -Board "$board"
+            echo "::endgroup::"
+          done
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=(--title "AegisToken ${GITHUB_REF_NAME}" --generate-notes)
+          case "${GITHUB_REF_NAME}" in *-*) args+=(--prerelease);; esac
+          gh release create "${GITHUB_REF_NAME}" "${args[@]}" AegisToken_*.uf2
