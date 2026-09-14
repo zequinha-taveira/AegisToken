@@ -361,8 +361,7 @@ mod tests {
     fn verify(private_key: &[u8; 32], message: &[u8], der: &[u8]) -> bool {
         use p256::ecdsa::signature::Verifier;
         use p256::ecdsa::{Signature, SigningKey};
-        let signing_key =
-            SigningKey::from_bytes(p256::FieldBytes::from_slice(private_key)).unwrap();
+        let signing_key = SigningKey::from_slice(private_key).unwrap();
         let signature = Signature::from_der(der).unwrap();
         signing_key
             .verifying_key()

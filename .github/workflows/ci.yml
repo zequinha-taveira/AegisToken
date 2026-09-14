@@ -14,7 +14,7 @@ jobs:
     name: host (aegis-core)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install target and components
         run: |
           rustup target add thumbv8m.main-none-eabihf
@@ -30,7 +30,7 @@ jobs:
     name: host tool (aegistoken-host)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install components
         run: rustup component add clippy
       - name: Clippy
@@ -45,7 +45,7 @@ jobs:
       matrix:
         board: [rp2350a, rp2350b, rp2354a, rp2354b]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install target
         run: rustup target add thumbv8m.main-none-eabihf
       - name: Build firmware
