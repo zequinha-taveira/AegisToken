@@ -44,17 +44,25 @@ O dispositivo compõe três funções HID, com separação lógica estrita:
 
 ## Arquitetura
 
-Workspace Cargo com quatro crates:
+Workspace Cargo com dez crates:
 
 | Crate | Papel |
 |-------|-------|
+| [`crates/security-key-core`](crates/security-key-core) | Scaffold para o domínio portátil de autenticação, credenciais, chaves, presença e estado. |
+| [`crates/security-key-crypto`](crates/security-key-crypto) | Scaffold para as primitivas e traits criptográficos. |
+| [`crates/security-key-storage`](crates/security-key-storage) | Scaffold para as abstrações e implementações de storage. |
+| [`crates/security-key-ctap`](crates/security-key-ctap) | Scaffold para CTAP2, CTAPHID, CBOR e U2F. |
+| [`crates/security-key-usb`](crates/security-key-usb) | Scaffold para os transportes USB HID, FIDO e Management. |
+| [`crates/security-key-hal`](crates/security-key-hal) | Scaffold para as fronteiras de abstração de hardware. |
 | [`crates/aegis-core`](crates/aegis-core) | Domínio portátil `no_std`/`no_alloc`, testável em host (máquinas de estado, protocolos, cripto, storage). |
 | [`crates/board-generic-rp2350`](crates/board-generic-rp2350) | Abstração de hardware da família RP2350 (GPIO, BOOTSEL, LED, flash, OTP, TRNG, USB). |
 | [`crates/firmware-universal-rp2350`](crates/firmware-universal-rp2350) | Binário `embassy-rp` que amarra tudo e implementa as tarefas USB. |
 | [`crates/aegistoken-host`](crates/aegistoken-host) | CLI de host em Rust sobre **libusb** para o Management HID. |
 
-O `aegis-core` não depende de HAL, executor ou placa — por isso roda e é testado
-no host. A HAL fica isolada em `board-generic-rp2350`.
+Os seis crates `security-key-*` são apenas scaffolds nesta fase: nenhum código
+foi movido. O `aegis-core` continua sendo a fonte da implementação durante a
+migração, não depende de HAL, executor ou placa e por isso roda e é testado no
+host. A HAL atual permanece isolada em `board-generic-rp2350`.
 
 ## Pré-requisitos
 

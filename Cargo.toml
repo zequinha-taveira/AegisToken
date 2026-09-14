@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/security-key-core",
+    "crates/security-key-crypto",
+    "crates/security-key-storage",
+    "crates/security-key-ctap",
+    "crates/security-key-usb",
+    "crates/security-key-hal",
     "crates/aegis-core",
     "crates/aegistoken-host",
     "crates/board-generic-rp2350",

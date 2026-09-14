@@ -1,0 +1,7 @@
+[package]
+name = "security-key-core"
+description = "Portable security-key domain model and state boundaries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
