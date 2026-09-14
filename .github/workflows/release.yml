@@ -23,6 +23,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify tag points to main
+        run: |
+          git fetch --no-tags origin main
+          main_sha="$(git rev-parse FETCH_HEAD)"
+          if [ "$main_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::Release tags must point to the current main commit."
+            exit 1
+          fi
+
       - name: Install Rust target
         run: rustup target add thumbv8m.main-none-eabihf
 
