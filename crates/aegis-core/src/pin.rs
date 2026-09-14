@@ -334,8 +334,7 @@ fn shared_secret(private: &[u8; 32], platform: &Ec2KeyAgreement) -> Result<[u8; 
     sec1[33..65].copy_from_slice(&platform.y);
     let public = PublicKey::from_sec1_bytes(&sec1).map_err(|_| Ctap2Status::InvalidParameter)?;
     let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
-    let mut out = [0u8; 32];
-    out.copy_from_slice(shared.raw_secret_bytes());
+    let out: [u8; 32] = (*shared.raw_secret_bytes()).into();
     Ok(out)
 }
 
@@ -490,7 +489,7 @@ impl ClientPin {
             .set_pin_retries(DEFAULT_RETRIES)
             .map_err(|_| Ctap2Status::Other)?;
 
-        let mut token = [0u8; 32];
+        let mut token: [u8; 32] = Default::default();
         rng.fill_bytes(&mut token);
         self.pin_uv_auth_token = Some(token);
         let mut encrypted = [0u8; 48];
@@ -622,7 +621,7 @@ mod tests {
             .unwrap();
 
         // Decrypt the returned token.
-        let mut token = [0u8; 32];
+        let mut token: [u8; 32] = Default::default();
         let length = aes_cbc_decrypt(&shared, &response.token, &mut token).unwrap();
         assert_eq!(length, 32);
         assert_eq!(state.retries, DEFAULT_RETRIES);
