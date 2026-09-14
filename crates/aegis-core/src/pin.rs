@@ -6,7 +6,7 @@
 
 use cbc::cipher::block_padding::NoPadding;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use minicbor::Decode;
 use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::{PublicKey, SecretKey};
@@ -272,7 +272,8 @@ pub fn pin_hash(pin: &[u8]) -> [u8; 32] {
 }
 
 fn hmac_sha256(key: &[u8; 32], message: &[u8]) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message);
     let out = mac.finalize().into_bytes();
     let mut result = [0u8; 32];
