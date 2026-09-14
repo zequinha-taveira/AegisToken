@@ -1,0 +1,7 @@
+[package]
+name = "security-key-storage"
+description = "Storage boundaries for security-key implementations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true

@@ -1654,6 +1654,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "security-key-core"
+version = "0.1.0"
+
+[[package]]
+name = "security-key-crypto"
+version = "0.1.0"
+
+[[package]]
+name = "security-key-ctap"
+version = "0.1.0"
+
+[[package]]
+name = "security-key-hal"
+version = "0.1.0"
+
+[[package]]
+name = "security-key-storage"
+version = "0.1.0"
+
+[[package]]
+name = "security-key-usb"
+version = "0.1.0"
+
+[[package]]
 name = "semver"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
