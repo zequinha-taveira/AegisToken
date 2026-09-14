@@ -6,7 +6,6 @@
 //! [`CredentialStore`].
 
 use minicbor::encode::{Encoder, Write};
-use p256::FieldBytes;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use sha2::{Digest, Sha256};
@@ -333,7 +332,7 @@ fn generate_signing_key<R: Rng>(rng: &mut R) -> Result<SigningKey, Ctap2Status> 
     for _ in 0..16 {
         let mut bytes = [0u8; 32];
         rng.fill_bytes(&mut bytes);
-        if let Ok(key) = SigningKey::from_bytes(FieldBytes::from_slice(&bytes)) {
+        if let Ok(key) = SigningKey::from_slice(&bytes) {
             return Ok(key);
         }
     }
@@ -400,8 +399,7 @@ pub fn sign_message(
     private_key: &[u8; 32],
     message: &[u8],
 ) -> Result<heapless::Vec<u8, MAX_SIGNATURE>, Ctap2Status> {
-    let signing_key = SigningKey::from_bytes(FieldBytes::from_slice(private_key))
-        .map_err(|_| Ctap2Status::Other)?;
+    let signing_key = SigningKey::from_slice(private_key).map_err(|_| Ctap2Status::Other)?;
     let signature: Signature = signing_key.sign(message);
     let der = signature.to_der();
     heapless::Vec::from_slice(der.as_bytes()).map_err(|_| Ctap2Status::LimitExceeded)
@@ -445,7 +443,7 @@ pub fn make_credential<S: CredentialStore, R: Rng>(
         .map_err(|_| Ctap2Status::Other)?;
 
     let verifying_key = signing_key.verifying_key();
-    let point = verifying_key.to_encoded_point(false);
+    let point = verifying_key.to_sec1_point(false);
     let mut x = [0u8; 32];
     let mut y = [0u8; 32];
     x.copy_from_slice(point.x().ok_or(Ctap2Status::Other)?);
@@ -675,7 +673,7 @@ mod tests {
         client_data_hash: &[u8; 32],
         der: &[u8],
     ) -> bool {
-        let signing_key = SigningKey::from_bytes(FieldBytes::from_slice(private_key)).unwrap();
+        let signing_key = SigningKey::from_slice(private_key).unwrap();
         let verifying_key = signing_key.verifying_key();
         let signature = Signature::from_der(der).unwrap();
         let mut message = heapless::Vec::<u8, MAX_SIGNING_INPUT>::new();
