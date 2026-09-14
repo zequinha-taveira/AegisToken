@@ -8,8 +8,8 @@ use cbc::cipher::block_padding::NoPadding;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
 use minicbor::Decode;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
-use p256::{FieldBytes, PublicKey, SecretKey};
+use p256::elliptic_curve::sec1::ToSec1Point;
+use p256::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 
 use crate::authenticator::Rng;
@@ -318,7 +318,7 @@ fn generate_secret_key<R: Rng>(rng: &mut R) -> Result<SecretKey, Ctap2Status> {
     for _ in 0..16 {
         let mut bytes = [0u8; 32];
         rng.fill_bytes(&mut bytes);
-        if let Ok(key) = SecretKey::from_bytes(FieldBytes::from_slice(&bytes)) {
+        if let Ok(key) = SecretKey::from_slice(&bytes) {
             return Ok(key);
         }
     }
@@ -326,8 +326,7 @@ fn generate_secret_key<R: Rng>(rng: &mut R) -> Result<SecretKey, Ctap2Status> {
 }
 
 fn shared_secret(private: &[u8; 32], platform: &Ec2KeyAgreement) -> Result<[u8; 32], Ctap2Status> {
-    let secret =
-        SecretKey::from_bytes(FieldBytes::from_slice(private)).map_err(|_| Ctap2Status::Other)?;
+    let secret = SecretKey::from_slice(private).map_err(|_| Ctap2Status::Other)?;
     let mut sec1 = [0u8; 65];
     sec1[0] = 0x04;
     sec1[1..33].copy_from_slice(&platform.x);
@@ -385,7 +384,7 @@ impl ClientPin {
         rng: &mut R,
     ) -> Result<KeyAgreementResponse, Ctap2Status> {
         let secret = generate_secret_key(rng)?;
-        let point = secret.public_key().to_encoded_point(false);
+        let point = secret.public_key().to_sec1_point(false);
         let mut x = [0u8; 32];
         let mut y = [0u8; 32];
         x.copy_from_slice(point.x().ok_or(Ctap2Status::Other)?);
@@ -553,7 +552,7 @@ mod tests {
     impl Platform {
         fn new(rng: &mut TestRng) -> Self {
             let secret = generate_secret_key(rng).unwrap();
-            let point = secret.public_key().to_encoded_point(false);
+            let point = secret.public_key().to_sec1_point(false);
             let mut x = [0u8; 32];
             let mut y = [0u8; 32];
             x.copy_from_slice(point.x().unwrap());

@@ -349,13 +349,13 @@ mod tests {
     }
 
     fn signing_key() -> SigningKey {
-        SigningKey::from_bytes(p256::FieldBytes::from_slice(&[0x42; 32])).unwrap()
+        SigningKey::from_slice(&[0x42; 32]).unwrap()
     }
 
     fn vendor_public(vendor: &SigningKey) -> Vec<u8> {
         vendor
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec()
     }
@@ -432,7 +432,7 @@ mod tests {
     fn wrong_vendor_key_is_rejected() {
         let vendor = signing_key();
         let package = build_package(&vendor, 5, (1, 0, 0), b"image");
-        let other = SigningKey::from_bytes(p256::FieldBytes::from_slice(&[0x24; 32])).unwrap();
+        let other = SigningKey::from_slice(&[0x24; 32]).unwrap();
         assert_eq!(
             verify_package(&package, &vendor_public(&other), 0),
             Err(CoreError::FirmwareError)
