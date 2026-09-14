@@ -5,7 +5,7 @@
 //! state is provided by a [`PinState`] implementation (in-memory or sealed).
 
 use cbc::cipher::block_padding::NoPadding;
-use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use hmac::{Hmac, KeyInit, Mac};
 use minicbor::Decode;
 use p256::elliptic_curve::sec1::ToSec1Point;
@@ -293,7 +293,7 @@ fn aes_cbc_encrypt(
     let cipher =
         Aes256CbcEnc::new_from_slices(shared, &shared[..16]).map_err(|_| Ctap2Status::Other)?;
     let encrypted = cipher
-        .encrypt_padded_mut::<NoPadding>(&mut out[..plaintext.len()], plaintext.len())
+        .encrypt_padded::<NoPadding>(&mut out[..plaintext.len()], plaintext.len())
         .map_err(|_| Ctap2Status::Other)?;
     Ok(encrypted.len())
 }
@@ -310,7 +310,7 @@ fn aes_cbc_decrypt(
     let cipher =
         Aes256CbcDec::new_from_slices(shared, &shared[..16]).map_err(|_| Ctap2Status::Other)?;
     let decrypted = cipher
-        .decrypt_padded_mut::<NoPadding>(&mut out[..ciphertext.len()])
+        .decrypt_padded::<NoPadding>(&mut out[..ciphertext.len()])
         .map_err(|_| Ctap2Status::Other)?;
     Ok(decrypted.len())
 }
