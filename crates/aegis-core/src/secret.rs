@@ -48,7 +48,7 @@ impl AesGcmSealer {
         plaintext: &[u8],
         out: &mut [u8],
     ) -> Result<usize, CoreError> {
-        use aes_gcm::aead::AeadInPlace;
+        use aes_gcm::aead::AeadInOut;
         let sealed_len = plaintext.len() + TAG_LEN;
         if out.len() < sealed_len {
             return Err(CoreError::CryptoError);
@@ -56,10 +56,10 @@ impl AesGcmSealer {
         out[..plaintext.len()].copy_from_slice(plaintext);
         let tag = self
             .cipher
-            .encrypt_in_place_detached(
-                aes_gcm::Nonce::from_slice(nonce),
+            .encrypt_inout_detached(
+                &aes_gcm::Nonce::try_from(&nonce[..]).map_err(|_| CoreError::CryptoError)?,
                 AAD,
-                &mut out[..plaintext.len()],
+                (&mut out[..plaintext.len()]).into(),
             )
             .map_err(|_| CoreError::CryptoError)?;
         out[plaintext.len()..sealed_len].copy_from_slice(&tag);
@@ -73,7 +73,7 @@ impl AesGcmSealer {
         sealed: &[u8],
         out: &mut [u8],
     ) -> Result<usize, CoreError> {
-        use aes_gcm::aead::AeadInPlace;
+        use aes_gcm::aead::AeadInOut;
         if sealed.len() < TAG_LEN {
             return Err(CoreError::CryptoError);
         }
@@ -82,13 +82,14 @@ impl AesGcmSealer {
             return Err(CoreError::CryptoError);
         }
         out[..plaintext_len].copy_from_slice(&sealed[..plaintext_len]);
-        let tag = aes_gcm::Tag::from_slice(&sealed[plaintext_len..]);
+        let tag =
+            aes_gcm::Tag::try_from(&sealed[plaintext_len..]).map_err(|_| CoreError::CryptoError)?;
         self.cipher
-            .decrypt_in_place_detached(
-                aes_gcm::Nonce::from_slice(nonce),
+            .decrypt_inout_detached(
+                &aes_gcm::Nonce::try_from(&nonce[..]).map_err(|_| CoreError::CryptoError)?,
                 AAD,
-                &mut out[..plaintext_len],
-                tag,
+                (&mut out[..plaintext_len]).into(),
+                &tag,
             )
             .map_err(|_| CoreError::CryptoError)?;
         Ok(plaintext_len)
