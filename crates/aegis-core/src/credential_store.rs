@@ -173,8 +173,7 @@ impl<S: Storage> SealedCredentialStore<S> {
     fn flush(&mut self) -> Result<(), CoreError> {
         self.counter = self.counter.wrapping_add(1);
 
-        let mut nonce = [0u8; NONCE_LEN];
-        nonce[..8].copy_from_slice(&self.counter.to_le_bytes());
+        let nonce = self.counter.to_le_bytes();
 
         let mut plain = [0u8; MAX_SEALED_PLAIN];
         let plain_len = encode_db(
