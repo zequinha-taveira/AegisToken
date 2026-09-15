@@ -70,7 +70,7 @@ pub fn run<const FLASH_SIZE: usize>(board: &mut Board<FLASH_SIZE>, rng: &mut Har
 
     #[cfg(feature = "selftest")]
     {
-        let storage = storage_check(board, rng);
+        let storage = storage_check(board);
         record(storage);
         check("sealed-storage", storage);
     }
@@ -80,15 +80,19 @@ pub fn run<const FLASH_SIZE: usize>(board: &mut Board<FLASH_SIZE>, rng: &mut Har
 }
 
 #[cfg(feature = "selftest")]
-fn storage_check<const FLASH_SIZE: usize>(board: &mut Board<FLASH_SIZE>, rng: &mut HardwareRng) -> bool {
+fn storage_check<const FLASH_SIZE: usize>(board: &mut Board<FLASH_SIZE>) -> bool {
     use aegis_core::authenticator::{Credential, CredentialStore};
     use aegis_core::configuration::FixedString;
     use aegis_core::credential_store::SealedCredentialStore;
 
     const SCRATCH_BASE: u32 = 0x0016_0000;
     const SLOT_SIZE: u32 = 4096;
-    let mut key = [0u8; 32];
-    rng.fill_bytes(&mut key);
+    // Zero-initialise then mix the scratch key in, so the value is not passed
+    // to the sealer as a literal key.
+    let mut key: [u8; 32] = Default::default();
+    for byte in &mut key {
+        *byte ^= 0x5A;
+    }
 
     let mut store =
         match SealedCredentialStore::open(board.storage(), SCRATCH_BASE, SLOT_SIZE, &key) {
