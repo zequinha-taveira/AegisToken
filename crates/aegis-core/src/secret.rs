@@ -100,82 +100,95 @@ impl AesGcmSealer {
 mod tests {
     use super::*;
 
-    const KEY: [u8; KEY_LEN] = [0x42; KEY_LEN];
-    const NONCE: [u8; NONCE_LEN] = [0x11; NONCE_LEN];
+    fn test_key(seed: u8) -> [u8; KEY_LEN] {
+        core::array::from_fn(|i| seed ^ (i as u8))
+    }
+
+    fn test_nonce(seed: u8) -> [u8; NONCE_LEN] {
+        core::array::from_fn(|i| seed ^ (i as u8))
+    }
 
     #[test]
     fn seal_then_open_round_trips() {
-        let sealer = AesGcmSealer::new(&KEY).unwrap();
+        let sealer = AesGcmSealer::new(&test_key(0x42)).unwrap();
         let plaintext = b"private key material";
         let mut sealed = [0u8; 64];
-        let sealed_len = sealer.seal(&NONCE, plaintext, &mut sealed).unwrap();
+        let sealed_len = sealer
+            .seal(&test_nonce(0x11), plaintext, &mut sealed)
+            .unwrap();
         assert_eq!(sealed_len, plaintext.len() + TAG_LEN);
         assert_ne!(&sealed[..plaintext.len()], &plaintext[..]);
 
         let mut opened = [0u8; 64];
         let opened_len = sealer
-            .open(&NONCE, &sealed[..sealed_len], &mut opened)
+            .open(&test_nonce(0x11), &sealed[..sealed_len], &mut opened)
             .unwrap();
         assert_eq!(&opened[..opened_len], plaintext);
     }
 
     #[test]
     fn wrong_key_fails() {
-        let sealer = AesGcmSealer::new(&KEY).unwrap();
+        let sealer = AesGcmSealer::new(&test_key(0x42)).unwrap();
         let mut sealed = [0u8; 32];
-        let sealed_len = sealer.seal(&NONCE, b"secret", &mut sealed).unwrap();
+        let sealed_len = sealer
+            .seal(&test_nonce(0x11), b"secret", &mut sealed)
+            .unwrap();
 
-        let other = AesGcmSealer::new(&[0x43; KEY_LEN]).unwrap();
+        let other = AesGcmSealer::new(&test_key(0x43)).unwrap();
         let mut opened = [0u8; 32];
         assert_eq!(
-            other.open(&NONCE, &sealed[..sealed_len], &mut opened),
+            other.open(&test_nonce(0x11), &sealed[..sealed_len], &mut opened),
             Err(CoreError::CryptoError)
         );
     }
 
     #[test]
     fn tampered_ciphertext_fails() {
-        let sealer = AesGcmSealer::new(&KEY).unwrap();
+        let sealer = AesGcmSealer::new(&test_key(0x42)).unwrap();
         let mut sealed = [0u8; 32];
-        let sealed_len = sealer.seal(&NONCE, b"secret", &mut sealed).unwrap();
+        let sealed_len = sealer
+            .seal(&test_nonce(0x11), b"secret", &mut sealed)
+            .unwrap();
         sealed[0] ^= 0x01;
         let mut opened = [0u8; 32];
         assert_eq!(
-            sealer.open(&NONCE, &sealed[..sealed_len], &mut opened),
+            sealer.open(&test_nonce(0x11), &sealed[..sealed_len], &mut opened),
             Err(CoreError::CryptoError)
         );
     }
 
     #[test]
     fn tampered_tag_fails() {
-        let sealer = AesGcmSealer::new(&KEY).unwrap();
+        let sealer = AesGcmSealer::new(&test_key(0x42)).unwrap();
         let mut sealed = [0u8; 32];
-        let sealed_len = sealer.seal(&NONCE, b"secret", &mut sealed).unwrap();
+        let sealed_len = sealer
+            .seal(&test_nonce(0x11), b"secret", &mut sealed)
+            .unwrap();
         let last = sealed_len - 1;
         sealed[last] ^= 0x80;
         let mut opened = [0u8; 32];
         assert_eq!(
-            sealer.open(&NONCE, &sealed[..sealed_len], &mut opened),
+            sealer.open(&test_nonce(0x11), &sealed[..sealed_len], &mut opened),
             Err(CoreError::CryptoError)
         );
     }
 
     #[test]
     fn too_small_output_is_rejected() {
-        let sealer = AesGcmSealer::new(&KEY).unwrap();
+        let sealer = AesGcmSealer::new(&test_key(0x42)).unwrap();
         let mut sealed = [0u8; 4];
         assert_eq!(
-            sealer.seal(&NONCE, b"secret", &mut sealed),
+            sealer.seal(&test_nonce(0x11), b"secret", &mut sealed),
             Err(CoreError::CryptoError)
         );
     }
 
     #[test]
     fn short_sealed_blob_is_rejected() {
-        let sealer = AesGcmSealer::new(&KEY).unwrap();
+        let sealer = AesGcmSealer::new(&test_key(0x42)).unwrap();
         let mut opened = [0u8; 32];
         assert_eq!(
-            sealer.open(&NONCE, &[0u8; 8], &mut opened),
+            sealer.open(&test_nonce(0x11), &[0u8; 8], &mut opened),
             Err(CoreError::CryptoError)
         );
     }
