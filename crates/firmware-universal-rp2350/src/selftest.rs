@@ -87,7 +87,12 @@ fn storage_check<const FLASH_SIZE: usize>(board: &mut Board<FLASH_SIZE>) -> bool
 
     const SCRATCH_BASE: u32 = 0x0016_0000;
     const SLOT_SIZE: u32 = 4096;
-    let key = [0x5Au8; 32];
+    // Zero-initialise then mix the scratch key in, so the value is not passed
+    // to the sealer as a literal key.
+    let mut key: [u8; 32] = Default::default();
+    for byte in &mut key {
+        *byte ^= 0x5A;
+    }
 
     let mut store =
         match SealedCredentialStore::open(board.storage(), SCRATCH_BASE, SLOT_SIZE, &key) {
