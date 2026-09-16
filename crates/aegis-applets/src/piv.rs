@@ -122,12 +122,10 @@ const DEFAULT_CCC: &[u8] = &[
 /// Key history with no retired keys.
 const KEY_HISTORY: &[u8] = &[0xC1, 0x01, 0x00, 0xC2, 0x01, 0x00, 0xC3, 0x01, 0x00];
 
-/// Default 3DES management key (`0102030405060708` repeated three times).
-fn default_mgmt_key() -> [u8; 24] {
+/// Generate a 3DES management key.
+fn default_mgmt_key(rng: &mut impl Rng) -> [u8; 24] {
     let mut key = [0u8; 24];
-    key[..8].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
-    key[8..16].copy_from_slice(&key[..8]);
-    key[16..24].copy_from_slice(&key[..8]);
+    rng.fill_bytes(&mut key);
     key
 }
 
@@ -1534,7 +1532,7 @@ mod tests {
         );
         assert_eq!(sw, Sw::OK);
         let encrypted = find_in_7c(&data, 0x81).expect("challenge present");
-        let mgmt_key = default_mgmt_key();
+        let mgmt_key = default_mgmt_key(rng);
         let nonce = tdes_ecb_decrypt(&mgmt_key, encrypted);
         let mut body = HeaplessVec::<u8, 32>::new();
         body.extend_from_slice(&[0x7C, 0x0A, 0x82, 0x08]).unwrap();
