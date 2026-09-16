@@ -325,13 +325,16 @@ struct MgmtKey {
 }
 
 impl MgmtKey {
-    fn random(rng: &mut dyn Rng) -> Self {
+    const fn default_key() -> Self {
         let mut key = [0u8; 32];
-        let len = DEFAULT_MGMT_KEY.len();
-        rng.fill_bytes(&mut key[..len]);
+        let mut index = 0;
+        while index < DEFAULT_MGMT_KEY.len() {
+            key[index] = DEFAULT_MGMT_KEY[index];
+            index += 1;
+        }
         Self {
             algorithm: ALG_TDES,
-            len,
+            len: DEFAULT_MGMT_KEY.len(),
             key,
         }
     }
@@ -424,14 +427,14 @@ pub struct Piv<S: PivStore> {
 impl<S: PivStore> Piv<S> {
     /// Create the applet over `store`.
     #[must_use]
-    pub fn new(store: S, rng: &mut dyn Rng) -> Self {
+    pub const fn new(store: S) -> Self {
         Self {
             store,
             value: Vec::new(),
             out: Vec::new(),
             pin: PinSlot::new(PIV_PIN_POLICY),
             puk: PinSlot::new(PIV_PIN_POLICY),
-            mgmt: MgmtKey::random(rng),
+            mgmt: MgmtKey::default_key(),
             pin_verified: false,
             mgmt_authenticated: false,
             witness: None,
@@ -1377,9 +1380,20 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     core::hint::black_box(diff) == 0
 }
 
-/// Single-block encryption using AES (legacy 3DES path removed).
+/// Single-block Triple-DES ECB encryption.
 fn tdes_ecb_encrypt(key: &[u8], block: &mut [u8]) -> bool {
-    aes_ecb_encrypt(key, block)
+    use des::cipher::generic_array::GenericArray;
+    use des::cipher::{BlockEncrypt, KeyInit};
+    if key.len() != 24 || block.len() != 8 {
+        return false;
+    }
+    let Ok(cipher) = des::TdesEde3::new_from_slice(key) else {
+        return false;
+    };
+    let mut buffer = GenericArray::clone_from_slice(block);
+    cipher.encrypt_block(&mut buffer);
+    block.copy_from_slice(&buffer);
+    true
 }
 
 /// Single-block AES ECB encryption (CBC with a zero IV over one block).
@@ -1505,7 +1519,27 @@ mod tests {
 
     /// Authenticate the management key with the default 3DES key.
     fn authenticate_management(piv: &mut Piv<MemoryPivStore>, rng: &mut TestRng) {
-        let (_, sw) = verify_management_default(piv, rng);
+        let (data, sw) = run(
+            piv,
+            rng,
+            &command(
+                INS_GENERAL_AUTHENTICATE,
+                ALG_TDES,
+                REF_MANAGEMENT,
+                &[0x7C, 0x02, 0x81, 0x00],
+            ),
+        );
+        assert_eq!(sw, Sw::OK);
+        let encrypted = find_in_7c(&data, 0x81).expect("challenge present");
+        let nonce = tdes_ecb_decrypt(&DEFAULT_MGMT_KEY, encrypted);
+        let mut body = HeaplessVec::<u8, 32>::new();
+        body.extend_from_slice(&[0x7C, 0x0A, 0x82, 0x08]).unwrap();
+        body.extend_from_slice(&nonce).unwrap();
+        let (_, sw) = run(
+            piv,
+            rng,
+            &command(INS_GENERAL_AUTHENTICATE, ALG_TDES, REF_MANAGEMENT, &body),
+        );
         assert_eq!(sw, Sw::OK, "management key authentication");
     }
 
@@ -1531,6 +1565,16 @@ mod tests {
         )
     }
 
+    fn tdes_ecb_decrypt(key: &[u8], block: &[u8]) -> [u8; 8] {
+        use des::cipher::generic_array::GenericArray;
+        use des::cipher::{BlockDecrypt, KeyInit};
+        let cipher = des::TdesEde3::new_from_slice(key).unwrap();
+        let mut buffer = GenericArray::clone_from_slice(block);
+        cipher.decrypt_block(&mut buffer);
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&buffer);
+        out
+    }
 
     #[test]
     fn selecting_returns_fci_and_provisions_defaults() {

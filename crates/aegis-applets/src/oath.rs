@@ -1032,7 +1032,7 @@ mod tests {
             run(&mut oath, &mut rng, &frame(INS_LIST, 0, 0, &[])).1,
             Sw::SECURITY_STATUS_NOT_SATISFIED
         );
-        let response = hmac_digest(ALGORITHM_SHA1, key, &oath.auth_challenge).unwrap();
+        let response = hmac_digest(ALGORITHM_SHA1, &key, &oath.auth_challenge).unwrap();
         let new_challenge = b"87654321";
         let mut validate = Vec::<u8, 128>::new();
         append_tlv(&mut validate, TAG_RESPONSE, &response);
@@ -1041,7 +1041,7 @@ mod tests {
         assert_eq!(status, Sw::OK);
         assert_eq!(
             tlv::find(&data, TAG_RESPONSE),
-            Some(&hmac_digest(ALGORITHM_SHA1, key, new_challenge).unwrap()[..])
+            Some(&hmac_digest(ALGORITHM_SHA1, &key, new_challenge).unwrap()[..])
         );
         assert_eq!(
             run(&mut oath, &mut rng, &frame(INS_LIST, 0, 0, &[])).1,
