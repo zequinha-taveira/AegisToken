@@ -400,6 +400,10 @@ fn validate(device: &mut ManagementDevice) -> Result<ExitCode, String> {
 
         harness.check("AC-007 reject out-of-range GPIO", || {
             let mut invalid = config.clone();
+            // Force the LED on so the range check is reached even on a board
+            // whose default configuration disables the LED (e.g. a third-party
+            // carrier with no plain-GPIO status LED).
+            invalid.led.enabled = true;
             invalid.led.gpio = 99;
             let mut buffer = [0u8; codec::MAX_STORED_CONFIG_LEN];
             let length = invalid.encode(&mut buffer)?;

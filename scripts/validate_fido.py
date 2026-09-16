@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AegisToken — Phase 10 FIDO2 / U2F hardware validation.
+"""AegisToken — Phase 10/15 FIDO2 / U2F hardware validation.
 
 Run with an AegisToken device connected. Requires ``python-fido2``.
 
@@ -7,6 +7,8 @@ Run with an AegisToken device connected. Requires ``python-fido2``.
 
 When a check needs User Presence the script prints a prompt; press BOOTSEL
 within the 15 second presence timeout.
+
+Covers AC-002/AC-011/AC-013 (ES256) and AC-020 (Ed25519 `ed25519-sk` flows).
 
 Exit code is 0 when every check passes, 1 otherwise.
 """
@@ -85,6 +87,39 @@ def check_make_credential(device) -> bool:
         return False
 
 
+def check_make_credential_eddsa(device) -> bool:
+    print(">>> Press BOOTSEL within 15s to approve makeCredential (EdDSA)")
+    try:
+        attestation = Ctap2(device).make_credential(
+            hashlib.sha256(os.urandom(32)).digest(),
+            {"id": "example.com", "name": "Example"},
+            {"id": os.urandom(16), "name": "user@example.com"},
+            [{"type": "public-key", "alg": -8}],
+        )
+        key = attestation.auth_data.credential_data.public_key
+        alg = getattr(key, "ALGORITHM", None)
+        record("AC-020 makeCredential Ed25519 (UP)", alg == -8, f"fmt={attestation.fmt}")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        record("AC-020 makeCredential Ed25519 (UP)", False, str(exc))
+        return False
+
+
+def check_get_assertion_eddsa(device) -> None:
+    print(">>> Press BOOTSEL within 15s to approve getAssertion (EdDSA)")
+    try:
+        assertion = Ctap2(device).get_assertion(
+            "example.com", hashlib.sha256(os.urandom(32)).digest()
+        )
+        record(
+            "AC-020 getAssertion Ed25519 (UP)",
+            len(assertion.signature) == 64,
+            f"sig={len(assertion.signature)}B",
+        )
+    except Exception as exc:  # noqa: BLE001
+        record("AC-020 getAssertion Ed25519 (UP)", False, str(exc))
+
+
 def check_get_assertion(device) -> None:
     print(">>> Press BOOTSEL within 15s to approve getAssertion")
     try:
@@ -138,6 +173,8 @@ def main() -> int:
 
     if check_make_credential(device):
         check_get_assertion(device)
+    if check_make_credential_eddsa(device):
+        check_get_assertion_eddsa(device)
     check_client_pin(device)
 
     # AC-013: the FIDO protocol exposes no credential or key export operation.

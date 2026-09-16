@@ -5,11 +5,11 @@
 //! state is provided by a [`PinState`] implementation (in-memory or sealed).
 
 use cbc::cipher::block_padding::NoPadding;
-use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use hmac::{Hmac, Mac};
+use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
+use hmac::{Hmac, KeyInit, Mac};
 use minicbor::Decode;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
-use p256::{FieldBytes, PublicKey, SecretKey};
+use p256::elliptic_curve::sec1::ToSec1Point;
+use p256::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 
 use crate::authenticator::Rng;
@@ -272,7 +272,8 @@ pub fn pin_hash(pin: &[u8]) -> [u8; 32] {
 }
 
 fn hmac_sha256(key: &[u8; 32], message: &[u8]) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message);
     let out = mac.finalize().into_bytes();
     let mut result = [0u8; 32];
@@ -292,7 +293,7 @@ fn aes_cbc_encrypt(
     let cipher =
         Aes256CbcEnc::new_from_slices(shared, &shared[..16]).map_err(|_| Ctap2Status::Other)?;
     let encrypted = cipher
-        .encrypt_padded_mut::<NoPadding>(&mut out[..plaintext.len()], plaintext.len())
+        .encrypt_padded::<NoPadding>(&mut out[..plaintext.len()], plaintext.len())
         .map_err(|_| Ctap2Status::Other)?;
     Ok(encrypted.len())
 }
@@ -309,7 +310,7 @@ fn aes_cbc_decrypt(
     let cipher =
         Aes256CbcDec::new_from_slices(shared, &shared[..16]).map_err(|_| Ctap2Status::Other)?;
     let decrypted = cipher
-        .decrypt_padded_mut::<NoPadding>(&mut out[..ciphertext.len()])
+        .decrypt_padded::<NoPadding>(&mut out[..ciphertext.len()])
         .map_err(|_| Ctap2Status::Other)?;
     Ok(decrypted.len())
 }
@@ -318,7 +319,7 @@ fn generate_secret_key<R: Rng>(rng: &mut R) -> Result<SecretKey, Ctap2Status> {
     for _ in 0..16 {
         let mut bytes = [0u8; 32];
         rng.fill_bytes(&mut bytes);
-        if let Ok(key) = SecretKey::from_bytes(FieldBytes::from_slice(&bytes)) {
+        if let Ok(key) = SecretKey::from_slice(&bytes) {
             return Ok(key);
         }
     }
@@ -326,16 +327,14 @@ fn generate_secret_key<R: Rng>(rng: &mut R) -> Result<SecretKey, Ctap2Status> {
 }
 
 fn shared_secret(private: &[u8; 32], platform: &Ec2KeyAgreement) -> Result<[u8; 32], Ctap2Status> {
-    let secret =
-        SecretKey::from_bytes(FieldBytes::from_slice(private)).map_err(|_| Ctap2Status::Other)?;
+    let secret = SecretKey::from_slice(private).map_err(|_| Ctap2Status::Other)?;
     let mut sec1 = [0u8; 65];
     sec1[0] = 0x04;
     sec1[1..33].copy_from_slice(&platform.x);
     sec1[33..65].copy_from_slice(&platform.y);
     let public = PublicKey::from_sec1_bytes(&sec1).map_err(|_| Ctap2Status::InvalidParameter)?;
     let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
-    let mut out = [0u8; 32];
-    out.copy_from_slice(shared.raw_secret_bytes());
+    let out: [u8; 32] = (*shared.raw_secret_bytes()).into();
     Ok(out)
 }
 
@@ -385,7 +384,7 @@ impl ClientPin {
         rng: &mut R,
     ) -> Result<KeyAgreementResponse, Ctap2Status> {
         let secret = generate_secret_key(rng)?;
-        let point = secret.public_key().to_encoded_point(false);
+        let point = secret.public_key().to_sec1_point(false);
         let mut x = [0u8; 32];
         let mut y = [0u8; 32];
         x.copy_from_slice(point.x().ok_or(Ctap2Status::Other)?);
@@ -490,7 +489,7 @@ impl ClientPin {
             .set_pin_retries(DEFAULT_RETRIES)
             .map_err(|_| Ctap2Status::Other)?;
 
-        let mut token = [0u8; 32];
+        let mut token: [u8; 32] = Default::default();
         rng.fill_bytes(&mut token);
         self.pin_uv_auth_token = Some(token);
         let mut encrypted = [0u8; 48];
@@ -553,7 +552,7 @@ mod tests {
     impl Platform {
         fn new(rng: &mut TestRng) -> Self {
             let secret = generate_secret_key(rng).unwrap();
-            let point = secret.public_key().to_encoded_point(false);
+            let point = secret.public_key().to_sec1_point(false);
             let mut x = [0u8; 32];
             let mut y = [0u8; 32];
             x.copy_from_slice(point.x().unwrap());
@@ -622,7 +621,7 @@ mod tests {
             .unwrap();
 
         // Decrypt the returned token.
-        let mut token = [0u8; 32];
+        let mut token: [u8; 32] = Default::default();
         let length = aes_cbc_decrypt(&shared, &response.token, &mut token).unwrap();
         assert_eq!(length, 32);
         assert_eq!(state.retries, DEFAULT_RETRIES);

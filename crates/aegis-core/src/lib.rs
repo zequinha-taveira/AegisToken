@@ -17,6 +17,8 @@ pub mod ctap2;
 pub mod ctaphid;
 pub mod discovery;
 pub mod error;
+pub mod hardware_profile;
+pub mod identity;
 pub mod lifecycle;
 pub mod management;
 pub mod management_protocol;

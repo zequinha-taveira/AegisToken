@@ -10,6 +10,7 @@ use crate::PRODUCT_USB_STRING;
 use crate::capabilities::{DeviceCapabilities, LedCapabilities, PresenceCapabilities};
 use crate::codec;
 use crate::error::CoreError;
+use crate::identity::BoardIdentity;
 use crate::lifecycle::LifecycleState;
 
 /// Current configuration schema version.
@@ -27,8 +28,11 @@ pub const DEFAULT_VENDOR_ID: u16 = 0x1209;
 /// Baseline USB product identifier.
 pub const DEFAULT_PRODUCT_ID: u16 = 0x0001;
 
-/// USB identities the firmware is permitted to present.
-pub const ALLOWED_USB_IDS: [(u16, u16); 1] = [(DEFAULT_VENDOR_ID, DEFAULT_PRODUCT_ID)];
+/// Factory default presence debounce interval, in milliseconds.
+pub const DEFAULT_PRESENCE_DEBOUNCE_MS: u16 = 20;
+
+/// Factory default presence timeout, in milliseconds.
+pub const DEFAULT_PRESENCE_TIMEOUT_MS: u16 = 15_000;
 
 /// Minimum accepted presence debounce interval.
 pub const MIN_DEBOUNCE_MS: u16 = 5;
@@ -172,6 +176,12 @@ pub enum PresenceSource {
 cbor_u8_enum!(PresenceSource { Bootsel => 0, ExternalButton => 1 });
 
 /// USB identity configuration (PRD §27).
+///
+/// This section is a **read-only echo of the board identity**: the descriptors
+/// are built from the board profile and never from this record, so
+/// [`DeviceConfig::validate`] rejects any value that differs from the active
+/// [`BoardIdentity`]. It stays in the persisted schema so the host can read
+/// back the identity the device presents.
 #[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
 #[cbor(map)]
 pub struct UsbConfig {
@@ -222,7 +232,12 @@ impl LedConfig {
         if self.gpio >= gpio_count {
             return Err(CoreError::InvalidConfiguration);
         }
-        if !caps.configurable_gpio && Some(self.gpio) != caps.default_gpio {
+        if caps.configurable_gpio {
+            // `gpio` is below `gpio_count` (<= 48), so the shift is in range.
+            if caps.candidate_gpio_mask & (1u64 << self.gpio) == 0 {
+                return Err(CoreError::InvalidCapability);
+            }
+        } else if Some(self.gpio) != caps.default_gpio {
             return Err(CoreError::InvalidCapability);
         }
         if !caps.brightness && self.brightness != caps.default_brightness {
@@ -241,6 +256,12 @@ impl LedConfig {
 }
 
 /// User-presence configuration (PRD §16, §18).
+///
+/// The presence **source** is an echo of the board hardware profile: the
+/// firmware builds its presence adapter from the profile and [`DeviceConfig::validate`]
+/// only accepts the source the capabilities advertise. The timing values are
+/// currently persisted and validated but not applied at runtime — the profile's
+/// debounce/timeout govern the adapter — so treat them as a recorded default.
 #[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
 #[cbor(map)]
 pub struct PresenceConfig {
@@ -309,10 +330,17 @@ pub struct ValidationContext<'a> {
     pub capabilities: &'a DeviceCapabilities,
     /// Current lifecycle state.
     pub lifecycle: LifecycleState,
+    /// Board identity the device presents; the USB identity may not diverge
+    /// from it.
+    pub identity: BoardIdentity,
 }
 
 impl DeviceConfig {
     /// The factory configuration shipped in the universal image.
+    ///
+    /// This is the reference AegisToken carrier configuration (generic
+    /// `1209:0001` identity). Firmware should prefer [`Self::for_board`], which
+    /// derives a valid configuration for the installed board.
     ///
     /// # Panics
     ///
@@ -336,13 +364,69 @@ impl DeviceConfig {
             },
             presence: PresenceConfig {
                 source: PresenceSource::Bootsel,
-                debounce_ms: 20,
-                timeout_ms: 15_000,
+                debounce_ms: DEFAULT_PRESENCE_DEBOUNCE_MS,
+                timeout_ms: DEFAULT_PRESENCE_TIMEOUT_MS,
             },
         }
     }
 
-    /// Validate against capabilities and lifecycle (PRD §11).
+    /// Factory configuration for the installed board.
+    ///
+    /// Unlike [`Self::official_defaults`], this honours the board's actual
+    /// hardware: the USB identity mirrors the board identity, the LED is
+    /// disabled on boards without one (and pinned to the board default
+    /// otherwise), and the presence source follows the discovered capability.
+    /// The result is always valid against `capabilities` and `identity`.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the board identity's product string exceeds
+    /// [`crate::identity::MAX_BOARD_IDENTITY_LEN`]; the board catalog
+    /// const-asserts that it does not.
+    #[must_use]
+    pub fn for_board(identity: BoardIdentity, capabilities: &DeviceCapabilities) -> Self {
+        let led = &capabilities.led;
+        // Prefer the simplest supported driver. When the board declares no LED
+        // at all this value is inert (the config is disabled and validation
+        // short-circuits), so keep the conservative GPIO default.
+        let driver = if led.drivers.gpio {
+            LedDriver::Gpio
+        } else if led.drivers.pwm {
+            LedDriver::Pwm
+        } else if led.drivers.ws2812 {
+            LedDriver::Ws2812
+        } else {
+            LedDriver::Gpio
+        };
+        let presence = if capabilities.presence.bootsel {
+            PresenceSource::Bootsel
+        } else {
+            PresenceSource::ExternalButton
+        };
+        Self {
+            version: CONFIG_VERSION,
+            usb: UsbConfig {
+                product_string: FixedString::new(identity.product)
+                    .expect("board product string fits"),
+                vid: identity.vendor_id,
+                pid: identity.product_id,
+            },
+            led: LedConfig {
+                enabled: led.available,
+                gpio: led.default_gpio.unwrap_or(0),
+                brightness: led.default_brightness,
+                driver,
+                behavior: LedBehavior::Activity,
+            },
+            presence: PresenceConfig {
+                source: presence,
+                debounce_ms: DEFAULT_PRESENCE_DEBOUNCE_MS,
+                timeout_ms: DEFAULT_PRESENCE_TIMEOUT_MS,
+            },
+        }
+    }
+
+    /// Validate against capabilities, lifecycle and board identity (PRD §11).
     ///
     /// Checks are ordered: identity/security, lifecycle, capability, range and
     /// cross-field consistency.
@@ -351,17 +435,19 @@ impl DeviceConfig {
             return Err(CoreError::InvalidConfiguration);
         }
 
-        // USB identity policy: the official product string and an approved
-        // VID/PID pair are required; arbitrary identity changes are rejected.
-        if self.usb.product_string.as_str() != PRODUCT_USB_STRING {
+        // USB identity policy: the configuration may only mirror the board's
+        // own identity. The USB descriptors are built from the board profile,
+        // so accepting a different product or VID/PID here would advertise an
+        // identity the device does not actually present.
+        if self.usb.product_string.as_str() != ctx.identity.product {
+            return Err(CoreError::Unauthorized);
+        }
+        if self.usb.vid != ctx.identity.vendor_id || self.usb.pid != ctx.identity.product_id {
             return Err(CoreError::Unauthorized);
         }
         if self.usb.product_string.len() > usize::from(ctx.capabilities.usb.max_product_string_len)
         {
             return Err(CoreError::InvalidConfiguration);
-        }
-        if !ALLOWED_USB_IDS.contains(&(self.usb.vid, self.usb.pid)) {
-            return Err(CoreError::Unauthorized);
         }
 
         // Lifecycle gate.
@@ -471,11 +557,23 @@ mod tests {
     use super::*;
     use crate::capabilities::DeviceCapabilities;
 
+    fn generic_identity() -> BoardIdentity {
+        BoardIdentity::new(
+            "AegisToken",
+            PRODUCT_USB_STRING,
+            "Generic RP2350",
+            0,
+            DEFAULT_VENDOR_ID,
+            DEFAULT_PRODUCT_ID,
+        )
+    }
+
     fn ctx() -> ValidationContext<'static> {
         static CAPS: DeviceCapabilities = DeviceCapabilities::rp2350a();
         ValidationContext {
             capabilities: &CAPS,
             lifecycle: LifecycleState::Commissioning,
+            identity: generic_identity(),
         }
     }
 
@@ -559,12 +657,54 @@ mod tests {
         let context = ValidationContext {
             capabilities: &CAPS,
             lifecycle: LifecycleState::Commissioning,
+            identity: generic_identity(),
         };
         let mut config = DeviceConfig::official_defaults();
         config.led.enabled = true;
         assert_eq!(config.validate(&context), Err(CoreError::InvalidCapability));
         config.led.enabled = false;
         assert_eq!(config.validate(&context), Ok(()));
+    }
+
+    #[test]
+    fn configurable_led_gpio_must_be_a_candidate() {
+        static CAPS: DeviceCapabilities = {
+            let mut c = DeviceCapabilities::rp2350a();
+            c.led.configurable_gpio = true;
+            c.led.candidate_gpio_mask = (1 << 6) | (1 << 16) | (1 << 25);
+            c
+        };
+        let context = ValidationContext {
+            capabilities: &CAPS,
+            lifecycle: LifecycleState::Commissioning,
+            identity: generic_identity(),
+        };
+        let mut config = DeviceConfig::official_defaults();
+        config.led.gpio = 16;
+        assert_eq!(config.validate(&context), Ok(()));
+        config.led.gpio = 7;
+        assert_eq!(config.validate(&context), Err(CoreError::InvalidCapability));
+    }
+
+    #[test]
+    fn fixed_led_gpio_must_match_the_board_default() {
+        static CAPS: DeviceCapabilities = {
+            let mut c = DeviceCapabilities::rp2350a();
+            c.led.configurable_gpio = false;
+            c.led.candidate_gpio_mask = 0;
+            c.led.default_gpio = Some(25);
+            c
+        };
+        let context = ValidationContext {
+            capabilities: &CAPS,
+            lifecycle: LifecycleState::Commissioning,
+            identity: generic_identity(),
+        };
+        let mut config = DeviceConfig::official_defaults();
+        config.led.gpio = 25;
+        assert_eq!(config.validate(&context), Ok(()));
+        config.led.gpio = 16;
+        assert_eq!(config.validate(&context), Err(CoreError::InvalidCapability));
     }
 
     #[test]
@@ -609,6 +749,7 @@ mod tests {
         let context = ValidationContext {
             capabilities: &CAPS,
             lifecycle: LifecycleState::Commissioning,
+            identity: generic_identity(),
         };
         let mut config = DeviceConfig::official_defaults();
         config.presence.source = PresenceSource::ExternalButton;
@@ -626,6 +767,96 @@ mod tests {
         let mut buf = [0u8; codec::MAX_STORED_CONFIG_LEN];
         assert_eq!(
             config.prepare_commit(&ctx(), &mut buf),
+            Err(CoreError::Unauthorized)
+        );
+    }
+
+    fn board_caps(led: crate::hardware_profile::LedProfile) -> (DeviceCapabilities, BoardIdentity) {
+        use crate::capabilities::{Rp2350Family, Rp2350Package};
+        use crate::discovery::derive_capabilities;
+        use crate::hardware_profile::{BoardHardwareProfile, FlashProfile, PresenceProfile};
+        let hardware = BoardHardwareProfile::new(
+            led,
+            PresenceProfile::bootsel(DEFAULT_PRESENCE_DEBOUNCE_MS, DEFAULT_PRESENCE_TIMEOUT_MS),
+            FlashProfile::new(2 * 1024 * 1024),
+        );
+        let caps = derive_capabilities(&hardware, Rp2350Family::Rp2350, Rp2350Package::Qfn60);
+        let identity = BoardIdentity::new(
+            "Waveshare",
+            PRODUCT_USB_STRING,
+            "RP2350-Zero",
+            0,
+            0x2E8A,
+            0x10B0,
+        );
+        (caps, identity)
+    }
+
+    #[test]
+    fn board_defaults_disable_the_led_when_the_board_has_none() {
+        use crate::hardware_profile::LedProfile;
+        let (caps, identity) = board_caps(LedProfile::NONE);
+        let config = DeviceConfig::for_board(identity, &caps);
+        let context = ValidationContext {
+            capabilities: &caps,
+            lifecycle: LifecycleState::Commissioning,
+            identity,
+        };
+        assert_eq!(config.validate(&context), Ok(()));
+        assert!(!config.led.enabled);
+        assert_eq!(config.usb.vid, 0x2E8A);
+        assert_eq!(config.usb.pid, 0x10B0);
+    }
+
+    #[test]
+    fn board_defaults_use_the_board_led_pin() {
+        use crate::hardware_profile::LedProfile;
+        let (caps, identity) = board_caps(LedProfile::configurable_gpio(16, false, &[6, 16, 22]));
+        let config = DeviceConfig::for_board(identity, &caps);
+        let context = ValidationContext {
+            capabilities: &caps,
+            lifecycle: LifecycleState::Commissioning,
+            identity,
+        };
+        assert_eq!(config.validate(&context), Ok(()));
+        assert!(config.led.enabled);
+        assert_eq!(config.led.gpio, 16);
+    }
+
+    #[test]
+    fn board_defaults_follow_the_presence_profile() {
+        use crate::capabilities::{Rp2350Family, Rp2350Package};
+        use crate::discovery::derive_capabilities;
+        use crate::hardware_profile::{
+            BoardHardwareProfile, FlashProfile, LedProfile, PresenceProfile,
+        };
+        let hardware = BoardHardwareProfile::new(
+            LedProfile::NONE,
+            PresenceProfile::external_button(
+                6,
+                true,
+                DEFAULT_PRESENCE_DEBOUNCE_MS,
+                DEFAULT_PRESENCE_TIMEOUT_MS,
+            ),
+            FlashProfile::new(2 * 1024 * 1024),
+        );
+        let caps = derive_capabilities(&hardware, Rp2350Family::Rp2350, Rp2350Package::Qfn60);
+        let identity = BoardIdentity::new("Acme", PRODUCT_USB_STRING, "Board", 0, 0x2E8A, 0x1234);
+        let config = DeviceConfig::for_board(identity, &caps);
+        assert_eq!(config.presence.source, PresenceSource::ExternalButton);
+    }
+
+    #[test]
+    fn board_identity_cannot_be_spoofed_by_configuration() {
+        let (caps, identity) = board_caps(crate::hardware_profile::LedProfile::NONE);
+        let context = ValidationContext {
+            capabilities: &caps,
+            lifecycle: LifecycleState::Commissioning,
+            identity,
+        };
+        // The generic AegisToken defaults do not match this board.
+        assert_eq!(
+            DeviceConfig::official_defaults().validate(&context),
             Err(CoreError::Unauthorized)
         );
     }

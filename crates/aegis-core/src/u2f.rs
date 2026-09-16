@@ -11,6 +11,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::authenticator::{self, CredentialStore};
+use crate::ctap2::COSE_ALG_ES256;
 
 /// `U2F_REGISTER` instruction.
 pub const INS_REGISTER: u8 = 0x01;
@@ -160,6 +161,11 @@ fn authenticate<C: CredentialStore>(apdu: &Apdu, store: &mut C, up_confirmed: bo
     let Some(credential) = store.get(key_handle) else {
         return U2fResponse::error(SW_WRONG_DATA);
     };
+    // U2F (CTAP1) only defines ES256 signatures; EdDSA credentials created
+    // over CTAP2 are invisible on this interface.
+    if credential.algorithm != COSE_ALG_ES256 {
+        return U2fResponse::error(SW_WRONG_DATA);
+    }
 
     match apdu.p1 {
         AUTH_CHECK_ONLY => U2fResponse::ok(&[]),
@@ -258,6 +264,7 @@ mod tests {
             rp_id: FixedString::new("example.com").unwrap(),
             user_id: heapless::Vec::from_slice(&[1, 2, 3]).unwrap(),
             exclude_list: heapless::Vec::new(),
+            algs: heapless::Vec::new(),
             rk: true,
             uv: false,
             pin_uv_auth_param: None,
@@ -286,6 +293,36 @@ mod tests {
         let unknown = [0u8; 16];
         let request = authenticate_request(&[0xAA; 32], &[0xBB; 32], &unknown, AUTH_CHECK_ONLY);
         assert_eq!(handle(&request, &mut store, false).status, SW_WRONG_DATA);
+    }
+
+    #[test]
+    fn eddsa_credentials_are_invisible_to_u2f() {
+        use crate::ctap2::COSE_ALG_EDDSA;
+
+        let mut store = MemoryCredentialStore::new();
+        let mut rng = TestRng(9);
+        let request = MakeCredentialRequest {
+            client_data_hash: [0x11; 32],
+            rp_id: FixedString::new("example.com").unwrap(),
+            user_id: heapless::Vec::from_slice(&[1, 2, 3]).unwrap(),
+            exclude_list: heapless::Vec::new(),
+            algs: heapless::Vec::from_slice(&[COSE_ALG_EDDSA]).unwrap(),
+            rk: true,
+            uv: false,
+            pin_uv_auth_param: None,
+        };
+        let response =
+            authenticator::make_credential(&mut store, &mut rng, &request, true, false).unwrap();
+        let length = u16::from_be_bytes([response.auth_data[53], response.auth_data[54]]) as usize;
+        let id: heapless::Vec<u8, 32> =
+            heapless::Vec::from_slice(&response.auth_data[55..55 + length]).unwrap();
+
+        // U2F only defines ES256: the EdDSA credential reads as unknown in
+        // both check-only and enforce modes.
+        let request = authenticate_request(&[0xAA; 32], &[0xBB; 32], &id, AUTH_CHECK_ONLY);
+        assert_eq!(handle(&request, &mut store, false).status, SW_WRONG_DATA);
+        let request = authenticate_request(&[0xAA; 32], &[0xBB; 32], &id, AUTH_ENFORCE);
+        assert_eq!(handle(&request, &mut store, true).status, SW_WRONG_DATA);
     }
 
     #[test]
@@ -361,8 +398,7 @@ mod tests {
     fn verify(private_key: &[u8; 32], message: &[u8], der: &[u8]) -> bool {
         use p256::ecdsa::signature::Verifier;
         use p256::ecdsa::{Signature, SigningKey};
-        let signing_key =
-            SigningKey::from_bytes(p256::FieldBytes::from_slice(private_key)).unwrap();
+        let signing_key = SigningKey::from_slice(private_key).unwrap();
         let signature = Signature::from_der(der).unwrap();
         signing_key
             .verifying_key()

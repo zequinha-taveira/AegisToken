@@ -69,5 +69,42 @@ fn main() {
         key, is_dev
     )
     .unwrap();
+
+    // Board profile selection: the carrier identity and USB VID/PID presented
+    // by the universal firmware. `AEGIS_BOARD` names a profile declared in
+    // `board-generic-rp2350`; the build-time MCU family is a separate concern.
+    println!("cargo:rerun-if-env-changed=AEGIS_BOARD");
+    let board = env::var("AEGIS_BOARD").unwrap_or_default();
+    let board = board.as_str();
+    let profile = match board {
+        "" | "generic" => "GENERIC",
+        "waveshare-rp2350-zero" => "WAVESHARE_RP2350_ZERO",
+        "waveshare-rp2350-plus" => "WAVESHARE_RP2350_PLUS",
+        "waveshare-rp2350-tiny" => "WAVESHARE_RP2350_TINY",
+        "waveshare-rp2350-lcd-1.28" => "WAVESHARE_RP2350_LCD_1_28",
+        "waveshare-rp2350-touch-lcd-1.28" => "WAVESHARE_RP2350_TOUCH_LCD_1_28",
+        "waveshare-rp2350-one" => "WAVESHARE_RP2350_ONE",
+        "waveshare-rp2350-geek" => "WAVESHARE_RP2350_GEEK",
+        "waveshare-rp2350-lcd-0.96" => "WAVESHARE_RP2350_LCD_096",
+        "waveshare-rp2350-eth" => "WAVESHARE_RP2350_ETH",
+        "pimoroni-pico-plus-2" => "PIMORONI_PICO_PLUS_2",
+        "pimoroni-tiny-2350" => "PIMORONI_TINY_2350",
+        "pimoroni-plasma-2350" => "PIMORONI_PLASMA_2350",
+        "pimoroni-pga2350" => "PIMORONI_PGA2350",
+        "datanoise-picoadk-v2" => "DATANOISE_PICOADK_V2",
+        "soldered-nula-max" => "SOLDERED_NULA_MAX",
+        "invector-challenger-plus" => "INVECTOR_CHALLENGER_PLUS",
+        other => panic!(
+            "unknown AEGIS_BOARD '{other}'; expected 'generic' or a third-party \
+             board profile declared in board-generic-rp2350::capabilities"
+        ),
+    };
+    let mut file = File::create(out.join("board_profile.rs")).unwrap();
+    writeln!(
+        file,
+        "pub const BOARD_PROFILE: BoardProfile = BoardProfile::{profile};"
+    )
+    .unwrap();
+
     println!("cargo:rerun-if-changed=build.rs");
 }

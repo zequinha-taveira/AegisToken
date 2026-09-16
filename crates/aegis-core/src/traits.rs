@@ -4,7 +4,7 @@
 //! vendor. Implementations live in `board-generic-rp2350`.
 
 use crate::capabilities::DeviceCapabilities;
-use crate::configuration::LedBehavior;
+use crate::configuration::{LedBehavior, LedConfig};
 use crate::error::CoreError;
 use crate::presence::UserPresence;
 
@@ -15,6 +15,18 @@ pub trait Led {
 
     /// Set the behaviour policy.
     fn set_behavior(&mut self, behavior: LedBehavior) -> Result<(), CoreError>;
+
+    /// Apply a persistent LED configuration.
+    ///
+    /// The default honours `enabled`, `brightness` and `behavior`. Drivers that
+    /// can also move or invert the pin override this to do so.
+    fn configure(&mut self, config: &LedConfig) -> Result<(), CoreError> {
+        if !config.enabled {
+            return self.set_behavior(LedBehavior::Off);
+        }
+        self.set_brightness(config.brightness)?;
+        self.set_behavior(config.behavior)
+    }
 }
 
 /// Byte-addressable persistent storage.
@@ -125,5 +137,39 @@ mod tests {
         assert!(hw.led().is_some());
         hw.storage().write(0, &[1, 2, 3]).unwrap();
         hw.user_presence().wait_for_presence().unwrap();
+    }
+
+    #[test]
+    fn default_configure_honours_enabled_brightness_and_behavior() {
+        #[derive(Default)]
+        struct Recording {
+            brightness: Option<u8>,
+            behavior: Option<LedBehavior>,
+        }
+        impl Led for Recording {
+            fn set_brightness(&mut self, brightness: u8) -> Result<(), CoreError> {
+                self.brightness = Some(brightness);
+                Ok(())
+            }
+            fn set_behavior(&mut self, behavior: LedBehavior) -> Result<(), CoreError> {
+                self.behavior = Some(behavior);
+                Ok(())
+            }
+        }
+
+        let mut config = crate::configuration::DeviceConfig::official_defaults().led;
+        config.brightness = 128;
+        config.behavior = LedBehavior::Blink;
+
+        let mut led = Recording::default();
+        led.configure(&config).unwrap();
+        assert_eq!(led.brightness, Some(128));
+        assert_eq!(led.behavior, Some(LedBehavior::Blink));
+
+        config.enabled = false;
+        let mut led = Recording::default();
+        led.configure(&config).unwrap();
+        assert_eq!(led.brightness, None);
+        assert_eq!(led.behavior, Some(LedBehavior::Off));
     }
 }

@@ -121,6 +121,32 @@ Nunca libere uma imagem com a chave de desenvolvimento.
 `SW_INS_NOT_SUPPORTED`; a atestação *packed self* do CTAP2 não é válida para
 U2F. Provisionar um certificado de atestação é etapa de produção separada.
 
+## Provisionamento dos applets (PINs, DOs e certificados)
+
+Os applets saem de fábrica com credenciais padrão e chaves vazias; o
+provisionamento usa as ferramentas padrão sobre CCID, sem utilitário
+proprietário:
+
+| Applet | Padrão de fábrica | Troca |
+|--------|-------------------|-------|
+| PIV PIN / PUK | `123456` / `12345678` | `CHANGE REFERENCE DATA`, `pivy`, `yubico-piv-tool` |
+| PIV management key | 3DES `0102030405060708` ×3 | ainda fixa (`SET MANAGEMENT KEY` responde `6D00`; trocar exige novo provisionamento) |
+| OpenPGP PW1 / PW3 | `123456` / `12345678` | `CHANGE REFERENCE DATA`, `gpg --card-edit` |
+| OATH password | ausente (opcional) | `SET CODE` via `ykman oath` |
+
+- **Geração de chaves** (`GENERATE ASYMMETRIC KEY PAIR` PIV, `GENERATE` OpenPGP)
+  exige autenticação de administrador (management key / PW3) e acontece
+  on-device a partir do TRNG; não existe importação de chave privada. A
+  geração RSA-2048 leva segundos — aguardar o status em vez de reenviar.
+- **Certificados** (material público) entram por `PUT DATA` com autenticação
+  de administrador e persistem selados; chaves privadas nunca saem.
+- **Touch policy** por slot/credencial (`never`/`always`/`cached` no PIV,
+  `touch required` no OATH) é definida na geração e impõe presença (BOOTSEL)
+  por operação.
+- Sem chave raiz provisionada na OTP, os applets operam sobre stores
+  voláteis: PINs/DOs provisionados se perdem no power cycle. Provisionar a
+  chave mestra (seção acima) é pré-requisito de produção.
+
 ## Validação FIDO no Windows (opcional)
 
 Para rodar `scripts/validate_fido.py`, a interface FIDO (MI_00) precisa estar

@@ -24,6 +24,7 @@ rp2354b = ["board-generic-rp2350/rp2354b"]
 selftest = []
 
 [dependencies]
+aegis-applets.workspace = true
 aegis-core.workspace = true
 minicbor.workspace = true
 heapless.workspace = true

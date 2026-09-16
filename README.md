@@ -12,23 +12,91 @@ com **descoberta automática de hardware** — sem seleção manual de placa.
 
 ## Interfaces USB
 
-O dispositivo compõe três funções HID, com separação lógica estrita:
+O dispositivo compõe três funções HID e uma interface CCID, com separação
+lógica estrita:
 
-| Interface | Usage Page | Finalidade |
-|-----------|-----------|------------|
-| **FIDO HID** | `0xF1D0` | Autenticação: CTAP2/FIDO2 (passkeys) e CTAP1/U2F |
+| Interface | Classe | Finalidade |
+|-----------|--------|------------|
+| **FIDO HID** | usage page `0xF1D0` | Autenticação: CTAP2/FIDO2 (passkeys) e CTAP1/U2F |
 | **Management HID** | vendor-defined `0xFF00` | Gestão, configuração, diagnóstico e atualização de firmware |
 | **HID Keyboard** | padrão | Emissão de teclas; **opcional e desabilitada por padrão** |
+| **CCID** | `0x0B` | Applets ISO 7816: PIV, OpenPGP e OATH (ECC + RSA-2048) |
 
-> Operações FIDO **nunca** dependem das interfaces Keyboard ou Management. A
-> interface HID Keyboard, quando habilitada, é governada pelo lifecycle e por
-> User Presence e nunca é alcançável a partir do caminho de entrada FIDO.
+> Operações FIDO **nunca** dependem das interfaces Keyboard, Management ou
+> CCID. A interface HID Keyboard, quando habilitada, é governada pelo lifecycle
+> e por User Presence e nunca é alcançável a partir do caminho de entrada FIDO.
+
+## Identidade e perfil de hardware
+
+O `DeviceManager` do firmware mantém três entidades separadas, para que a marca
+da placa, o chip instalado e a fiação não se misturem:
+
+- **Board Identity** — fabricante, produto, modelo da placa, revisão de hardware
+  e o par USB `vendor_id`/`product_id` declarados pelo perfil. Exposta no
+  descritor USB e em `GET_DEVICE_INFO`.
+- **Board Hardware Profile** — parâmetros que variam por placa sem tocar no
+  núcleo do firmware: LED (driver, GPIO, polaridade, pinos candidatos,
+  brilho), User Presence (BOOTSEL ou botão externo, GPIO, polaridade, debounce,
+  timeout) e flash (capacidade e layout). A tarefa FIDO aguarda a presença de
+  forma assíncrona (`PresenceAdapter::wait`); o perfil decide se isso é BOOTSEL
+  ou um botão GPIO, também sem travar o executor.
+- **MCU Identity** — variante do RP2350 (família, package, revisão de silício) e
+  o identificador único de 64 bits fundido na OTP, usado como número de série
+  USB. Vem do chip instalado, então trocar a placa não confunde a identidade.
+
+Uma nova placa, PCB própria ou placa de terceiros só precisa de um novo
+`BoardProfile` (identidade + hardware profile); o firmware universal não muda.
+
+O perfil genérico `AegisToken` usa `VID:PID = 1209:0001` (pid.codes). As placas
+de terceiros usam o `vendor_id` `2E8A` sublicenciado pela Raspberry Pi e o
+`product_id` alocado ao fabricante, conforme a lista oficial
+[raspberrypi/usb-pid](https://github.com/raspberrypi/usb-pid); o `manufacturer`
+passa a ser o fabricante da placa e o `product` permanece o produto AegisToken.
+
+### Placas RP2350 de terceiros
+
+Cada `BoardProfile` declara a identidade da placa e seu `product_id`:
+
+| Fabricante | Placa | USB VID:PID |
+|------------|-------|-------------|
+| Waveshare | RP2350-Zero | `2E8A:10B0` |
+| Waveshare | RP2350-Plus | `2E8A:10B1` |
+| Waveshare | RP2350-Tiny | `2E8A:10B2` |
+| Waveshare | RP2350-LCD-1.28 | `2E8A:10B3` |
+| Waveshare | RP2350-Touch-LCD-1.28 | `2E8A:10B4` |
+| Waveshare | RP2350-One | `2E8A:10B5` |
+| Waveshare | RP2350-GEEK | `2E8A:10B6` |
+| Waveshare | RP2350-LCD-0.96 | `2E8A:10B7` |
+| Waveshare | RP2350-ETH | `2E8A:10C3` |
+| Pimoroni | Pico Plus 2 | `2E8A:10A3` |
+| Pimoroni | Tiny 2350 | `2E8A:10A4` |
+| Pimoroni | Plasma 2350 | `2E8A:10A5` |
+| Pimoroni | PGA2350 | `2E8A:10A6` |
+| Datanoise | PicoADK v2 | `2E8A:10AE` |
+| Soldered | NULA Max RP2350 | `2E8A:10EC` |
+| Invector Labs | Challenger+ RP2350 NB-IoT | `2E8A:110D` |
+
+O perfil é selecionado em tempo de build por `AEGIS_BOARD` (ou `-BoardProfile`
+em `scripts/build-uf2.ps1`); o padrão `generic` mantém a identidade AegisToken.
+O número de série USB continua vindo da OTP do chip, não da placa.
 
 ## Funcionalidades
 
 - **FIDO2/CTAP2**: `authenticatorGetInfo`, `makeCredential`, `getAssertion`,
-  `clientPIN` (protocolo v1), `reset` e credential management.
-- **U2F/CTAP1**: `U2F_VERSION` e `U2F_AUTHENTICATE` (check-only e sign).
+  `clientPIN` (protocolo v1), `reset` e credential management — ES256 e
+  EdDSA (`ed25519-sk`, pronta para SSH/Git; ver `docs/ssh-git.md`).
+- **U2F/CTAP1**: `U2F_VERSION` e `U2F_AUTHENTICATE` (check-only e sign, ES256).
+- **CCID / ISO 7816** (Fases 11–12, 16): transporte CCID (classe `0x0B`), APDU
+  ISO 7816-4 (curto e estendido), roteamento por AID e framework de PIN/retry.
+  O applet **PIV** (NIST SP 800-73-4) implementa `VERIFY`/`CHANGE`/`RESET`,
+  `GET DATA`/`PUT DATA`, `GENERATE ASYMMETRIC KEY PAIR` (P-256/P-384 e
+  RSA-2048), `GENERAL AUTHENTICATE` (management key 3DES/AES e assinatura
+  ECDSA ou RSA crua) e touch policy por slot. O applet **OATH** (YKOATH)
+  implementa HOTP/TOTP com HMAC-SHA1/SHA-256/SHA-512, access code,
+  LIST/CALCULATE e RFC 4226/6238; o applet **OpenPGP Card** implementa o
+  slice v3.4 com P-256, Ed25519, X25519 e RSA-2048 (PW1/PW3, DOs, keygen,
+  ECDSA/EdDSA, internal auth crua, ECDH/decifra RSA e fingerprints
+  RFC 4880); RSA-3072/PSS e KDF OpenPGP completo ficam fora de escopo.
 - **User Presence** contextual via botão BOOTSEL, com debounce, timeout,
   consume-once e anti-replay; presença só é aceita em `FidoWaitPresence`.
 - **Configuração** versionada em CBOR, com validação, integridade (CRC-32) e
@@ -44,7 +112,7 @@ O dispositivo compõe três funções HID, com separação lógica estrita:
 
 ## Arquitetura
 
-Workspace Cargo com dez crates:
+Workspace Cargo com onze crates:
 
 | Crate | Papel |
 |-------|-------|
@@ -55,14 +123,15 @@ Workspace Cargo com dez crates:
 | [`crates/security-key-usb`](crates/security-key-usb) | Scaffold para os transportes USB HID, FIDO e Management. |
 | [`crates/security-key-hal`](crates/security-key-hal) | Scaffold para as fronteiras de abstração de hardware. |
 | [`crates/aegis-core`](crates/aegis-core) | Domínio portátil `no_std`/`no_alloc`, testável em host (máquinas de estado, protocolos, cripto, storage). |
-| [`crates/board-generic-rp2350`](crates/board-generic-rp2350) | Abstração de hardware da família RP2350 (GPIO, BOOTSEL, LED, flash, OTP, TRNG, USB). |
+| [`crates/aegis-applets`](crates/aegis-applets) | APDU, CCID, roteamento por AID, TLV e applets PIV/OATH/OpenPGP (`no_std`, testável em host). |
+| [`crates/board-generic-rp2350`](crates/board-generic-rp2350) | Abstração de hardware da família RP2350 (GPIO, BOOTSEL, LED, flash, OTP, TRNG, USB HID/CCID). |
 | [`crates/firmware-universal-rp2350`](crates/firmware-universal-rp2350) | Binário `embassy-rp` que amarra tudo e implementa as tarefas USB. |
 | [`crates/aegistoken-host`](crates/aegistoken-host) | CLI de host em Rust sobre **libusb** para o Management HID. |
 
 Os seis crates `security-key-*` são apenas scaffolds nesta fase: nenhum código
-foi movido. O `aegis-core` continua sendo a fonte da implementação durante a
-migração, não depende de HAL, executor ou placa e por isso roda e é testado no
-host. A HAL atual permanece isolada em `board-generic-rp2350`.
+foi movido. O `aegis-core` e o `aegis-applets` são a fonte da implementação
+durante a migração, não dependem de HAL, executor ou placa e por isso rodam e
+são testados no host. A HAL atual permanece isolada em `board-generic-rp2350`.
 
 ## Pré-requisitos
 
@@ -71,7 +140,8 @@ host. A HAL atual permanece isolada em `board-generic-rp2350`.
 - [`probe-rs`](https://probe.rs) — flash e RTT.
 - [`picotool`](https://github.com/raspberrypi/picotool) — conversão de UF2 e
   `picotool info`.
-- Python 3 com `fido2`, `hidapi` e `cbor2` para os scripts de validação.
+- Python 3 com `fido2`, `hidapi`, `cbor2` e `pyscard` para os scripts de
+  validação.
 
 O host tool compila a libusb embutida (`vendored`), então **não** requer WinUSB
 nem Zadig. No Windows a libusb usa o backend HID sobre o driver `hidusb` inbox.
@@ -91,6 +161,10 @@ cargo test -p aegis-core
 & scripts/build-uf2.ps1 -Board rp2350b
 & scripts/build-uf2.ps1 -Board rp2354a
 & scripts/build-uf2.ps1 -Board rp2354b
+
+# Placa de terceiros (identidade e USB VID:PID da placa)
+& scripts/build-uf2.ps1 -BoardProfile waveshare-rp2350-zero
+& scripts/build-uf2.ps1 -BoardProfile pimoroni-tiny-2350
 
 # Flash + RTT
 probe-rs run --chip RP2350 target/thumbv8m.main-none-eabihf/release/firmware-universal-rp2350
@@ -120,14 +194,19 @@ cargo run -p aegistoken-host -- validate      # AC-003..AC-009 (Management HID)
 ```
 
 Opções globais: `--vid`/`--pid` (padrão `0x1209:0x0001`), `--interface N` e
-`--timeout MS`. Rode `cargo run -p aegistoken-host -- --help` para a lista
-completa de comandos.
+`--timeout MS`. Um firmware construído com um perfil de terceiros enumera com o
+VID/PID da placa (ex.: `--vid 0x2E8A --pid 0x10B0`); rode
+`cargo run -p aegistoken-host -- --help` para a lista completa de comandos.
 
 ## Validação
 
 ```powershell
 python scripts/validate_management.py   # Management HID (AC-003..AC-009)
-python scripts/validate_fido.py         # FIDO2/U2F (AC-002, AC-011, AC-013)
+python scripts/validate_fido.py         # FIDO2/U2F + Ed25519 (AC-002, AC-011, AC-013, AC-020)
+python scripts/validate_ccid.py         # CCID (AC-016)
+python scripts/validate_piv.py          # PIV (AC-017) + RSA-2048 (AC-021)
+python scripts/validate_oath.py         # OATH/TOTP/HOTP (AC-018)
+python scripts/validate_openpgp.py      # OpenPGP ECC + RSA-2048 (AC-019, AC-021)
 python scripts/set_pin.py               # define/altera o PIN do clientPIN
 ```
 
@@ -140,8 +219,10 @@ ou remapeamento para o driver HID genérico).
 ## Documentação
 
 - [`roadmap.md`](roadmap.md) — fases do projeto, decisões arquiteturais e status.
-- [`validation.md`](validation.md) — matriz AC-001..AC-015, evidências e
+- [`validation.md`](validation.md) — matriz AC-001..AC-021, evidências e
   limitações conhecidas.
+- [`docs/ssh-git.md`](docs/ssh-git.md) — SSH (`ed25519-sk`/`ecdsa-sk`),
+  `ssh-agent` e assinatura Git via SSH.
 - [`production.md`](production.md) — provisionamento: secure boot, OTP, chave de
   update e atestação.
 

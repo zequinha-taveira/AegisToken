@@ -23,6 +23,7 @@ rp2354b = ["rp235xb"]
 aegis-core.workspace = true
 critical-section.workspace = true
 embassy-rp.workspace = true
+embassy-sync.workspace = true
 embassy-time.workspace = true
 embassy-usb.workspace = true
 static_cell.workspace = true

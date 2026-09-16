@@ -1,12 +1,12 @@
 //! CTAP2 authenticator logic: makeCredential and getAssertion (PRD §15).
 //!
 //! Pure, host-testable implementation of credential creation and assertion
-//! signing with P-256 / ES256 and packed self-attestation. Persistence and
-//! `clientPIN` are layered on top in later slices; credentials are held in a
-//! [`CredentialStore`].
+//! signing with P-256 / ES256 and Ed25519 / EdDSA, plus packed
+//! self-attestation. Persistence and `clientPIN` are layered on top in later
+//! slices; credentials are held in a [`CredentialStore`].
 
+use ed25519_dalek::{Signer as EdSigner, SigningKey as EdSigningKey};
 use minicbor::encode::{Encoder, Write};
-use p256::FieldBytes;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use sha2::{Digest, Sha256};
@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 use crate::codec;
 use crate::configuration::FixedString;
 use crate::ctap2::{
-    AAGUID, COSE_ALG_ES256, COSE_CURVE_P256, CredentialDescriptor, Ctap2Status, Ec2PublicKey,
-    GetAssertionRequest, MakeCredentialRequest,
+    AAGUID, COSE_ALG_EDDSA, COSE_ALG_ES256, COSE_CURVE_ED25519, COSE_CURVE_P256,
+    CredentialDescriptor, Ctap2Status, Ec2PublicKey, GetAssertionRequest, MakeCredentialRequest,
+    OkpPublicKey,
 };
 use crate::error::CoreError;
 
@@ -25,7 +26,7 @@ pub const MAX_CREDENTIALS: usize = 8;
 pub const CREDENTIAL_ID_LEN: usize = 16;
 /// Maximum authenticator-data length.
 pub const MAX_AUTH_DATA: usize = 256;
-/// Maximum signature length (DER-encoded ES256).
+/// Maximum signature length (DER-encoded ES256 or raw EdDSA).
 pub const MAX_SIGNATURE: usize = 80;
 /// Scratch length for signing input (auth data plus client data hash).
 const MAX_SIGNING_INPUT: usize = MAX_AUTH_DATA + 32;
@@ -54,8 +55,10 @@ pub struct Credential {
     pub rp_id: FixedString<64>,
     /// User handle.
     pub user_id: heapless::Vec<u8, 64>,
-    /// P-256 private scalar.
+    /// Private key material: P-256 scalar for ES256, seed for EdDSA.
     pub private_key: [u8; 32],
+    /// COSE algorithm this credential was created with (`-7` or `-8`).
+    pub algorithm: i64,
     /// Signature counter.
     pub sign_count: u32,
     /// Whether this is a discoverable (resident) credential.
@@ -68,7 +71,7 @@ impl<C> minicbor::Encode<C> for Credential {
         e: &mut Encoder<W>,
         _ctx: &mut C,
     ) -> Result<(), minicbor::encode::Error<W::Error>> {
-        e.map(6)?;
+        e.map(7)?;
         e.u8(0)?;
         e.bytes(&self.id)?;
         e.u8(1)?;
@@ -81,6 +84,8 @@ impl<C> minicbor::Encode<C> for Credential {
         e.u32(self.sign_count)?;
         e.u8(5)?;
         e.bool(self.discoverable)?;
+        e.u8(6)?;
+        e.i64(self.algorithm)?;
         Ok(())
     }
 }
@@ -98,6 +103,7 @@ impl<'b, C> minicbor::Decode<'b, C> for Credential {
             rp_id: FixedString::new("").expect("empty string fits"),
             user_id: heapless::Vec::new(),
             private_key: [0u8; 32],
+            algorithm: COSE_ALG_ES256,
             sign_count: 0,
             discoverable: false,
         };
@@ -126,8 +132,13 @@ impl<'b, C> minicbor::Decode<'b, C> for Credential {
                 }
                 4 => credential.sign_count = d.u32()?,
                 5 => credential.discoverable = d.bool()?,
+                // Absent in records written before EdDSA support; default ES256.
+                6 => credential.algorithm = d.i64()?,
                 _ => d.skip()?,
             }
+        }
+        if credential.algorithm != COSE_ALG_ES256 && credential.algorithm != COSE_ALG_EDDSA {
+            return Err(minicbor::decode::Error::message("bad algorithm"));
         }
         Ok(credential)
     }
@@ -266,6 +277,8 @@ pub struct MakeCredentialResponse {
     pub auth_data: heapless::Vec<u8, MAX_AUTH_DATA>,
     /// Attestation signature.
     pub signature: heapless::Vec<u8, MAX_SIGNATURE>,
+    /// COSE algorithm of the created credential (`-7` or `-8`).
+    pub alg: i64,
 }
 
 impl<C> minicbor::Encode<C> for MakeCredentialResponse {
@@ -282,7 +295,7 @@ impl<C> minicbor::Encode<C> for MakeCredentialResponse {
         e.u8(3)?;
         e.map(2)?;
         e.str("alg")?;
-        e.i64(COSE_ALG_ES256)?;
+        e.i64(self.alg)?;
         e.str("sig")?;
         e.bytes(&self.signature)?;
         Ok(())
@@ -333,7 +346,7 @@ fn generate_signing_key<R: Rng>(rng: &mut R) -> Result<SigningKey, Ctap2Status> 
     for _ in 0..16 {
         let mut bytes = [0u8; 32];
         rng.fill_bytes(&mut bytes);
-        if let Ok(key) = SigningKey::from_bytes(FieldBytes::from_slice(&bytes)) {
+        if let Ok(key) = SigningKey::from_slice(&bytes) {
             return Ok(key);
         }
     }
@@ -342,7 +355,7 @@ fn generate_signing_key<R: Rng>(rng: &mut R) -> Result<SigningKey, Ctap2Status> 
 
 fn build_attested_credential_data(
     credential_id: &[u8],
-    cose_key: &Ec2PublicKey,
+    cose_key: &[u8],
 ) -> Result<heapless::Vec<u8, 200>, Ctap2Status> {
     let mut out: heapless::Vec<u8, 200> = heapless::Vec::new();
     out.extend_from_slice(&AAGUID)
@@ -351,9 +364,7 @@ fn build_attested_credential_data(
         .map_err(|_| Ctap2Status::LimitExceeded)?;
     out.extend_from_slice(credential_id)
         .map_err(|_| Ctap2Status::LimitExceeded)?;
-    let mut buf = [0u8; 128];
-    let len = codec::encode_into(cose_key, &mut buf).map_err(|_| Ctap2Status::Other)?;
-    out.extend_from_slice(&buf[..len])
+    out.extend_from_slice(cose_key)
         .map_err(|_| Ctap2Status::LimitExceeded)?;
     Ok(out)
 }
@@ -380,6 +391,7 @@ fn build_auth_data(
 
 fn sign(
     private_key: &[u8; 32],
+    alg: i64,
     auth_data: &[u8],
     client_data_hash: &[u8; 32],
 ) -> Result<heapless::Vec<u8, MAX_SIGNATURE>, Ctap2Status> {
@@ -390,6 +402,12 @@ fn sign(
     message
         .extend_from_slice(client_data_hash)
         .map_err(|_| Ctap2Status::LimitExceeded)?;
+    if alg == COSE_ALG_EDDSA {
+        let signing_key = EdSigningKey::from_bytes(private_key);
+        let signature = signing_key.sign(&message);
+        return heapless::Vec::from_slice(&signature.to_bytes())
+            .map_err(|_| Ctap2Status::LimitExceeded);
+    }
     sign_message(private_key, &message)
 }
 
@@ -400,8 +418,7 @@ pub fn sign_message(
     private_key: &[u8; 32],
     message: &[u8],
 ) -> Result<heapless::Vec<u8, MAX_SIGNATURE>, Ctap2Status> {
-    let signing_key = SigningKey::from_bytes(FieldBytes::from_slice(private_key))
-        .map_err(|_| Ctap2Status::Other)?;
+    let signing_key = SigningKey::from_slice(private_key).map_err(|_| Ctap2Status::Other)?;
     let signature: Signature = signing_key.sign(message);
     let der = signature.to_der();
     heapless::Vec::from_slice(der.as_bytes()).map_err(|_| Ctap2Status::LimitExceeded)
@@ -435,7 +452,18 @@ pub fn make_credential<S: CredentialStore, R: Rng>(
         }
     }
 
-    let signing_key = generate_signing_key(rng)?;
+    // Honor the client's algorithm preference order; fall back to ES256 when
+    // no list was sent (pre-EdDSA clients and older requests).
+    let alg = if request.algs.is_empty() {
+        COSE_ALG_ES256
+    } else {
+        request
+            .algs
+            .iter()
+            .copied()
+            .find(|alg| *alg == COSE_ALG_ES256 || *alg == COSE_ALG_EDDSA)
+            .ok_or(Ctap2Status::UnsupportedAlgorithm)?
+    };
 
     let mut credential_id: heapless::Vec<u8, 32> = heapless::Vec::new();
     let mut id_bytes = [0u8; CREDENTIAL_ID_LEN];
@@ -444,25 +472,42 @@ pub fn make_credential<S: CredentialStore, R: Rng>(
         .extend_from_slice(&id_bytes)
         .map_err(|_| Ctap2Status::Other)?;
 
-    let verifying_key = signing_key.verifying_key();
-    let point = verifying_key.to_encoded_point(false);
-    let mut x = [0u8; 32];
-    let mut y = [0u8; 32];
-    x.copy_from_slice(point.x().ok_or(Ctap2Status::Other)?);
-    y.copy_from_slice(point.y().ok_or(Ctap2Status::Other)?);
-    let cose_key = Ec2PublicKey {
-        crv: COSE_CURVE_P256,
-        x,
-        y,
+    // Encoded COSE public key plus the private key material (both 32 bytes
+    // for P-256 scalars and Ed25519 seeds).
+    let mut cose_buf = [0u8; 128];
+    let (private_key, cose_len) = if alg == COSE_ALG_EDDSA {
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let signing_key = EdSigningKey::from_bytes(&seed);
+        let cose_key = OkpPublicKey {
+            crv: COSE_CURVE_ED25519,
+            x: signing_key.verifying_key().to_bytes(),
+        };
+        let len = codec::encode_into(&cose_key, &mut cose_buf).map_err(|_| Ctap2Status::Other)?;
+        (seed, len)
+    } else {
+        let signing_key = generate_signing_key(rng)?;
+        let verifying_key = signing_key.verifying_key();
+        let point = verifying_key.to_sec1_point(false);
+        let mut x = [0u8; 32];
+        let mut y = [0u8; 32];
+        x.copy_from_slice(point.x().ok_or(Ctap2Status::Other)?);
+        y.copy_from_slice(point.y().ok_or(Ctap2Status::Other)?);
+        let cose_key = Ec2PublicKey {
+            crv: COSE_CURVE_P256,
+            x,
+            y,
+        };
+        let len = codec::encode_into(&cose_key, &mut cose_buf).map_err(|_| Ctap2Status::Other)?;
+        let mut private_key = [0u8; 32];
+        private_key.copy_from_slice(&signing_key.to_bytes());
+        (private_key, len)
     };
 
     let flags = FLAG_UP | FLAG_AT | if uv_confirmed { FLAG_UV } else { 0 };
-    let attested = build_attested_credential_data(&credential_id, &cose_key)?;
+    let attested = build_attested_credential_data(&credential_id, &cose_buf[..cose_len])?;
     let auth_data = build_auth_data(request.rp_id.as_str(), flags, 0, Some(&attested))?;
-
-    let mut private_key = [0u8; 32];
-    private_key.copy_from_slice(&signing_key.to_bytes());
-    let signature = sign(&private_key, &auth_data, &request.client_data_hash)?;
+    let signature = sign(&private_key, alg, &auth_data, &request.client_data_hash)?;
 
     store
         .insert(Credential {
@@ -470,6 +515,7 @@ pub fn make_credential<S: CredentialStore, R: Rng>(
             rp_id: request.rp_id.clone(),
             user_id: request.user_id.clone(),
             private_key,
+            algorithm: alg,
             sign_count: 0,
             discoverable: request.rk,
         })
@@ -478,6 +524,7 @@ pub fn make_credential<S: CredentialStore, R: Rng>(
     Ok(MakeCredentialResponse {
         auth_data,
         signature,
+        alg,
     })
 }
 
@@ -518,6 +565,7 @@ pub fn get_assertion<S: CredentialStore, R: Rng>(
     let auth_data = build_auth_data(request.rp_id.as_str(), flags, sign_count, None)?;
     let signature = sign(
         &credential.private_key,
+        credential.algorithm,
         &auth_data,
         &request.client_data_hash,
     )?;
@@ -652,6 +700,7 @@ mod tests {
             rp_id: FixedString::new(rp_id).unwrap(),
             user_id: heapless::Vec::from_slice(user_id).unwrap(),
             exclude_list: heapless::Vec::new(),
+            algs: heapless::Vec::new(),
             rk: true,
             uv: false,
             pin_uv_auth_param: None,
@@ -675,7 +724,7 @@ mod tests {
         client_data_hash: &[u8; 32],
         der: &[u8],
     ) -> bool {
-        let signing_key = SigningKey::from_bytes(FieldBytes::from_slice(private_key)).unwrap();
+        let signing_key = SigningKey::from_slice(private_key).unwrap();
         let verifying_key = signing_key.verifying_key();
         let signature = Signature::from_der(der).unwrap();
         let mut message = heapless::Vec::<u8, MAX_SIGNING_INPUT>::new();
@@ -765,6 +814,145 @@ mod tests {
             make_credential(&mut store, &mut rng, &excluded, true, false),
             Err(Ctap2Status::CredentialExcluded)
         );
+    }
+
+    fn make_request_with_algs(rp_id: &str, user_id: &[u8], algs: &[i64]) -> MakeCredentialRequest {
+        let mut request = make_request(rp_id, user_id);
+        request.algs.extend_from_slice(algs).unwrap();
+        request
+    }
+
+    fn verify_eddsa(
+        seed: &[u8; 32],
+        auth_data: &[u8],
+        client_data_hash: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        use ed25519_dalek::Verifier as _;
+        let verifying_key = EdSigningKey::from_bytes(seed).verifying_key();
+        let Ok(signature) = ed25519_dalek::Signature::from_slice(signature) else {
+            return false;
+        };
+        let mut message = heapless::Vec::<u8, MAX_SIGNING_INPUT>::new();
+        if message.extend_from_slice(auth_data).is_err()
+            || message.extend_from_slice(client_data_hash).is_err()
+        {
+            return false;
+        }
+        verifying_key.verify(&message, &signature).is_ok()
+    }
+
+    #[test]
+    fn make_credential_with_eddsa_creates_verifiable_credential() {
+        let mut store = MemoryCredentialStore::new();
+        let mut rng = TestRng(11);
+        let request = make_request_with_algs("example.com", &[9], &[COSE_ALG_EDDSA]);
+        let response = make_credential(&mut store, &mut rng, &request, true, false).unwrap();
+        assert_eq!(response.alg, COSE_ALG_EDDSA);
+        assert_eq!(response.signature.len(), 64);
+
+        let credential = store.find_by_rp("example.com").unwrap();
+        assert_eq!(credential.algorithm, COSE_ALG_EDDSA);
+
+        // The attested credential data carries an OKP key; decode and check it.
+        let cose_bytes = &response.auth_data[71..];
+        let cose: OkpPublicKey = crate::codec::decode_from(cose_bytes).unwrap();
+        assert_eq!(cose.crv, COSE_CURVE_ED25519);
+
+        assert!(verify_eddsa(
+            &credential.private_key,
+            &response.auth_data,
+            &request.client_data_hash,
+            &response.signature,
+        ));
+    }
+
+    #[test]
+    fn make_credential_with_unsupported_algorithm_is_rejected() {
+        let mut store = MemoryCredentialStore::new();
+        let mut rng = TestRng(12);
+        // RS256 and RSAES-OAEP are not implemented.
+        let request = make_request_with_algs("example.com", &[9], &[-257, -260]);
+        assert_eq!(
+            make_credential(&mut store, &mut rng, &request, true, false),
+            Err(Ctap2Status::UnsupportedAlgorithm)
+        );
+    }
+
+    #[test]
+    fn make_credential_honors_client_algorithm_preference() {
+        let mut store = MemoryCredentialStore::new();
+        let mut rng = TestRng(13);
+        let request =
+            make_request_with_algs("example.com", &[1], &[COSE_ALG_EDDSA, COSE_ALG_ES256]);
+        let response = make_credential(&mut store, &mut rng, &request, true, false).unwrap();
+        assert_eq!(response.alg, COSE_ALG_EDDSA);
+
+        let request =
+            make_request_with_algs("example.org", &[2], &[COSE_ALG_ES256, COSE_ALG_EDDSA]);
+        let response = make_credential(&mut store, &mut rng, &request, true, false).unwrap();
+        assert_eq!(response.alg, COSE_ALG_ES256);
+    }
+
+    #[test]
+    fn get_assertion_signs_with_eddsa() {
+        let mut store = MemoryCredentialStore::new();
+        let mut rng = TestRng(14);
+        let request = make_request_with_algs("example.com", &[7], &[COSE_ALG_EDDSA]);
+        make_credential(&mut store, &mut rng, &request, true, false).unwrap();
+
+        let request = assertion_request("example.com");
+        let assertion = get_assertion(&mut store, &mut rng, &request, true, false).unwrap();
+        assert_eq!(assertion.signature.len(), 64);
+        let credential = store.get(&assertion.credential_id).unwrap();
+        assert!(verify_eddsa(
+            &credential.private_key,
+            &assertion.auth_data,
+            &request.client_data_hash,
+            &assertion.signature,
+        ));
+    }
+
+    #[test]
+    fn credential_without_algorithm_defaults_to_es256() {
+        // Records sealed before EdDSA support carry no algorithm key.
+        let mut buf = [0u8; 256];
+        let mut writer = crate::codec::SliceWriter::new(&mut buf);
+        {
+            let mut e = minicbor::Encoder::new(&mut writer);
+            e.map(6).unwrap();
+            e.u8(0).unwrap();
+            e.bytes(&[9u8; 16]).unwrap();
+            e.u8(1).unwrap();
+            e.str("example.com").unwrap();
+            e.u8(2).unwrap();
+            e.bytes(&[7u8; 1]).unwrap();
+            e.u8(3).unwrap();
+            e.bytes(&[8u8; 32]).unwrap();
+            e.u8(4).unwrap();
+            e.u32(3).unwrap();
+            e.u8(5).unwrap();
+            e.bool(true).unwrap();
+        }
+        let len = writer.len();
+        let credential: Credential = crate::codec::decode_from(&buf[..len]).unwrap();
+        assert_eq!(credential.algorithm, COSE_ALG_ES256);
+        assert_eq!(credential.sign_count, 3);
+    }
+
+    #[test]
+    fn credential_cbor_round_trips_algorithm() {
+        let mut store = MemoryCredentialStore::new();
+        let mut rng = TestRng(15);
+        let request = make_request_with_algs("example.com", &[7], &[COSE_ALG_EDDSA]);
+        make_credential(&mut store, &mut rng, &request, true, false).unwrap();
+        let credential = store.find_by_rp("example.com").unwrap();
+
+        let mut buf = [0u8; 512];
+        let len = crate::codec::encode_into(&credential, &mut buf).unwrap();
+        let decoded: Credential = crate::codec::decode_from(&buf[..len]).unwrap();
+        assert_eq!(decoded, credential);
+        assert_eq!(decoded.algorithm, COSE_ALG_EDDSA);
     }
 
     #[test]

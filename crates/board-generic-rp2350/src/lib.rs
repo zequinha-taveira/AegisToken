@@ -12,6 +12,7 @@
 pub use embassy_rp;
 
 pub mod capabilities;
+pub mod ccid;
 pub mod flash;
 pub mod hid;
 pub mod led;
@@ -24,4 +25,4 @@ pub mod watchdog;
 mod hardware;
 
 pub use capabilities::BoardProfile;
-pub use hardware::{Board, Platform};
+pub use hardware::{Board, BoardParts, DeviceManager};
