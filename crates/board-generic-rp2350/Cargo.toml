@@ -8,6 +8,13 @@ license.workspace = true
 
 [features]
 default = ["rp235xa"]
+# Universal image: RP2350A pinout (30 GPIO, QFN-60 subset). Runs on all four
+# variants (RP2350A/B, RP2354A/B) because the firmware only uses the common
+# subset (GPIO 6..=29, BOOTSEL, USB, QSPI flash, TRNG, watchdog) with a
+# conservative 2 MiB layout, and the package is detected at runtime via
+# SYSINFO.PACKAGE_SEL. RP2354 shares the RP2350 die with stacked flash
+# accessed through the same QSPI driver.
+universal = ["rp235xa"]
 # RP2350A: QFN-60, 30 GPIO, external QSPI flash.
 rp235xa = ["embassy-rp/rp235xa"]
 # RP2350B: QFN-80, 48 GPIO, external QSPI flash.

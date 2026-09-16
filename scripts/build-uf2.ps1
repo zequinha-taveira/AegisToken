@@ -1,8 +1,10 @@
 # Builds the Universal RP2350 Firmware in release mode and converts it to UF2.
 #
-# Usage:  powershell -File scripts/build-uf2.ps1 [-Board rp2350a|rp2350b|rp2354a|rp2354b]
+# Usage:  powershell -File scripts/build-uf2.ps1 [-Board universal|rp2350a|rp2350b|rp2354a|rp2354b]
 #                                                [-BoardProfile <name>]
-# Output: AegisToken_<product>-<version>.uf2 (repository root), where <version>
+# Output: AegisToken-<version>.uf2 for `-Board universal` (single image for all
+#         four variants: RP2350A/B + RP2354A/B), otherwise
+#         AegisToken_<product>-<version>.uf2 (repository root), where <version>
 #         is the workspace version from Cargo.toml and the RP2350A target uses
 #         the `pico2` codename (e.g. AegisToken_pico2-0.1.0.uf2). A non-generic
 #         board profile is appended to the product name.
@@ -18,8 +20,8 @@
 # development update key is embedded and a warning is printed.
 
 param(
-    [ValidateSet("rp2350a", "rp2350b", "rp2354a", "rp2354b")]
-    [string]$Board = "rp2350a",
+    [ValidateSet("universal", "rp2350a", "rp2350b", "rp2354a", "rp2354b")]
+    [string]$Board = "universal",
     [string]$BoardProfile = "generic"
 )
 
@@ -34,10 +36,18 @@ $match = Select-String -LiteralPath $manifest -Pattern '^version\s*=\s*"([^"]+)"
 if (-not $match) { throw "could not read version from $manifest" }
 $version = $match.Matches[0].Groups[1].Value
 
-# RP2350A maps to the Pico 2 product codename; other boards keep the board name.
-$product = if ($Board -eq "rp2350a") { "pico2" } else { $Board }
-if ($BoardProfile -ne "generic") { $product = "$product-$BoardProfile" }
-$out = "AegisToken_$product-$version.uf2"
+# `universal` produces the single unified image AegisToken-<version>.uf2 that
+# runs on all four variants (RP2350A/B + RP2354A/B: same die, runtime package
+# detection, same QSPI flash driver with a conservative 2 MiB layout).
+# Per-variant targets keep the legacy AegisToken_<product>-<version>.uf2 names.
+if ($Board -eq "universal") {
+    $out = "AegisToken-$version.uf2"
+} else {
+    # RP2350A maps to the Pico 2 product codename; other boards keep the board name.
+    $product = if ($Board -eq "rp2350a") { "pico2" } else { $Board }
+    if ($BoardProfile -ne "generic") { $product = "$product-$BoardProfile" }
+    $out = "AegisToken_$product-$version.uf2"
+}
 
 if (-not $env:AEGIS_UPDATE_VENDOR_PUBKEY) {
     Write-Warning ("AEGIS_UPDATE_VENDOR_PUBKEY is not set: this image embeds a " +
