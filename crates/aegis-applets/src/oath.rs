@@ -1011,13 +1011,14 @@ mod tests {
     fn access_code_validate_round_trips() {
         let mut oath = applet();
         let mut rng = TestRng;
-        let key = b"access-key";
+        let mut key = [0u8; 10];
+        rng.fill_bytes(&mut key);
         let challenge = b"12345678";
-        let response = hmac_digest(ALGORITHM_SHA1, key, challenge).unwrap();
+        let response = hmac_digest(ALGORITHM_SHA1, &key, challenge).unwrap();
         let mut data = Vec::<u8, 256>::new();
         let mut key_data = Vec::<u8, 128>::new();
         key_data.push(ALGORITHM_SHA1).unwrap();
-        key_data.extend_from_slice(key).unwrap();
+        key_data.extend_from_slice(&key).unwrap();
         append_tlv(&mut data, TAG_KEY, &key_data);
         append_tlv(&mut data, TAG_CHALLENGE, challenge);
         append_tlv(&mut data, TAG_RESPONSE, &response);
