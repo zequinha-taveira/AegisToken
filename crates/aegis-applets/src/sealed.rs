@@ -27,7 +27,6 @@
 //! [`OpenPgpStore`]: crate::openpgp::OpenPgpStore
 
 use aegis_core::error::CoreError;
-use aegis_core::secret::aead::rand_core::{OsRng, RngCore};
 use aegis_core::secret::{AesGcmSealer, KEY_LEN, NONCE_LEN, TAG_LEN};
 use aegis_core::storage::{MAX_PAYLOAD_BYTES, SLOT_COUNT, SecretStorage};
 use aegis_core::traits::Storage;
@@ -90,10 +89,12 @@ const META_RECORDS: [u16; 6] = [
 /// Build a 12-byte GCM nonce from generation and domain tags.
 ///
 /// The `(applet, shard)` domain keeps nonces unique across shards even when
-/// Generate a fresh nonce for every seal operation.
-fn random_nonce() -> [u8; NONCE_LEN] {
+/// two shards share a generation counter value.
+fn nonce(generation: u64, applet: u16, shard: u16) -> [u8; NONCE_LEN] {
     let mut out = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut out);
+    out[..8].copy_from_slice(&generation.to_le_bytes());
+    out[8..10].copy_from_slice(&applet.to_le_bytes());
+    out[10..12].copy_from_slice(&shard.to_le_bytes());
     out
 }
 
@@ -111,7 +112,7 @@ fn seal_cell(
     if out.len() < total {
         return Err(CoreError::StorageError);
     }
-    let nonce = random_nonce();
+    let nonce = nonce(generation, applet, shard);
     out[..NONCE_LEN].copy_from_slice(&nonce);
     let mut plain = [0u8; GEN_LEN + PRESENT_LEN + SHARD_BODY_MAX];
     plain[..GEN_LEN].copy_from_slice(&generation.to_le_bytes());
@@ -637,7 +638,7 @@ impl<S: Storage + Clone, const SHARDS: usize> SealedBlob<S, SHARDS> {
             plain[..GEN_LEN].copy_from_slice(&generation.to_le_bytes());
             plain[GEN_LEN..GEN_LEN + chunk.len()].copy_from_slice(chunk);
             let body_len = GEN_LEN + chunk.len();
-            let nonce = random_nonce();
+            let nonce = nonce(generation, applet, index as u16);
             blob[..NONCE_LEN].copy_from_slice(&nonce);
             let sealed_len =
                 self.sealer
@@ -646,7 +647,7 @@ impl<S: Storage + Clone, const SHARDS: usize> SealedBlob<S, SHARDS> {
         }
         plain[..GEN_LEN].copy_from_slice(&generation.to_le_bytes());
         plain[GEN_LEN..GEN_LEN + COMMIT_LEN].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        let nonce = random_nonce();
+        let nonce = nonce(generation, applet, SHARDS as u16);
         blob[..NONCE_LEN].copy_from_slice(&nonce);
         let sealed_len = self.sealer.seal(
             &nonce,
@@ -1058,7 +1059,7 @@ mod tests {
         // data shard still only holds generation 1.
         let sealer = AesGcmSealer::new(&key).unwrap();
         let mut blob = [0u8; MAX_PAYLOAD_BYTES];
-        let nonce = random_nonce();
+        let nonce = nonce(2, OATH_APPLET_TAG, 2);
         blob[..NONCE_LEN].copy_from_slice(&nonce);
         let mut plain = [0u8; GEN_LEN + COMMIT_LEN];
         plain[..GEN_LEN].copy_from_slice(&2u64.to_le_bytes());

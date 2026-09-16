@@ -122,12 +122,12 @@ const DEFAULT_CCC: &[u8] = &[
 /// Key history with no retired keys.
 const KEY_HISTORY: &[u8] = &[0xC1, 0x01, 0x00, 0xC2, 0x01, 0x00, 0xC3, 0x01, 0x00];
 
-/// Generate a 3DES management key.
-fn default_mgmt_key(rng: &mut impl Rng) -> [u8; 24] {
-    let mut key = [0u8; 24];
-    rng.fill_bytes(&mut key);
-    key
-}
+/// Default 3DES management key (`0102030405060708` repeated three times).
+/// NIST SP 800-73-4 interop default: must exist, personalized at runtime.
+pub const DEFAULT_MGMT_KEY: [u8; 24] = [
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+];
 
 /// Default PIV PIN (`123456`).
 pub const DEFAULT_PIN: &[u8] = b"123456";
@@ -1532,8 +1532,7 @@ mod tests {
         );
         assert_eq!(sw, Sw::OK);
         let encrypted = find_in_7c(&data, 0x81).expect("challenge present");
-        let mgmt_key = default_mgmt_key(rng);
-        let nonce = tdes_ecb_decrypt(&mgmt_key, encrypted);
+        let nonce = tdes_ecb_decrypt(&DEFAULT_MGMT_KEY, encrypted);
         let mut body = HeaplessVec::<u8, 32>::new();
         body.extend_from_slice(&[0x7C, 0x0A, 0x82, 0x08]).unwrap();
         body.extend_from_slice(&nonce).unwrap();
