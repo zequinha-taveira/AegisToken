@@ -1011,8 +1011,7 @@ mod tests {
     fn access_code_validate_round_trips() {
         let mut oath = applet();
         let mut rng = TestRng;
-        let mut key = [0u8; 10];
-        rng.fill_bytes(&mut key);
+        let key = core::array::from_fn(|_| rng.next_u32() as u8);
         let challenge = b"12345678";
         let response = hmac_digest(ALGORITHM_SHA1, &key, challenge).unwrap();
         let mut data = Vec::<u8, 256>::new();
