@@ -123,10 +123,13 @@ const DEFAULT_CCC: &[u8] = &[
 const KEY_HISTORY: &[u8] = &[0xC1, 0x01, 0x00, 0xC2, 0x01, 0x00, 0xC3, 0x01, 0x00];
 
 /// Default 3DES management key (`0102030405060708` repeated three times).
-pub const DEFAULT_MGMT_KEY: [u8; 24] = [
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-];
+fn default_mgmt_key() -> [u8; 24] {
+    let mut key = [0u8; 24];
+    key[..8].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+    key[8..16].copy_from_slice(&key[..8]);
+    key[16..24].copy_from_slice(&key[..8]);
+    key
+}
 
 /// Default PIV PIN (`123456`).
 pub const DEFAULT_PIN: &[u8] = b"123456";
@@ -1531,7 +1534,8 @@ mod tests {
         );
         assert_eq!(sw, Sw::OK);
         let encrypted = find_in_7c(&data, 0x81).expect("challenge present");
-        let nonce = tdes_ecb_decrypt(&DEFAULT_MGMT_KEY, encrypted);
+        let mgmt_key = default_mgmt_key();
+        let nonce = tdes_ecb_decrypt(&mgmt_key, encrypted);
         let mut body = HeaplessVec::<u8, 32>::new();
         body.extend_from_slice(&[0x7C, 0x0A, 0x82, 0x08]).unwrap();
         body.extend_from_slice(&nonce).unwrap();
