@@ -325,16 +325,13 @@ struct MgmtKey {
 }
 
 impl MgmtKey {
-    const fn default_key() -> Self {
+    fn random(rng: &mut dyn Rng) -> Self {
         let mut key = [0u8; 32];
-        let mut index = 0;
-        while index < DEFAULT_MGMT_KEY.len() {
-            key[index] = DEFAULT_MGMT_KEY[index];
-            index += 1;
-        }
+        let len = DEFAULT_MGMT_KEY.len();
+        rng.fill_bytes(&mut key[..len]);
         Self {
             algorithm: ALG_TDES,
-            len: DEFAULT_MGMT_KEY.len(),
+            len,
             key,
         }
     }
@@ -427,14 +424,14 @@ pub struct Piv<S: PivStore> {
 impl<S: PivStore> Piv<S> {
     /// Create the applet over `store`.
     #[must_use]
-    pub const fn new(store: S) -> Self {
+    pub fn new(store: S, rng: &mut dyn Rng) -> Self {
         Self {
             store,
             value: Vec::new(),
             out: Vec::new(),
             pin: PinSlot::new(PIV_PIN_POLICY),
             puk: PinSlot::new(PIV_PIN_POLICY),
-            mgmt: MgmtKey::default_key(),
+            mgmt: MgmtKey::random(rng),
             pin_verified: false,
             mgmt_authenticated: false,
             witness: None,
