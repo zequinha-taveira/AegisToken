@@ -7,15 +7,16 @@ members = [
     "crates/security-key-ctap",
     "crates/security-key-usb",
     "crates/security-key-hal",
+    "crates/aegis-applets",
     "crates/aegis-core",
     "crates/aegistoken-host",
     "crates/board-generic-rp2350",
     "crates/firmware-universal-rp2350",
 ]
-# Only the host-testable core is built by default so `cargo test` / `cargo build`
+# Only the host-testable crates are built by default so `cargo test` / `cargo build`
 # work on the host without an embedded target. Embedded crates are built
 # explicitly with `--target thumbv8m.main-none-eabihf` (see .cargo aliases).
-default-members = ["crates/aegis-core"]
+default-members = ["crates/aegis-core", "crates/aegis-applets"]
 
 [workspace.package]
 version = "0.1.0"
@@ -25,6 +26,7 @@ license = "MIT OR Apache-2.0"
 authors = ["AegisToken"]
 
 [workspace.dependencies]
+aegis-applets = { path = "crates/aegis-applets" }
 aegis-core = { path = "crates/aegis-core" }
 # Default features off: consumers must pick exactly one chip target
 # (`rp235xa`/`rp235xb`, or the `rp2354a`/`rp2354b` aliases).
@@ -39,19 +41,25 @@ rusb = { version = "0.9", default-features = false, features = ["vendored"] }
 minicbor = { version = "2.3", default-features = false, features = ["derive"] }
 heapless = { version = "0.9", default-features = false }
 zeroize = { version = "1.9", default-features = false }
-aes = { version = "0.8", default-features = false }
-cbc = { version = "0.1", default-features = false, features = ["block-padding"] }
-hmac = { version = "0.12", default-features = false }
-aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+aes = { version = "0.9", default-features = false }
+cbc = { version = "0.2", default-features = false, features = ["block-padding"] }
+hmac = { version = "0.13", default-features = false }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }
+crypto-bigint = { version = "0.7", default-features = false }
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "arithmetic", "ecdh"] }
-sha2 = { version = "0.10", default-features = false }
+p384 = { version = "0.14", default-features = false, features = ["ecdsa", "arithmetic"] }
+ed25519-dalek = { version = "2.2", default-features = false }
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets"] }
+des = { version = "0.8", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+sha1 = { version = "0.11", default-features = false }
 
 # Embedded dependencies.
 embassy-executor = { version = "0.10", features = ["defmt"] }
 embassy-time = { version = "0.5", features = ["defmt"] }
 embassy-futures = "0.1"
 embassy-sync = { version = "0.8", features = ["defmt"] }
-embassy-usb = { version = "0.6", features = ["defmt"] }
+embassy-usb = { version = "0.6", features = ["defmt", "max-interface-count-8", "max-handler-count-8"] }
 embassy-rp = { version = "0.10", features = [
     "defmt",
     "unstable-pac",

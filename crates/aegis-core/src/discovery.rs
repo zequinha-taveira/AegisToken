@@ -1,81 +1,68 @@
-//! Capability derivation from raw hardware facts (PRD §8, §9).
+//! Capability derivation from the board hardware profile and the discovered MCU
+//! variant (PRD §8, §9).
 //!
-//! The board layer gathers [`HardwareFacts`] from the chip and board. This
-//! module turns those facts into the [`DeviceCapabilities`] the firmware is the
-//! authority on. Keeping the derivation here makes it host-testable and free of
-//! any hardware dependency.
+//! The board layer gathers the MCU facts (`family`, `package`, `revision`) and
+//! selects a [`BoardHardwareProfile`]. This module turns those into the
+//! [`DeviceCapabilities`] the firmware is the authority on. Keeping the
+//! derivation here makes it host-testable and free of any hardware dependency.
 
 use crate::capabilities::{
     DeviceCapabilities, FlashCapabilities, LedCapabilities, LedDriverCapabilities,
     PresenceCapabilities, Rp2350Family, Rp2350Package, UsbCapabilities,
 };
-
-/// Default flash capacity assumed when no device could be interrogated.
-pub const DEFAULT_FLASH_SIZE_BYTES: u32 = 2 * 1024 * 1024;
+use crate::configuration::{LedDriver, PresenceSource};
+use crate::hardware_profile::BoardHardwareProfile;
 
 /// Default maximum USB product string length.
 pub const DEFAULT_PRODUCT_STRING_LEN: u8 = 64;
 
-/// Facts discovered about the chip and the board it is mounted on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HardwareFacts {
-    /// Die family (RP2350 vs RP2354).
-    pub family: Rp2350Family,
-    /// Physical package, from `SYSINFO.PACKAGE_SEL`.
-    pub package: Rp2350Package,
-    /// Chip revision, from `SYSINFO.CHIP_ID.REVISION`.
-    pub revision: u8,
-    /// Flash capacity read from the device JEDEC id, when available.
-    pub flash_size_bytes: Option<u32>,
-    /// GPIO driving the status LED, when the board has one.
-    pub led_gpio: Option<u8>,
-    /// Whether the LED GPIO may be chosen by configuration.
-    pub led_configurable_gpio: bool,
-    /// Whether brightness is actually controllable.
-    pub led_brightness: bool,
-    /// Brightness used when `led_brightness` is false.
-    pub led_default_brightness: u8,
-    /// LED driver technologies present.
-    pub led_drivers: LedDriverCapabilities,
-    /// GPIO of a dedicated external presence button, when present.
-    pub external_button_gpio: Option<u8>,
-}
-
-impl HardwareFacts {
-    /// Minimal facts for a generic RP2350A board with an LED on GPIO25.
-    #[must_use]
-    pub const fn generic_rp2350a() -> Self {
-        Self {
-            family: Rp2350Family::Rp2350,
-            package: Rp2350Package::Qfn60,
-            revision: 0,
-            flash_size_bytes: None,
-            led_gpio: Some(25),
-            led_configurable_gpio: false,
-            led_brightness: false,
-            led_default_brightness: 255,
-            led_drivers: LedDriverCapabilities {
-                gpio: true,
-                pwm: false,
-                ws2812: false,
-            },
-            external_button_gpio: None,
-        }
+/// Map an LED driver selection to the capability flags.
+#[must_use]
+const fn driver_caps(driver: Option<LedDriver>) -> LedDriverCapabilities {
+    match driver {
+        Some(LedDriver::Gpio) => LedDriverCapabilities {
+            gpio: true,
+            pwm: false,
+            ws2812: false,
+        },
+        Some(LedDriver::Pwm) => LedDriverCapabilities {
+            gpio: false,
+            pwm: true,
+            ws2812: false,
+        },
+        Some(LedDriver::Ws2812) => LedDriverCapabilities {
+            gpio: false,
+            pwm: false,
+            ws2812: true,
+        },
+        None => LedDriverCapabilities {
+            gpio: false,
+            pwm: false,
+            ws2812: false,
+        },
     }
 }
 
-/// Derive the advertised capability set from discovered facts.
+/// Derive the advertised capability set from a board hardware profile and the
+/// discovered MCU variant.
 #[must_use]
-pub fn derive_capabilities(facts: &HardwareFacts) -> DeviceCapabilities {
-    let internal_flash = matches!(facts.family, Rp2350Family::Rp2354);
+pub fn derive_capabilities(
+    profile: &BoardHardwareProfile,
+    family: Rp2350Family,
+    package: Rp2350Package,
+) -> DeviceCapabilities {
+    let internal_flash = matches!(family, Rp2350Family::Rp2354);
+    let bootsel = matches!(profile.presence.source, PresenceSource::Bootsel);
+    let external_button = matches!(profile.presence.source, PresenceSource::ExternalButton)
+        && profile.presence.gpio.is_some();
     DeviceCapabilities {
-        family: facts.family,
-        package: facts.package,
-        gpio_count: facts.package.gpio_count(),
+        family,
+        package,
+        gpio_count: package.gpio_count(),
         flash: FlashCapabilities {
             external: !internal_flash,
             internal: internal_flash,
-            size_bytes: facts.flash_size_bytes.unwrap_or(DEFAULT_FLASH_SIZE_BYTES),
+            size_bytes: profile.flash.size_bytes,
         },
         usb: UsbCapabilities {
             device: true,
@@ -84,17 +71,22 @@ pub fn derive_capabilities(facts: &HardwareFacts) -> DeviceCapabilities {
             max_product_string_len: DEFAULT_PRODUCT_STRING_LEN,
         },
         led: LedCapabilities {
-            available: facts.led_gpio.is_some(),
-            configurable_gpio: facts.led_configurable_gpio,
-            brightness: facts.led_brightness,
-            drivers: facts.led_drivers,
-            default_gpio: facts.led_gpio,
-            default_brightness: facts.led_default_brightness,
+            available: profile.led.available(),
+            configurable_gpio: profile.led.configurable_gpio,
+            candidate_gpio_mask: profile.led.candidate_mask(),
+            brightness: profile.led.brightness,
+            drivers: driver_caps(profile.led.driver),
+            default_gpio: profile.led.gpio,
+            default_brightness: profile.led.default_brightness,
         },
         presence: PresenceCapabilities {
-            bootsel: true,
-            external_button: facts.external_button_gpio.is_some(),
-            external_button_gpio: facts.external_button_gpio,
+            bootsel,
+            external_button,
+            external_button_gpio: if external_button {
+                profile.presence.gpio
+            } else {
+                None
+            },
         },
     }
 }
@@ -102,61 +94,92 @@ pub fn derive_capabilities(facts: &HardwareFacts) -> DeviceCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::configuration::LedDriver;
+    use crate::hardware_profile::{FlashProfile, LedProfile, PresenceProfile};
 
-    #[test]
-    fn package_sel_mapping_is_inverted_as_documented() {
-        // PACKAGE_SEL = 1 => QFN60.
-        assert_eq!(Rp2350Package::from_package_sel(true), Rp2350Package::Qfn60);
-        assert_eq!(Rp2350Package::from_package_sel(false), Rp2350Package::Qfn80);
+    fn profile() -> BoardHardwareProfile {
+        BoardHardwareProfile::new(
+            LedProfile::gpio(25, false),
+            PresenceProfile::bootsel(20, 15_000),
+            FlashProfile::new(2 * 1024 * 1024),
+        )
     }
 
     #[test]
     fn qfn80_yields_48_gpio() {
-        let mut facts = HardwareFacts::generic_rp2350a();
-        facts.package = Rp2350Package::Qfn80;
-        facts.family = Rp2350Family::Rp2350;
-        let caps = derive_capabilities(&facts);
+        let caps = derive_capabilities(&profile(), Rp2350Family::Rp2350, Rp2350Package::Qfn80);
         assert_eq!(caps.gpio_count, 48);
         assert_eq!(caps.package, Rp2350Package::Qfn80);
     }
 
     #[test]
     fn rp2354_uses_internal_flash() {
-        let mut facts = HardwareFacts::generic_rp2350a();
-        facts.family = Rp2350Family::Rp2354;
-        let caps = derive_capabilities(&facts);
+        let caps = derive_capabilities(&profile(), Rp2350Family::Rp2354, Rp2350Package::Qfn60);
         assert!(caps.flash.internal && !caps.flash.external);
     }
 
     #[test]
-    fn flash_size_falls_back_to_default() {
-        let facts = HardwareFacts::generic_rp2350a();
-        assert_eq!(
-            derive_capabilities(&facts).flash.size_bytes,
-            DEFAULT_FLASH_SIZE_BYTES
-        );
-
-        let mut facts = facts;
-        facts.flash_size_bytes = Some(4 * 1024 * 1024);
-        assert_eq!(
-            derive_capabilities(&facts).flash.size_bytes,
-            4 * 1024 * 1024
-        );
+    fn flash_size_comes_from_the_profile() {
+        let mut profile = profile();
+        profile.flash = FlashProfile::new(8 * 1024 * 1024);
+        let caps = derive_capabilities(&profile, Rp2350Family::Rp2350, Rp2350Package::Qfn60);
+        assert_eq!(caps.flash.size_bytes, 8 * 1024 * 1024);
     }
 
     #[test]
-    fn no_led_gpio_means_led_unavailable() {
-        let mut facts = HardwareFacts::generic_rp2350a();
-        facts.led_gpio = None;
-        assert!(!derive_capabilities(&facts).led.available);
+    fn no_led_profile_means_led_unavailable() {
+        let mut profile = profile();
+        profile.led = LedProfile::NONE;
+        let caps = derive_capabilities(&profile, Rp2350Family::Rp2350, Rp2350Package::Qfn60);
+        assert!(!caps.led.available);
+        assert_eq!(caps.led.drivers, LedDriverCapabilities::default());
+    }
+
+    #[test]
+    fn led_driver_is_reflected_in_capabilities() {
+        let mut profile = profile();
+        profile.led.driver = Some(LedDriver::Pwm);
+        let caps = derive_capabilities(&profile, Rp2350Family::Rp2350, Rp2350Package::Qfn60);
+        assert!(caps.led.available && caps.led.drivers.pwm && !caps.led.drivers.gpio);
+    }
+
+    #[test]
+    fn configurable_led_gpio_is_reflected_as_a_mask() {
+        let mut profile = profile();
+        profile.led = LedProfile::configurable_gpio(16, false, &[6, 16, 22]);
+        let caps = derive_capabilities(&profile, Rp2350Family::Rp2350, Rp2350Package::Qfn60);
+        assert!(caps.led.configurable_gpio);
+        assert_eq!(caps.led.candidate_gpio_mask & (1 << 16), 1 << 16);
+        assert_eq!(caps.led.candidate_gpio_mask & (1 << 7), 0);
     }
 
     #[test]
     fn external_button_is_reflected() {
-        let mut facts = HardwareFacts::generic_rp2350a();
-        facts.external_button_gpio = Some(6);
-        let caps = derive_capabilities(&facts);
+        let mut profile = profile();
+        profile.presence = PresenceProfile::external_button(6, true, 20, 15_000);
+        let caps = derive_capabilities(&profile, Rp2350Family::Rp2350, Rp2350Package::Qfn60);
         assert!(caps.presence.external_button);
         assert_eq!(caps.presence.external_button_gpio, Some(6));
+    }
+
+    #[test]
+    fn presence_source_is_mutually_exclusive() {
+        let mut profile = profile();
+        profile.presence = PresenceProfile::bootsel(20, 15_000);
+        let caps = derive_capabilities(&profile, Rp2350Family::Rp2350, Rp2350Package::Qfn60);
+        assert!(caps.presence.bootsel);
+        assert!(!caps.presence.external_button);
+
+        profile.presence = PresenceProfile::external_button(6, true, 20, 15_000);
+        let caps = derive_capabilities(&profile, Rp2350Family::Rp2350, Rp2350Package::Qfn60);
+        assert!(!caps.presence.bootsel);
+        assert!(caps.presence.external_button);
+        assert_eq!(caps.presence.external_button_gpio, Some(6));
+    }
+
+    #[test]
+    fn usb_always_declares_both_hid_interfaces() {
+        let caps = derive_capabilities(&profile(), Rp2350Family::Rp2350, Rp2350Package::Qfn60);
+        assert!(caps.usb.device && caps.usb.fido_hid && caps.usb.management_hid);
     }
 }

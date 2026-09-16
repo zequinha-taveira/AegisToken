@@ -40,3 +40,19 @@ pub fn read_root_key() -> Result<[u8; KEY_LEN], CoreError> {
     }
     Ok(key)
 }
+
+/// Read the unique 64-bit chip identifier fused into OTP rows `0x0..=0x3`.
+///
+/// This is the chip serial number, distinct from the JEDEC `SYSINFO.CHIP_ID`
+/// part/revision. It gives each device a stable identity independent of the
+/// carrier board, and is used to derive the USB serial number.
+///
+/// Raspberry Pi describes this serial as highly likely but not guaranteed to be
+/// unique, so it must not be treated as a cryptographic identifier; the sealed
+/// per-device key remains the security boundary.
+///
+/// Returns [`CoreError::StorageError`] when OTP is not readable (e.g. locked by
+/// the boot process).
+pub fn read_unique_id() -> Result<u64, CoreError> {
+    embassy_rp::otp::get_chipid().map_err(|_| CoreError::StorageError)
+}

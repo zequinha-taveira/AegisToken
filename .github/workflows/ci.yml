@@ -11,7 +11,7 @@ env:
 
 jobs:
   host:
-    name: host (aegis-core)
+    name: host (aegis-core, aegis-applets)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -21,10 +21,14 @@ jobs:
           rustup component add rustfmt clippy
       - name: Format
         run: cargo fmt --all --check
-      - name: Clippy
+      - name: Clippy (core)
         run: cargo clippy -p aegis-core --all-targets -- -D warnings
-      - name: Test
+      - name: Test (core)
         run: cargo test -p aegis-core
+      - name: Clippy (applets)
+        run: cargo clippy -p aegis-applets --all-targets -- -D warnings
+      - name: Test (applets)
+        run: cargo test -p aegis-applets
 
   host-tool:
     name: host tool (aegistoken-host)
@@ -46,10 +50,40 @@ jobs:
         board: [rp2350a, rp2350b, rp2354a, rp2354b]
     steps:
       - uses: actions/checkout@v7
-      - name: Install target
-        run: rustup target add thumbv8m.main-none-eabihf
+      - name: Install target and components
+        run: |
+          rustup target add thumbv8m.main-none-eabihf
+          rustup component add clippy
+      - name: Clippy board and firmware
+        run: >-
+          cargo clippy -p firmware-universal-rp2350
+          --no-default-features --features ${{ matrix.board }}
+          --target thumbv8m.main-none-eabihf --release -- -D warnings
       - name: Build firmware
         run: >-
           cargo build -p firmware-universal-rp2350
           --no-default-features --features ${{ matrix.board }}
+          --target thumbv8m.main-none-eabihf --release
+
+  firmware-profiles:
+    name: firmware profile (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        profile: [generic, waveshare-rp2350-zero, pimoroni-tiny-2350]
+    env:
+      AEGIS_BOARD: ${{ matrix.profile }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install target and components
+        run: |
+          rustup target add thumbv8m.main-none-eabihf
+          rustup component add clippy
+      - name: Clippy board and firmware
+        run: >-
+          cargo clippy -p board-generic-rp2350 -p firmware-universal-rp2350
+          --target thumbv8m.main-none-eabihf --release -- -D warnings
+      - name: Build firmware
+        run: >-
+          cargo build -p firmware-universal-rp2350
           --target thumbv8m.main-none-eabihf --release

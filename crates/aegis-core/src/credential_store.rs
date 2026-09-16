@@ -152,8 +152,9 @@ impl<S: Storage> SealedCredentialStore<S> {
 
         if let Some((_sequence, length)) = secret_storage.load(&mut blob)? {
             if length >= NONCE_LEN + TAG_LEN {
-                let mut nonce = [0u8; NONCE_LEN];
-                nonce.copy_from_slice(&blob[..NONCE_LEN]);
+                let nonce: [u8; NONCE_LEN] = blob[..NONCE_LEN]
+                    .try_into()
+                    .map_err(|_| CoreError::StorageError)?;
                 let mut plain = [0u8; MAX_SEALED_PLAIN];
                 let plain_len = sealer.open(&nonce, &blob[NONCE_LEN..length], &mut plain)?;
                 state = decode_db(&plain[..plain_len])?;
@@ -173,7 +174,7 @@ impl<S: Storage> SealedCredentialStore<S> {
     fn flush(&mut self) -> Result<(), CoreError> {
         self.counter = self.counter.wrapping_add(1);
 
-        let mut nonce = [0u8; NONCE_LEN];
+        let mut nonce: [u8; NONCE_LEN] = Default::default();
         nonce[..8].copy_from_slice(&self.counter.to_le_bytes());
 
         let mut plain = [0u8; MAX_SEALED_PLAIN];
@@ -327,7 +328,9 @@ mod tests {
     use crate::configuration::FixedString;
 
     const SLOT_SIZE: u32 = 4096;
-    const KEY: [u8; KEY_LEN] = [0x5A; KEY_LEN];
+    fn test_key(seed: u8) -> [u8; KEY_LEN] {
+        core::array::from_fn(|i| seed ^ (i as u8))
+    }
 
     struct RamStorage {
         data: [u8; 16384],
@@ -377,6 +380,7 @@ mod tests {
             rp_id: FixedString::new("example.com").unwrap(),
             user_id: heapless::Vec::from_slice(&[id]).unwrap(),
             private_key: [id; 32],
+            algorithm: crate::ctap2::COSE_ALG_ES256,
             sign_count: 0,
             discoverable: true,
         }
@@ -384,7 +388,8 @@ mod tests {
 
     #[test]
     fn empty_store_opens() {
-        let store = SealedCredentialStore::open(RamStorage::new(), 0, SLOT_SIZE, &KEY).unwrap();
+        let store =
+            SealedCredentialStore::open(RamStorage::new(), 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
         assert_eq!(store.count(), 0);
         assert!(store.pin_hash().is_none());
     }
@@ -393,11 +398,13 @@ mod tests {
     fn credentials_and_pin_persist_across_reopen() {
         let mut storage = RamStorage::new();
         {
-            let mut store = SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &KEY).unwrap();
+            let mut store =
+                SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
             store.insert(credential(1)).unwrap();
             store.set_pin([0x77; 32]).unwrap();
         }
-        let store = SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &KEY).unwrap();
+        let store =
+            SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
         assert_eq!(store.count(), 1);
         assert_eq!(store.get(&[1u8; 16]).unwrap().user_id[0], 1);
         assert_eq!(store.pin_hash(), Some([0x77; 32]));
@@ -407,17 +414,19 @@ mod tests {
     fn wrong_key_fails_closed() {
         let mut storage = RamStorage::new();
         {
-            let mut store = SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &KEY).unwrap();
+            let mut store =
+                SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
             store.insert(credential(2)).unwrap();
         }
-        let result = SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &[0x5B; KEY_LEN]);
+        let result = SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5B));
         assert!(result.is_err());
     }
 
     #[test]
     fn reset_clears_everything() {
         let mut storage = RamStorage::new();
-        let mut store = SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &KEY).unwrap();
+        let mut store =
+            SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
         store.insert(credential(3)).unwrap();
         store.set_pin([0x11; 32]).unwrap();
         store.reset().unwrap();
@@ -429,12 +438,14 @@ mod tests {
     fn sign_count_increments_and_persists() {
         let mut storage = RamStorage::new();
         {
-            let mut store = SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &KEY).unwrap();
+            let mut store =
+                SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
             store.insert(credential(4)).unwrap();
             assert_eq!(store.next_sign_count(&[4u8; 16]), Some(1));
             assert_eq!(store.next_sign_count(&[4u8; 16]), Some(2));
         }
-        let store = SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &KEY).unwrap();
+        let store =
+            SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
         assert_eq!(store.get(&[4u8; 16]).unwrap().sign_count, 2);
     }
 }

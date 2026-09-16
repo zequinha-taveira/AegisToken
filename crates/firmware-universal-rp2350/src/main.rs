@@ -7,33 +7,49 @@
 //! power-fail-safe two-slot store and reloaded (with fallback) on boot. The
 //! device root key can be read from OTP for sealed secret storage.
 
+use aegis_applets::card::{Card, Outcome};
+use aegis_applets::oath::{MemoryOathStore, Oath};
+use aegis_applets::openpgp::{MemoryOpenPgpStore, OpenPgp};
+use aegis_applets::piv::{MemoryPivStore, Piv};
+use aegis_applets::router::Applet;
+use aegis_applets::sealed::{
+    OATH_COMMIT_STORE, OATH_DATA_STORE_BASE, OATH_SHARDS, OPENPGP_COMMIT_STORE,
+    OPENPGP_DATA_STORE_BASE, OPENPGP_SHARDS, PivLayout, SealedOathStore, SealedOpenPgpStore,
+    SealedPivStore,
+};
 use aegis_core::authenticator::{self, CredentialManagementRequest, MemoryCredentialStore};
+use aegis_core::capabilities::Rp2350Family;
 use aegis_core::configuration::{DeviceConfig, LedBehavior, ValidationContext};
 use aegis_core::ctap2::{self, Ctap2Request};
 use aegis_core::ctaphid::{self, Assembler, CtapHidCommand, CtapHidError};
+use aegis_core::identity::BoardIdentity;
 use aegis_core::lifecycle::LifecycleState;
 use aegis_core::management_protocol::{ManagementCommand, ManagementService};
 use aegis_core::pin::{
     ClientPin, ClientPinRequest, SUB_GET_KEY_AGREEMENT, SUB_GET_PIN_TOKEN,
     SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS, SUB_GET_RETRIES, SUB_SET_PIN,
 };
-use aegis_core::presence::PresenceTiming;
 use aegis_core::storage::ConfigStorage;
-use aegis_core::traits::Rp2350Hardware;
+use aegis_core::traits::{Led, Rp2350Hardware, Storage};
 use aegis_core::u2f;
 use aegis_core::update::{self, UpdateSession};
-use board_generic_rp2350::presence::await_bootsel;
+use board_generic_rp2350::flash::{FlashStorage, RegionStorage};
+use board_generic_rp2350::presence::PresenceAdapter;
 use board_generic_rp2350::rng::HardwareRng;
 use board_generic_rp2350::usb::{
-    FidoReader, FidoWriter, KeyboardWriter, ManagementReader, ManagementWriter, RpUsb, Usb,
+    Ccid, FidoReader, FidoWriter, KeyboardWriter, ManagementReader, ManagementWriter, RpUsb, Usb,
 };
-use board_generic_rp2350::{Board, BoardProfile, Platform, embassy_rp};
+use board_generic_rp2350::watchdog::WatchdogHandle;
+use board_generic_rp2350::{Board, BoardParts, BoardProfile, DeviceManager, embassy_rp};
+use core::cell::RefCell;
 use defmt::info;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_futures::join::{join, join3};
+use embassy_futures::join::join3;
 use embassy_futures::select::{Either, select};
+use embassy_sync::blocking_mutex::CriticalSectionMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use embassy_usb::UsbDevice;
@@ -53,14 +69,22 @@ static DETACH: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Vendor Management HID command: return the last FIDO command/status pair.
 const CMD_GET_LAST_FIDO_STATUS: u8 = 0x14;
 
-/// Flash capacity known at build time, used to size the flash driver.
-const FLASH_SIZE: usize = 2 * 1024 * 1024;
+/// Flash capacity known at build time, used to size the flash driver. Taken
+/// from the board hardware profile so each carrier declares its own capacity.
+const FLASH_SIZE: usize = BOARD_PROFILE.hardware.flash.size_bytes as usize;
 
-/// Base offset of the configuration slots.
-const CONFIG_BASE: u32 = 0x100000;
+/// Base offset of the configuration slots, from the board profile layout.
+const CONFIG_BASE: u32 = BOARD_PROFILE.hardware.flash.layout.config_offset;
 
 /// Size of one storage slot; must match the flash erase granularity.
-const SLOT_SIZE: u32 = 4096;
+const SLOT_SIZE: u32 = BOARD_PROFILE.hardware.flash.layout.slot_size;
+
+/// Sealed applet stores must fit the applet flash region with room to spare
+/// for the FIDO credential store.
+const _: () = assert!(
+    aegis_applets::sealed::APPLET_STORE_COUNT
+        <= BOARD_PROFILE.hardware.flash.layout.applet_store_count()
+);
 
 /// Watchdog timeout while the main loop is running.
 const WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5_000);
@@ -69,17 +93,12 @@ const WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// (CTAP1/U2F).
 const CTAPHID_CAPABILITIES: u8 = 0x0D;
 
-/// Presence timing used for FIDO operations.
-const PRESENCE_TIMING: PresenceTiming = PresenceTiming {
-    debounce_ms: 20,
-    timeout_ms: 15_000,
-};
-
-/// Base offset of the firmware staging region (separate from the running image).
-const STAGING_BASE: u32 = 0x140000;
+/// Base offset of the firmware staging region (separate from the running image),
+/// from the board profile layout.
+const STAGING_BASE: u32 = BOARD_PROFILE.hardware.flash.layout.staging_offset;
 
 /// Flash erase granularity for the staging region.
-const STAGING_ERASE_SIZE: u32 = 4096;
+const STAGING_ERASE_SIZE: u32 = SLOT_SIZE;
 
 /// Minimum rollback counter accepted for an update.
 const INSTALLED_ROLLBACK: u32 = 1;
@@ -89,8 +108,11 @@ const INSTALLED_ROLLBACK: u32 = 1;
 include!(concat!(env!("OUT_DIR"), "/vendor_key.rs"));
 
 // Board target selected at build time. The RP2350 and RP2354 variants share the
-// same wiring; only the flash kind (external vs in-package) differs. Enabling
-// two targets at once is a compile error by design (duplicate definition).
+// same die and wiring; only the package (30 vs 48 GPIO, detected at runtime
+// via PACKAGE_SEL) and the flash kind (external vs stacked, same QSPI driver
+// and 2 MiB layout) differ. `universal` covers all four variants with the
+// RP2350A pinout subset. Enabling two targets at once is a compile error by
+// design.
 #[cfg(all(
     any(feature = "rp2350a", feature = "rp2350b"),
     any(feature = "rp2354a", feature = "rp2354b")
@@ -99,15 +121,24 @@ compile_error!("select exactly one board target (rp2350a/b or rp2354a/b)");
 
 #[cfg(all(
     not(any(feature = "rp2354a", feature = "rp2354b")),
-    not(any(feature = "rp2350a", feature = "rp2350b"))
+    not(any(feature = "rp2350a", feature = "rp2350b")),
+    not(feature = "universal")
 ))]
-compile_error!("select a board target: rp2350a, rp2350b, rp2354a or rp2354b");
+compile_error!("select a board target: universal, rp2350a, rp2350b, rp2354a or rp2354b");
 
+// Carrier profile (board identity and USB VID/PID), generated by `build.rs`
+// from the `AEGIS_BOARD` environment variable. Defaults to the generic carrier;
+// see `board-generic-rp2350::BoardProfile`.
+include!(concat!(env!("OUT_DIR"), "/board_profile.rs"));
+
+// MCU die family selected by the build's chip-target feature. The board profile
+// describes the carrier wiring; the MCU variant is a separate concern. The
+// `universal` image reports Rp2350 (same die and QSPI driver as Rp2354, same
+// 2 MiB layout); only the advertised flash-capability flag differs.
 #[cfg(any(feature = "rp2354a", feature = "rp2354b"))]
-const BOARD_PROFILE: BoardProfile = BoardProfile::GENERIC_RP2354;
-
-#[cfg(any(feature = "rp2350a", feature = "rp2350b"))]
-const BOARD_PROFILE: BoardProfile = BoardProfile::GENERIC;
+const MCU_FAMILY: Rp2350Family = Rp2350Family::Rp2354;
+#[cfg(any(feature = "rp2350a", feature = "rp2350b", feature = "universal"))]
+const MCU_FAMILY: Rp2350Family = Rp2350Family::Rp2350;
 
 #[embassy_executor::main(
     executor = "board_generic_rp2350::embassy_rp::executor::Executor",
@@ -115,13 +146,11 @@ const BOARD_PROFILE: BoardProfile = BoardProfile::GENERIC;
 )]
 async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    let Platform {
-        mut board,
-        usb,
-        mut rng,
-    } = Platform::<FLASH_SIZE>::new(p, &BOARD_PROFILE);
+    let mut device = DeviceManager::<FLASH_SIZE>::new(p, &BOARD_PROFILE, MCU_FAMILY);
 
-    let caps = board.capabilities();
+    let caps = device.board.capabilities();
+    let identity = device.identity();
+    let mcu = device.mcu_identity();
     info!(
         "AegisToken {} boot: gpio={} fido_hid={} management_hid={}",
         aegis_core::VERSION,
@@ -130,13 +159,21 @@ async fn main(_spawner: Spawner) {
         caps.usb.management_hid,
     );
     info!(
-        "device root key provisioned: {}",
-        board_generic_rp2350::otp::read_root_key().is_ok()
+        "board identity: {} {} rev{}",
+        identity.manufacturer, identity.board, identity.revision
     );
+    info!(
+        "mcu identity: revision={} unique_id={=u64:x}",
+        mcu.revision, mcu.unique_id
+    );
+    // The device root key seals applet state at rest. Without a provisioned
+    // key the applets run on volatile stores, exactly as before.
+    let root_key = board_generic_rp2350::otp::read_root_key().ok();
+    info!("device root key provisioned: {}", root_key.is_some());
     if VENDOR_KEY_IS_DEV {
         info!("warning: development firmware-update vendor key in use");
     }
-    let bootsel_held = board.bootsel_pressed();
+    let bootsel_held = device.board.bootsel_pressed();
     info!(
         "boot destination recovery={} (bootsel held: {})",
         aegis_core::state::boot_destination(bootsel_held) == aegis_core::ExecutionState::Recovery,
@@ -144,33 +181,52 @@ async fn main(_spawner: Spawner) {
     );
     // Load the persisted configuration, falling back to factory defaults when
     // none exists or it no longer matches this device.
-    let initial_config = load_config(&mut board, &caps);
-    let mut management = ManagementService::new(caps, initial_config, LifecycleState::Factory);
+    let initial_config = load_config(&mut device.board, &caps, identity);
+    let mut management =
+        ManagementService::new(caps, identity, initial_config, LifecycleState::Factory);
 
-    board.start_watchdog(WATCHDOG_TIMEOUT);
+    // Apply the persisted LED configuration so the status LED reflects the
+    // stored behavior from the moment the device boots.
+    let mut boot_led = device.board.led();
+    apply_led_config(&mut boot_led, management.config());
 
-    selftest::run(&mut board, &mut rng);
+    device.board.start_watchdog(WATCHDOG_TIMEOUT);
+
+    selftest::run(&mut device.board, device.rng.get_mut(), identity);
 
     let Usb {
-        device,
+        device: usb_device,
         keyboard,
         fido,
         management: management_hid,
-    } = usb;
+        ccid,
+    } = device.usb;
     let (fido_reader, fido_writer) = fido.split();
     let (management_reader, management_writer) = management_hid.split();
 
+    // Split the board so the FIDO task can await the profile-selected User
+    // Presence source while housekeeping owns the LED, storage and watchdog.
+    let BoardParts {
+        presence,
+        led,
+        storage,
+        watchdog,
+    } = device.board.split();
+
     join3(
-        usb_supervisor(device),
-        fido_task(fido_reader, fido_writer, &mut rng),
-        join(
+        usb_supervisor(usb_device),
+        fido_task(fido_reader, fido_writer, &device.rng, presence),
+        join3(
             housekeeping(
                 management_reader,
                 management_writer,
                 &mut management,
-                &mut board,
+                storage,
+                led.map(|led| led as &mut dyn Led),
+                watchdog,
             ),
             keyboard_task(keyboard),
+            ccid_task(ccid, &device.rng, presence, storage, root_key),
         ),
     )
     .await;
@@ -183,6 +239,145 @@ async fn main(_spawner: Spawner) {
 async fn keyboard_task(mut writer: KeyboardWriter) {
     writer.ready().await;
     core::future::pending::<()>().await;
+}
+
+/// Serve the CCID interface: reassemble host messages and answer with the
+/// applet router.
+///
+/// PIV, OATH and the P-256 OpenPGP slice are live applets. Applet state is
+/// sealed to flash when the device root key is provisioned, and falls back to
+/// volatile stores otherwise.
+async fn ccid_task<const FLASH_SIZE: usize>(
+    mut ccid: Ccid,
+    rng: &Mutex<CriticalSectionRawMutex, HardwareRng>,
+    presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter>,
+    storage: &CriticalSectionMutex<RefCell<FlashStorage<FLASH_SIZE>>>,
+    root_key: Option<[u8; aegis_core::secret::KEY_LEN]>,
+) {
+    let layout = BOARD_PROFILE.hardware.flash.layout;
+    let region = RegionStorage::new(storage, layout.applet_offset);
+    let base = |store: u32| layout.applet_store_offset(store);
+
+    if let Some(key) = root_key {
+        let piv_layout = PivLayout {
+            meta: base(aegis_applets::sealed::PIV_META_STORE),
+            objects: core::array::from_fn(|i| {
+                base(aegis_applets::sealed::PIV_OBJECT_STORE_BASE + i as u32)
+            }),
+        };
+        let oath_data: [u32; OATH_SHARDS] =
+            core::array::from_fn(|i| base(OATH_DATA_STORE_BASE + i as u32));
+        let pgp_data: [u32; OPENPGP_SHARDS] =
+            core::array::from_fn(|i| base(OPENPGP_DATA_STORE_BASE + i as u32));
+        let piv = SealedPivStore::open(region, &piv_layout, SLOT_SIZE, &key);
+        let oath =
+            SealedOathStore::open(region, oath_data, base(OATH_COMMIT_STORE), SLOT_SIZE, &key);
+        let openpgp = SealedOpenPgpStore::open(
+            region,
+            pgp_data,
+            base(OPENPGP_COMMIT_STORE),
+            SLOT_SIZE,
+            &key,
+        );
+        match (piv, oath, openpgp) {
+            (Ok(piv), Ok(oath), Ok(openpgp)) => {
+                info!("applet stores sealed to flash");
+                let mut piv = Piv::new(piv);
+                let mut openpgp = OpenPgp::new(openpgp);
+                let mut oath = Oath::new(oath);
+                run_card(&mut ccid, rng, presence, &mut piv, &mut openpgp, &mut oath).await;
+                return;
+            }
+            (piv, oath, openpgp) => {
+                if piv.is_err() {
+                    info!("PIV sealed store unavailable; using memory");
+                }
+                if oath.is_err() {
+                    info!("OATH sealed store unavailable; using memory");
+                }
+                if openpgp.is_err() {
+                    info!("OpenPGP sealed store unavailable; using memory");
+                }
+            }
+        }
+    } else {
+        info!("no root key; applet state will not persist");
+    }
+
+    let mut piv = Piv::new(MemoryPivStore::new());
+    let mut openpgp = OpenPgp::new(MemoryOpenPgpStore::new());
+    let mut oath = Oath::new(MemoryOathStore::new());
+    run_card(&mut ccid, rng, presence, &mut piv, &mut openpgp, &mut oath).await;
+}
+
+/// Drive one CCID card session: reassemble host messages and answer with the
+/// applet router, sharing RNG and presence with the FIDO task.
+async fn run_card<P, G, O>(
+    ccid: &mut Ccid,
+    rng: &Mutex<CriticalSectionRawMutex, HardwareRng>,
+    presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter>,
+    piv: &mut P,
+    openpgp: &mut G,
+    oath: &mut O,
+) where
+    P: Applet,
+    G: Applet,
+    O: Applet,
+{
+    let mut applets: [&mut dyn Applet; 3] = [piv, openpgp, oath];
+    let mut card: aegis_applets::card::DefaultCard<'_> = Card::new(&mut applets);
+    let mut in_buf = [0u8; board_generic_rp2350::ccid::MAX_PACKET_SIZE as usize];
+    let mut out_buf = [0u8; aegis_applets::ccid::MAX_MESSAGE_BYTES];
+
+    loop {
+        let Ok(len) = ccid.read(&mut in_buf).await else {
+            continue;
+        };
+        if card.feed(&in_buf[..len]).is_err() {
+            card.reset();
+            continue;
+        }
+        loop {
+            let outcome = {
+                let mut rng = rng.lock().await;
+                card.poll(&mut *rng, &mut out_buf)
+            };
+            match outcome {
+                Ok(Some(Outcome::Response(len))) => {
+                    if ccid.write(&out_buf[..len]).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Some(Outcome::PresenceRequired)) => {
+                    // PIV touch policy: wait for the same physical presence
+                    // source the FIDO task uses, then finish the signature
+                    // with fresh RNG (RSA blinding re-randomizes per op).
+                    let confirmed = wait_presence(presence).await;
+                    let outcome = {
+                        let mut rng = rng.lock().await;
+                        card.complete_presence(confirmed, &mut *rng, &mut out_buf)
+                    };
+                    let Ok(Some(len)) = outcome else {
+                        continue;
+                    };
+                    if ccid.write(&out_buf[..len]).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    card.reset();
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Wait for User Presence on the shared source.
+async fn wait_presence(presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter>) -> bool {
+    let mut guard = presence.lock().await;
+    guard.wait().await.is_ok()
 }
 
 /// Drive the USB device and honor soft-detach requests from the Management
@@ -210,6 +405,7 @@ async fn usb_supervisor(mut device: UsbDevice<'static, RpUsb>) -> ! {
 fn load_config<const FLASH_SIZE: usize>(
     board: &mut Board<FLASH_SIZE>,
     capabilities: &aegis_core::DeviceCapabilities,
+    identity: BoardIdentity,
 ) -> DeviceConfig {
     let mut store = ConfigStorage::new(board.storage(), CONFIG_BASE, SLOT_SIZE);
     match store.load() {
@@ -217,6 +413,7 @@ fn load_config<const FLASH_SIZE: usize>(
             let context = ValidationContext {
                 capabilities,
                 lifecycle: LifecycleState::Factory,
+                identity,
             };
             if config.validate(&context).is_ok() {
                 info!("configuration loaded from flash");
@@ -227,20 +424,34 @@ fn load_config<const FLASH_SIZE: usize>(
         Ok(None) => info!("no stored configuration; using defaults"),
         Err(_) => info!("configuration read failed; using defaults"),
     }
-    DeviceConfig::official_defaults()
+    DeviceConfig::for_board(identity, capabilities)
 }
 
 /// Persist the active configuration.
-fn persist_config<const FLASH_SIZE: usize>(board: &mut Board<FLASH_SIZE>, config: &DeviceConfig) {
-    let mut store = ConfigStorage::new(board.storage(), CONFIG_BASE, SLOT_SIZE);
+fn persist_config(storage: &mut dyn Storage, config: &DeviceConfig) {
+    let mut store = ConfigStorage::new(storage, CONFIG_BASE, SLOT_SIZE);
     match store.commit(config) {
         Ok(sequence) => info!("configuration persisted (sequence {})", sequence),
         Err(_) => info!("configuration persistence failed"),
     }
 }
 
+/// Apply the LED section of a configuration to the board hardware, if present.
+fn apply_led_config(led: &mut Option<&mut dyn Led>, config: &DeviceConfig) {
+    if let Some(led) = led.as_mut() {
+        if (*led).configure(&config.led).is_err() {
+            info!("LED configuration rejected by hardware");
+        }
+    }
+}
+
 /// Serve the CTAPHID transport and CTAP2 commands.
-async fn fido_task(mut reader: FidoReader, mut writer: FidoWriter, rng: &mut HardwareRng) {
+async fn fido_task(
+    mut reader: FidoReader,
+    mut writer: FidoWriter,
+    rng: &Mutex<CriticalSectionRawMutex, HardwareRng>,
+    presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter>,
+) {
     let mut assembler = Assembler::new();
     let mut next_channel: u32 = 1;
     let mut store = MemoryCredentialStore::new();
@@ -269,6 +480,7 @@ async fn fido_task(mut reader: FidoReader, mut writer: FidoWriter, rng: &mut Har
                     &mut store,
                     &mut client_pin,
                     rng,
+                    presence,
                 )
                 .await
             }
@@ -288,7 +500,8 @@ async fn handle_ctaphid(
     message: &ctaphid::Message,
     store: &mut MemoryCredentialStore,
     client_pin: &mut ClientPin,
-    rng: &mut HardwareRng,
+    rng: &Mutex<CriticalSectionRawMutex, HardwareRng>,
+    presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter>,
 ) {
     match message.command {
         CtapHidCommand::Init => {
@@ -327,7 +540,8 @@ async fn handle_ctaphid(
         }
         CtapHidCommand::Cbor => {
             let mut out = [0u8; 512];
-            let len = handle_ctap2(&message.payload, &mut out, store, client_pin, rng).await;
+            let len =
+                handle_ctap2(&message.payload, &mut out, store, client_pin, rng, presence).await;
             if let Some(&command) = message.payload.first() {
                 LAST_CTAP_COMMAND.store(command, core::sync::atomic::Ordering::Relaxed);
             }
@@ -338,7 +552,7 @@ async fn handle_ctaphid(
         }
         CtapHidCommand::Msg => {
             let up = if u2f::requires_user_presence(&message.payload) {
-                await_bootsel(PRESENCE_TIMING).await.is_ok()
+                wait_presence(presence).await
             } else {
                 false
             };
@@ -389,7 +603,8 @@ async fn handle_ctap2(
     out: &mut [u8],
     store: &mut MemoryCredentialStore,
     client_pin: &mut ClientPin,
-    rng: &mut HardwareRng,
+    rng: &Mutex<CriticalSectionRawMutex, HardwareRng>,
+    presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter>,
 ) -> usize {
     let Some((&command, params)) = payload.split_first() else {
         return write_status(ctap2::Ctap2Status::InvalidLength, out);
@@ -401,8 +616,9 @@ async fn handle_ctap2(
             let uv = request.pin_uv_auth_param.as_ref().is_some_and(|param| {
                 client_pin.verify_pin_uv_auth_param(param, &request.client_data_hash)
             });
-            let up = await_bootsel(PRESENCE_TIMING).await.is_ok();
-            match authenticator::make_credential(store, rng, &request, up, uv) {
+            let up = wait_presence(presence).await;
+            let mut rng = rng.lock().await;
+            match authenticator::make_credential(store, &mut *rng, &request, up, uv) {
                 Ok(response) => encode_response(&response, out),
                 Err(status) => write_status(status, out),
             }
@@ -411,8 +627,9 @@ async fn handle_ctap2(
             let uv = request.pin_uv_auth_param.as_ref().is_some_and(|param| {
                 client_pin.verify_pin_uv_auth_param(param, &request.client_data_hash)
             });
-            let up = await_bootsel(PRESENCE_TIMING).await.is_ok();
-            match authenticator::get_assertion(store, rng, &request, up, uv) {
+            let up = wait_presence(presence).await;
+            let mut rng = rng.lock().await;
+            match authenticator::get_assertion(store, &mut *rng, &request, up, uv) {
                 Ok(response) => encode_response(&response, out),
                 Err(status) => write_status(status, out),
             }
@@ -420,16 +637,20 @@ async fn handle_ctap2(
         Ok(Ctap2Request::ClientPin) => match ClientPinRequest::parse(params) {
             Ok(request) => match request.sub_command {
                 SUB_GET_RETRIES => encode_response(&client_pin.get_retries(store), out),
-                SUB_GET_KEY_AGREEMENT => match client_pin.key_agreement(rng) {
-                    Ok(response) => encode_response(&response, out),
-                    Err(status) => write_status(status, out),
-                },
+                SUB_GET_KEY_AGREEMENT => {
+                    let mut rng = rng.lock().await;
+                    match client_pin.key_agreement(&mut *rng) {
+                        Ok(response) => encode_response(&response, out),
+                        Err(status) => write_status(status, out),
+                    }
+                }
                 SUB_SET_PIN => match client_pin.set_pin(&request, store) {
                     Ok(()) => write_status(ctap2::Ctap2Status::Ok, out),
                     Err(status) => write_status(status, out),
                 },
                 SUB_GET_PIN_TOKEN | SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS => {
-                    match client_pin.get_pin_token(&request, store, rng) {
+                    let mut rng = rng.lock().await;
+                    match client_pin.get_pin_token(&request, store, &mut *rng) {
                         Ok(response) => encode_response(&response, out),
                         Err(status) => write_status(status, out),
                     }
@@ -439,7 +660,7 @@ async fn handle_ctap2(
             Err(status) => write_status(status, out),
         },
         Ok(Ctap2Request::Reset) => {
-            let up = await_bootsel(PRESENCE_TIMING).await.is_ok();
+            let up = wait_presence(presence).await;
             match authenticator::reset(store, up) {
                 Ok(()) => write_status(ctap2::Ctap2Status::Ok, out),
                 Err(status) => write_status(status, out),
@@ -505,7 +726,9 @@ async fn housekeeping<const FLASH_SIZE: usize>(
     mut reader: ManagementReader,
     mut writer: ManagementWriter,
     service: &mut ManagementService,
-    board: &mut Board<FLASH_SIZE>,
+    storage: &CriticalSectionMutex<RefCell<FlashStorage<FLASH_SIZE>>>,
+    mut led: Option<&mut dyn Led>,
+    watchdog: &mut WatchdogHandle,
 ) {
     let mut assembler = aegis_core::management::Assembler::new();
     let mut buf = [0u8; aegis_core::management::REPORT_SIZE];
@@ -525,36 +748,54 @@ async fn housekeeping<const FLASH_SIZE: usize>(
                 // Transport body: one status byte followed by the payload.
                 let mut body = [0u8; 513];
                 let mut soft_detach = false;
-                let (response_code, body_len) = if (update::CMD_BEGIN..=update::CMD_ABORT)
-                    .contains(&message.command)
-                {
-                    let length = handle_update(
-                        message.command,
-                        &message.payload,
-                        &mut update_handler,
-                        board,
-                        &mut body,
-                    );
-                    (message.command | 0x80, length)
-                } else if message.command == CMD_GET_LAST_FIDO_STATUS {
-                    body[0] = 0x00;
-                    body[1] = LAST_CTAP_COMMAND.load(core::sync::atomic::Ordering::Relaxed);
-                    body[2] = LAST_CTAP_STATUS.load(core::sync::atomic::Ordering::Relaxed);
-                    (CMD_GET_LAST_FIDO_STATUS | 0x80, 3)
-                } else {
-                    let command = ManagementCommand::from_code(message.command);
-                    let response = service.handle(command, &message.payload);
-                    body[0] = response.status.code();
-                    let length = 1 + response.payload.len();
-                    body[1..length].copy_from_slice(&response.payload);
-                    if command == ManagementCommand::CommitConfiguration && response.status.is_ok()
-                    {
-                        persist_config(board, service.config());
-                    }
-                    soft_detach =
-                        command == ManagementCommand::SoftDetach && response.status.is_ok();
-                    (command.response_code(), length)
-                };
+                // Flash is shared with the CCID task; each storage call locks
+                // briefly and regions never overlap between writers.
+                let (response_code, body_len) = storage.lock(|cell| {
+                    let storage = &mut *cell.borrow_mut();
+                    let (response_code, body_len) =
+                        if (update::CMD_BEGIN..=update::CMD_ABORT).contains(&message.command) {
+                            let length = handle_update(
+                                message.command,
+                                &message.payload,
+                                &mut update_handler,
+                                storage,
+                                &mut body,
+                            );
+                            (message.command | 0x80, length)
+                        } else if message.command == CMD_GET_LAST_FIDO_STATUS {
+                            body[0] = 0x00;
+                            body[1] = LAST_CTAP_COMMAND.load(core::sync::atomic::Ordering::Relaxed);
+                            body[2] = LAST_CTAP_STATUS.load(core::sync::atomic::Ordering::Relaxed);
+                            (CMD_GET_LAST_FIDO_STATUS | 0x80, 3)
+                        } else {
+                            let command = ManagementCommand::from_code(message.command);
+                            let response = service.handle(command, &message.payload);
+                            body[0] = response.status.code();
+                            let length = 1 + response.payload.len();
+                            body[1..length].copy_from_slice(&response.payload);
+                            if response.status.is_ok() {
+                                match command {
+                                    // Live preview: apply the staged configuration to the
+                                    // LED as soon as it is accepted.
+                                    ManagementCommand::SetConfiguration => {
+                                        if let Some(staged) = service.staged() {
+                                            apply_led_config(&mut led, staged);
+                                        }
+                                    }
+                                    // Persist and apply the now-active configuration.
+                                    ManagementCommand::CommitConfiguration => {
+                                        persist_config(&mut *storage, service.config());
+                                        apply_led_config(&mut led, service.config());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            soft_detach =
+                                command == ManagementCommand::SoftDetach && response.status.is_ok();
+                            (command.response_code(), length)
+                        };
+                    (response_code, body_len)
+                });
                 send_management(&mut writer, response_code, &body[..body_len]).await;
 
                 // Signal only after the acknowledgement has been transmitted, so
@@ -566,15 +807,26 @@ async fn housekeeping<const FLASH_SIZE: usize>(
             Either::First(Err(_)) => {}
             Either::Second(()) => {
                 led_on = !led_on;
-                if let Some(led) = board.led() {
-                    let behavior = if led_on {
-                        LedBehavior::Solid
-                    } else {
+                if let Some(led) = led.as_mut() {
+                    let config = service.config();
+                    let behavior = if !config.led.enabled {
                         LedBehavior::Off
+                    } else {
+                        match config.led.behavior {
+                            LedBehavior::Off => LedBehavior::Off,
+                            LedBehavior::Solid => LedBehavior::Solid,
+                            LedBehavior::Activity | LedBehavior::Blink => {
+                                if led_on {
+                                    LedBehavior::Solid
+                                } else {
+                                    LedBehavior::Off
+                                }
+                            }
+                        }
                     };
                     let _ = led.set_behavior(behavior);
                 }
-                board.feed_watchdog(WATCHDOG_TIMEOUT);
+                watchdog.feed(WATCHDOG_TIMEOUT);
             }
         }
     }
@@ -597,11 +849,11 @@ fn update_error(out: &mut [u8]) -> usize {
 }
 
 /// Handle a firmware-update management command.
-fn handle_update<const FLASH_SIZE: usize>(
+fn handle_update(
     command: u8,
     payload: &[u8],
     handler: &mut UpdateHandler,
-    board: &mut Board<FLASH_SIZE>,
+    storage: &mut dyn Storage,
     out: &mut [u8],
 ) -> usize {
     match command {
@@ -612,7 +864,7 @@ fn handle_update<const FLASH_SIZE: usize>(
                 INSTALLED_ROLLBACK,
                 STAGING_BASE,
                 STAGING_ERASE_SIZE,
-                board.storage(),
+                storage,
             ) {
                 Ok(session) => {
                     handler.session = Some(session);
@@ -625,7 +877,7 @@ fn handle_update<const FLASH_SIZE: usize>(
             let Some(session) = handler.session.as_mut() else {
                 return update_error(out);
             };
-            match session.write(board.storage(), payload) {
+            match session.write(storage, payload) {
                 Ok(()) => update_ok(out),
                 Err(_) => update_error(out),
             }
@@ -634,7 +886,7 @@ fn handle_update<const FLASH_SIZE: usize>(
             let Some(session) = handler.session.take() else {
                 return update_error(out);
             };
-            match session.finish(board.storage()) {
+            match session.finish(storage) {
                 Ok(image) => {
                     info!(
                         "firmware update verified: {}.{}.{}",

@@ -1,7 +1,7 @@
 //! USB device composition (PRD §7.1, §12, §27).
 //!
 //! AegisToken presents itself to the host as a single composite USB device
-//! exposing three independent HID functions:
+//! exposing three independent HID functions plus a CCID smart-card interface:
 //!
 //! ```text
 //! USB Device
@@ -9,28 +9,32 @@
 //! ├── FIDO HID        usage page 0xF1D0  → CTAPHID transport (64-byte reports)
 //! │   ├── CTAP1 / U2F      (aegis-core::u2f, CTAPHID MSG)
 //! │   └── CTAP2 / FIDO2    (aegis-core::ctap2, CTAPHID CBOR)
-//! └── Management HID  usage page 0xFF00  → vendor management transport
-//!     ├── Device Info       (ManagementCommand::GetDeviceInfo)
-//!     ├── Capabilities      (ManagementCommand::GetCapabilities)
-//!     ├── Configuration     (Get/Set/Validate/Commit)
-//!     ├── Commissioning     (GetLifecycle, CommissionDevice)
-//!     └── Diagnostics       (GetStatus, GetDiagnostics)
+//! ├── Management HID  usage page 0xFF00  → vendor management transport
+//! │   ├── Device Info       (ManagementCommand::GetDeviceInfo)
+//! │   ├── Capabilities      (ManagementCommand::GetCapabilities)
+//! │   ├── Configuration     (Get/Set/Validate/Commit)
+//! │   ├── Commissioning     (GetLifecycle, CommissionDevice)
+//! │   └── Diagnostics       (GetStatus, GetDiagnostics)
+//! └── CCID             class 0x0B        → ISO 7816 applets (PIV, OpenPGP, OATH)
+//!     ├── APDU framing and AID routing   (aegis-applets)
+//!     └── PIN/retry framework            (aegis-applets)
 //! ```
 //!
 //! The FIDO and Management functions use the HID class defined in [`crate::hid`],
 //! which lets the host tell the two apart by interface name. The keyboard uses
 //! `embassy-usb`'s stock HID class so it can advertise the boot subclass and
-//! keyboard boot protocol.
+//! keyboard boot protocol, and the CCID function uses the class in
+//! [`crate::ccid`].
 //!
 //! **Security note:** the keyboard interface is a keystroke-injection surface.
 //! It is registered unconditionally here; a build that must not be able to type
 //! should drop the `keyboard` function from [`Usb::new`]. The application-level
 //! protocols are owned by `aegis-core`; this module only provides the transport.
 //!
-//! The USB product string is `AegisToken FIDO2 USB Authenticator`.
+//! The USB manufacturer, product, vendor and product identifiers come from the
+//! board profile, and the serial number from the RP2350's unique chip
+//! identifier.
 
-use aegis_core::PRODUCT_USB_STRING;
-use aegis_core::configuration::{DEFAULT_PRODUCT_ID, DEFAULT_VENDOR_ID};
 use embassy_rp::Peri;
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::USB;
@@ -42,6 +46,8 @@ use embassy_usb::class::hid::{
 use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
 use static_cell::StaticCell;
 
+use crate::capabilities::BoardProfile;
+use crate::ccid::{CcidClass, State as CcidState};
 use crate::hid::{HidReader, HidReaderWriter, HidWriter, State as HidState};
 
 /// Interface name for the FIDO HID function.
@@ -50,14 +56,22 @@ const FIDO_INTERFACE_NAME: &str = "HID FIDO Authenticator";
 /// Interface name for the Management HID function.
 const MANAGEMENT_INTERFACE_NAME: &str = "HID Management";
 
-/// USB manufacturer string.
-const MANUFACTURER: &str = "AegisToken";
+/// Scratch buffer for the runtime-derived USB serial number (16 hex digits).
+static SERIAL_NUMBER_BUF: StaticCell<[u8; aegis_core::identity::CHIP_ID_HEX_LEN]> =
+    StaticCell::new();
 
-/// USB serial-number string.
+/// USB serial number derived from the RP2350's unique chip identifier.
 ///
-/// Fixed for now; a unique value can later be derived from the RP2350 chip/OTP
-/// identifier.
-const SERIAL_NUMBER: &str = "AEGIS-0001";
+/// Binding the identity to the MCU instead of the carrier board keeps a device
+/// distinguishable when the board is swapped or sourced from a different
+/// vendor. When OTP is not readable the same fallback as
+/// [`aegis_core::identity::McuIdentity`] is formatted, so the serial number and
+/// the reported MCU identity never disagree.
+fn serial_number() -> &'static str {
+    let chip_id = crate::otp::read_unique_id().unwrap_or(aegis_core::identity::FALLBACK_UNIQUE_ID);
+    let bytes = SERIAL_NUMBER_BUF.init(aegis_core::identity::chip_id_hex(chip_id));
+    core::str::from_utf8(bytes).expect("chip identifier hex is ASCII")
+}
 
 /// Maximum power draw advertised by the device, in milliamps.
 const MAX_POWER_MA: u16 = 100;
@@ -178,6 +192,7 @@ static CONTROL_BUF: StaticCell<[u8; 256]> = StaticCell::new();
 static KEYBOARD_STATE: StaticCell<KeyboardHidState<'static>> = StaticCell::new();
 static FIDO_STATE: StaticCell<HidState<'static>> = StaticCell::new();
 static MANAGEMENT_STATE: StaticCell<HidState<'static>> = StaticCell::new();
+static CCID_STATE: StaticCell<CcidState> = StaticCell::new();
 
 /// Concrete embassy-rp USB driver for the RP2350 USB peripheral.
 pub type RpUsb = RpUsbDriver<'static, USB>;
@@ -203,7 +218,10 @@ pub type ManagementReader = HidReader<'static, RpUsb, 64>;
 /// Management HID writer.
 pub type ManagementWriter = HidWriter<'static, RpUsb, 64>;
 
-/// The composed USB device and its three HID functions.
+/// CCID smart-card transport (ISO 7816 applets).
+pub type Ccid = CcidClass<'static, RpUsb>;
+
+/// The composed USB device and its functions.
 pub struct Usb {
     /// The USB device, which must be `run()`.
     pub device: UsbDevice<'static, RpUsb>,
@@ -213,17 +231,24 @@ pub struct Usb {
     pub fido: FidoHid,
     /// Management HID transport (device info, configuration, diagnostics, ...).
     pub management: ManagementHid,
+    /// CCID transport (PIV, OpenPGP and OATH applets).
+    pub ccid: Ccid,
 }
 
 impl Usb {
-    /// Build the USB device from the USB peripheral.
-    pub fn new(usb: Peri<'static, USB>) -> Self {
+    /// Build the USB device from the USB peripheral and board profile.
+    ///
+    /// The manufacturer, product and USB vendor/product identifiers come from
+    /// the board profile (Board Identity), while the serial number comes from
+    /// the RP2350's unique chip identifier (MCU Identity).
+    pub fn new(usb: Peri<'static, USB>, profile: &BoardProfile) -> Self {
         let driver = RpUsbDriver::new(usb, Irqs);
+        let identity = profile.identity();
 
-        let mut config = UsbConfig::new(DEFAULT_VENDOR_ID, DEFAULT_PRODUCT_ID);
-        config.manufacturer = Some(MANUFACTURER);
-        config.product = Some(PRODUCT_USB_STRING);
-        config.serial_number = Some(SERIAL_NUMBER);
+        let mut config = UsbConfig::new(identity.vendor_id, identity.product_id);
+        config.manufacturer = Some(identity.manufacturer);
+        config.product = Some(identity.product);
+        config.serial_number = Some(serial_number());
         config.max_power = MAX_POWER_MA;
         config.max_packet_size_0 = 64;
         // Report an independently powered device that can request remote wakeup
@@ -275,11 +300,14 @@ impl Usb {
             REPORT_SIZE as u16,
         );
 
+        let ccid = CcidClass::new(&mut builder, CCID_STATE.init(CcidState::new()));
+
         Self {
             device: builder.build(),
             keyboard,
             fido,
             management,
+            ccid,
         }
     }
 }

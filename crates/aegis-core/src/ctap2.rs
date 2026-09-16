@@ -46,6 +46,12 @@ pub const COSE_KEY_TYPE_EC2: i64 = 2;
 pub const COSE_ALG_ES256: i64 = -7;
 /// COSE curve P-256.
 pub const COSE_CURVE_P256: i64 = 1;
+/// COSE key type for OKP (Octet Key Pair, RFC 8152).
+pub const COSE_KEY_TYPE_OKP: i64 = 1;
+/// COSE algorithm EdDSA.
+pub const COSE_ALG_EDDSA: i64 = -8;
+/// COSE curve Ed25519.
+pub const COSE_CURVE_ED25519: i64 = 6;
 
 /// CTAP2 status codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +95,8 @@ pub enum Ctap2Status {
     UserActionPending = 0x23,
     /// Operation pending.
     OperationPending = 0x24,
+    /// Unsupported algorithm.
+    UnsupportedAlgorithm = 0x26,
     /// No credentials found.
     NoCredentials = 0x2E,
     /// User action timed out.
@@ -213,6 +221,57 @@ impl<'b, C> minicbor::Decode<'b, C> for Ec2PublicKey {
     }
 }
 
+/// A COSE OKP Ed25519 public key (`COSE_Key`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OkpPublicKey {
+    /// COSE curve (`crv`); always [`COSE_CURVE_ED25519`].
+    pub crv: i64,
+    /// Raw 32-byte public key (`x`).
+    pub x: [u8; 32],
+}
+
+impl<C> minicbor::Encode<C> for OkpPublicKey {
+    fn encode<W: Write>(
+        &self,
+        e: &mut Encoder<W>,
+        _ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        e.map(4)?;
+        e.i64(1)?;
+        e.i64(COSE_KEY_TYPE_OKP)?;
+        e.i64(3)?;
+        e.i64(COSE_ALG_EDDSA)?;
+        e.i64(-1)?;
+        e.i64(self.crv)?;
+        e.i64(-2)?;
+        e.bytes(&self.x)?;
+        Ok(())
+    }
+}
+
+impl<'b, C> minicbor::Decode<'b, C> for OkpPublicKey {
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite map"))?;
+        let mut key = OkpPublicKey { crv: 0, x: [0; 32] };
+        for _ in 0..len {
+            match d.i64()? {
+                -1 => key.crv = d.i64()?,
+                -2 => {
+                    let bytes = d.bytes()?;
+                    if bytes.len() != 32 {
+                        return Err(minicbor::decode::Error::message("bad x length"));
+                    }
+                    key.x.copy_from_slice(bytes);
+                }
+                _ => d.skip()?,
+            }
+        }
+        Ok(key)
+    }
+}
+
 /// `authenticatorGetInfo` response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GetInfoResponse {
@@ -311,6 +370,11 @@ pub struct MakeCredentialRequest {
     pub user_id: heapless::Vec<u8, 64>,
     /// Credentials the client wants to avoid re-creating.
     pub exclude_list: heapless::Vec<CredentialDescriptor, 8>,
+    /// Acceptable credential algorithms, in client preference order.
+    ///
+    /// Each entry is a COSE algorithm identifier (`-7` for ES256, `-8` for
+    /// EdDSA). Empty when the client sent no `pubKeyCredParams`.
+    pub algs: heapless::Vec<i64, 8>,
     /// Resident-key requested.
     pub rk: bool,
     /// User verification requested.
@@ -483,6 +547,34 @@ fn parse_credential_list(
     Ok(())
 }
 
+fn parse_pub_key_cred_params(
+    d: &mut Decoder<'_>,
+    out: &mut heapless::Vec<i64, 8>,
+) -> Result<(), Ctap2Status> {
+    // `pubKeyCredParams`: array of `{"type": "public-key", "alg": <int>}`
+    // maps with text keys, in client preference order.
+    let len = d
+        .array()
+        .map_err(invalid)?
+        .ok_or(Ctap2Status::InvalidCbor)?;
+    for _ in 0..len {
+        let entries = read_map_len(d)?;
+        let mut alg = None;
+        for _ in 0..entries {
+            let key = d.str().map_err(invalid)?;
+            if key == "alg" {
+                alg = Some(d.i64().map_err(invalid)?);
+            } else {
+                d.skip().map_err(invalid)?;
+            }
+        }
+        if let Some(alg) = alg {
+            out.push(alg).map_err(|_| Ctap2Status::LimitExceeded)?;
+        }
+    }
+    Ok(())
+}
+
 fn parse_make_credential(params: &[u8]) -> Result<MakeCredentialRequest, Ctap2Status> {
     let mut d = Decoder::new(params);
     let len = read_map_len(&mut d)?;
@@ -490,6 +582,7 @@ fn parse_make_credential(params: &[u8]) -> Result<MakeCredentialRequest, Ctap2St
     let mut rp_id = None;
     let mut user_id: heapless::Vec<u8, 64> = heapless::Vec::new();
     let mut exclude_list = heapless::Vec::new();
+    let mut algs = heapless::Vec::new();
     let mut rk = false;
     let mut uv = false;
     let mut pin_uv_auth_param = None;
@@ -500,6 +593,7 @@ fn parse_make_credential(params: &[u8]) -> Result<MakeCredentialRequest, Ctap2St
             0x01 => client_data_hash = Some(read_client_data_hash(&mut d)?),
             0x02 => rp_id = Some(parse_rp_id(&mut d)?),
             0x03 => user_id = parse_user_id(&mut d)?,
+            0x04 => parse_pub_key_cred_params(&mut d, &mut algs)?,
             0x05 => parse_credential_list(&mut d, &mut exclude_list)?,
             0x07 => {
                 let (parsed_rk, parsed_uv, _up) = parse_options(&mut d)?;
@@ -520,6 +614,7 @@ fn parse_make_credential(params: &[u8]) -> Result<MakeCredentialRequest, Ctap2St
         rp_id: rp_id.ok_or(Ctap2Status::MissingParameter)?,
         user_id,
         exclude_list,
+        algs,
         rk,
         uv,
         pin_uv_auth_param,
@@ -605,6 +700,7 @@ mod tests {
     fn status_codes_are_canonical() {
         assert_eq!(Ctap2Status::Ok.code(), 0x00);
         assert_eq!(Ctap2Status::InvalidCommand.code(), 0x01);
+        assert_eq!(Ctap2Status::UnsupportedAlgorithm.code(), 0x26);
         assert_eq!(Ctap2Status::NoCredentials.code(), 0x2E);
         assert_eq!(Ctap2Status::UpRequired.code(), 0x3B);
     }
@@ -725,6 +821,58 @@ mod tests {
             parse_request(CMD_MAKE_CREDENTIAL, &buf[..len]),
             Err(Ctap2Status::MissingParameter)
         );
+    }
+
+    #[test]
+    fn make_credential_parses_pub_key_cred_params_in_order() {
+        let mut buf = [0u8; 256];
+        let len = with_encoder(&mut buf, |e| {
+            e.map(5).unwrap();
+            e.u8(0x01).unwrap();
+            e.bytes(&[0xAB; 32]).unwrap();
+            e.u8(0x02).unwrap();
+            e.map(1).unwrap();
+            e.str("id").unwrap();
+            e.str("example.com").unwrap();
+            e.u8(0x03).unwrap();
+            e.map(1).unwrap();
+            e.str("id").unwrap();
+            e.bytes(&[1, 2, 3, 4]).unwrap();
+            e.u8(0x04).unwrap();
+            e.array(2).unwrap();
+            e.map(2).unwrap();
+            e.str("type").unwrap();
+            e.str("public-key").unwrap();
+            e.str("alg").unwrap();
+            e.i64(COSE_ALG_EDDSA).unwrap();
+            e.map(2).unwrap();
+            e.str("type").unwrap();
+            e.str("public-key").unwrap();
+            e.str("alg").unwrap();
+            e.i64(COSE_ALG_ES256).unwrap();
+            e.u8(0x07).unwrap();
+            e.map(0).unwrap();
+        });
+
+        let request = parse_request(CMD_MAKE_CREDENTIAL, &buf[..len]).unwrap();
+        let Ctap2Request::MakeCredential(request) = request else {
+            panic!("expected makeCredential");
+        };
+        assert_eq!(&request.algs[..], &[COSE_ALG_EDDSA, COSE_ALG_ES256]);
+    }
+
+    #[test]
+    fn okp_public_key_round_trips() {
+        let key = OkpPublicKey {
+            crv: COSE_CURVE_ED25519,
+            x: [0x42; 32],
+        };
+        let mut buf = [0u8; 64];
+        let len = encode(&key, &mut buf);
+        let decoded: OkpPublicKey = crate::codec::decode_from(&buf[..len]).unwrap();
+        assert_eq!(decoded, key);
+        // COSE key type is OKP and algorithm is EdDSA.
+        assert_eq!(buf[0], 0xA4); // map(4)
     }
 
     #[test]
