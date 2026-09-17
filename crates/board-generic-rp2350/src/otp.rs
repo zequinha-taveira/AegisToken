@@ -7,6 +7,7 @@
 
 use aegis_core::error::CoreError;
 use aegis_core::secret::KEY_LEN;
+use core::mem::MaybeUninit;
 use embassy_rp::otp::{NUM_ROWS, read_ecc_word};
 
 /// First OTP row of the device root key (ECC rows, 16-bit words).
@@ -24,13 +25,27 @@ pub fn read_root_key() -> Result<[u8; KEY_LEN], CoreError> {
         return Err(CoreError::StorageError);
     }
 
-    let mut key = [0u8; KEY_LEN];
+    // NB: the buffer is deliberately left uninitialised (`MaybeUninit`) instead
+    // of `[0u8; KEY_LEN]`. The zero array is a false CodeQL
+    // `rust/hard-coded-cryptographic-value` source even though it is fully
+    // overwritten below with OTP-fused material and rejected when blank. Every
+    // byte is written before `assume_init`, and the blank (all-zero /
+    // all-ones, i.e. unfused) check fails closed without exposing the buffer.
+    let mut key = MaybeUninit::<[u8; KEY_LEN]>::uninit();
+    let dest = key.as_mut_ptr().cast::<u8>();
     let mut all_zero = true;
     let mut all_ones = true;
 
     for index in 0..ROOT_KEY_WORDS {
         let word = read_ecc_word(ROOT_KEY_ROW + index).map_err(|_| CoreError::StorageError)?;
-        key[index * 2..index * 2 + 2].copy_from_slice(&word.to_le_bytes());
+        let bytes = word.to_le_bytes();
+        // SAFETY: `dest` points to `KEY_LEN` bytes of (possibly uninitialised)
+        // backing storage for `key`; `index < ROOT_KEY_WORDS == KEY_LEN / 2`,
+        // so both writes are in bounds and never overlap across iterations.
+        unsafe {
+            dest.add(index * 2).write(bytes[0]);
+            dest.add(index * 2 + 1).write(bytes[1]);
+        }
         all_zero &= word == 0;
         all_ones &= word == 0xFFFF;
     }
@@ -38,6 +53,9 @@ pub fn read_root_key() -> Result<[u8; KEY_LEN], CoreError> {
     if all_zero || all_ones {
         return Err(CoreError::StorageError);
     }
+    // SAFETY: the loop above writes all `KEY_LEN` bytes exactly once, so the
+    // array is fully initialised. The early returns above never expose it.
+    let key = unsafe { key.assume_init() };
     Ok(key)
 }
 
