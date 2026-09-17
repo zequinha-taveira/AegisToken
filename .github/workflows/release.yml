@@ -1,7 +1,7 @@
 name: release
 
-# Build the firmware with scripts/build-uf2.ps1 and publish the UF2 artifacts as
-# a GitHub release. Triggered by pushing a `v*` tag; tags containing a hyphen
+# Build the universal firmware image with scripts/build-uf2.ps1 and publish the
+# single UF2 artifact as a GitHub release. Triggered by pushing a `v*` tag; tags containing a hyphen
 # (e.g. v0.2.0-rc1) are published as pre-releases. To embed the release update
 # key, set the repository secret AEGIS_UPDATE_VENDOR_PUBKEY (65-byte SEC1 P-256
 # hex, from scripts/gen-update-key.py); otherwise a development key is embedded.
@@ -52,15 +52,11 @@ jobs:
           sudo cmake --install "$RUNNER_TEMP/picotool/build"
           picotool version
 
-      - name: Build UF2 artifacts
+      - name: Build UF2 artifact
         env:
           AEGIS_UPDATE_VENDOR_PUBKEY: ${{ secrets.AEGIS_UPDATE_VENDOR_PUBKEY }}
         run: |
-          for board in rp2350a rp2350b rp2354a rp2354b; do
-            echo "::group::$board"
-            pwsh -NoProfile -File scripts/build-uf2.ps1 -Board "$board"
-            echo "::endgroup::"
-          done
+          pwsh -NoProfile -File scripts/build-uf2.ps1 -Board universal
 
       - name: Publish release
         env:
@@ -68,4 +64,4 @@ jobs:
         run: |
           args=(--title "AegisToken ${GITHUB_REF_NAME}" --generate-notes)
           case "${GITHUB_REF_NAME}" in *-*) args+=(--prerelease);; esac
-          gh release create "${GITHUB_REF_NAME}" "${args[@]}" AegisToken_*.uf2
+          gh release create "${GITHUB_REF_NAME}" "${args[@]}" AegisToken-*.uf2
