@@ -25,10 +25,10 @@ AegisToken_<produto>-<versão>.uf2
 
 | Placa (`-Board`) | Produto | Exemplo |
 |------------------|---------|---------|
-| `rp2350a` (padrão) | `pico2` | `AegisToken_pico2-0.1.0.uf2` |
-| `rp2350b` | `rp2350b` | `AegisToken_rp2350b-0.1.0.uf2` |
-| `rp2354a` | `rp2354a` | `AegisToken_rp2354a-0.1.0.uf2` |
-| `rp2354b` | `rp2354b` | `AegisToken_rp2354b-0.1.0.uf2` |
+| `rp2350a` (padrão) | `pico2` | `AegisToken_pico2-0.2.0.uf2` |
+| `rp2350b` | `rp2350b` | `AegisToken_rp2350b-0.2.0.uf2` |
+| `rp2354a` | `rp2354a` | `AegisToken_rp2354a-0.2.0.uf2` |
+| `rp2354b` | `rp2354b` | `AegisToken_rp2354b-0.2.0.uf2` |
 
 Os artefatos de release são publicados automaticamente pelo workflow
 `.github/workflows/release.yml` ao empurrar uma tag `v*`.
@@ -37,11 +37,11 @@ Os artefatos de release são publicados automaticamente pelo workflow
 
 | Versão | Tag | Data | Artefato | Status |
 |--------|-----|------|----------|--------|
-| 0.1 | `v0.1` | 2026-09-11 | `AegisToken_pico2-0.1.uf2` | Latest |
+| 0.2.0 | `v0.2.0` | 2026-09-17 | `AegisToken_pico2-0.2.0.uf2` (+ rp2350b/rp2354a/rp2354b) | Latest |
+| 0.1 | `v0.1` | 2026-09-11 | `AegisToken_pico2-0.1.uf2` | Superseded |
 | 0.0 | `v0.0` | 2026-09-11 | `AegisToken_pico2-0.0.uf2` | Pre-release |
 
-> As tags de release (`v0.0`, `v0.1`) não incluem o `PATCH`. A versão compilada
-> no binário continua sendo a do `Cargo.toml` (`0.1.0`).
+> A versão compilada no binário é a do `Cargo.toml` (`0.2.0`).
 
 ## Compatibilidade e anti-rollback
 
