@@ -8,12 +8,12 @@
 //! Responses are CBOR payloads preceded by a one-byte status code. The command
 //! byte is echoed with [`RESPONSE_FLAG`] set.
 
-use crate::PRODUCT_USB_STRING;
 use crate::VERSION;
 use crate::capabilities::{DeviceCapabilities, Rp2350Family, Rp2350Package};
 use crate::codec;
 use crate::configuration::{DeviceConfig, FixedString, ValidationContext};
 use crate::error::CoreError;
+use crate::identity::{BoardIdentity, MAX_BOARD_IDENTITY_LEN};
 use crate::lifecycle::{LifecycleManager, LifecycleState};
 use crate::recovery::DiagnosticsReport;
 
@@ -209,13 +209,17 @@ fn version_tuple() -> (u8, u8, u8) {
     (next(), next(), next())
 }
 
-/// Fixed device identity (PRD §2).
+/// Device identity reported to the host (PRD §2).
+///
+/// The manufacturer and product come from the board identity declared by the
+/// board profile, so the same firmware presents the correct identity on
+/// different carrier boards.
 #[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
 #[cbor(map)]
 pub struct DeviceInfo {
-    /// Official USB product string.
+    /// USB product string for the board/product.
     #[n(0)]
-    pub product: FixedString<64>,
+    pub product: FixedString<MAX_BOARD_IDENTITY_LEN>,
     /// Firmware family: 0 = RP2350, 1 = RP2354.
     #[n(1)]
     pub family: u8,
@@ -231,20 +235,25 @@ pub struct DeviceInfo {
     /// Active configuration schema version.
     #[n(5)]
     pub config_version: u16,
+    /// Board/product manufacturer.
+    #[n(6)]
+    pub manufacturer: FixedString<MAX_BOARD_IDENTITY_LEN>,
 }
 
 impl DeviceInfo {
-    /// Build the fixed device identity for these capabilities.
+    /// Build the device identity for these capabilities and board identity.
     #[must_use]
-    pub fn current(capabilities: &DeviceCapabilities) -> Self {
+    pub fn current(identity: &BoardIdentity, capabilities: &DeviceCapabilities) -> Self {
         let (major, minor, patch) = version_tuple();
         Self {
-            product: FixedString::new(PRODUCT_USB_STRING).expect("official product string fits"),
+            product: FixedString::new(identity.product).expect("board product string fits"),
             family: family_code(capabilities.family),
             version_major: major,
             version_minor: minor,
             version_patch: patch,
             config_version: crate::configuration::CONFIG_VERSION,
+            manufacturer: FixedString::new(identity.manufacturer)
+                .expect("board manufacturer string fits"),
         }
     }
 }
@@ -316,6 +325,9 @@ pub struct CapabilityReport {
     /// External button GPIO.
     #[n(20)]
     pub presence_external_button_gpio: Option<u8>,
+    /// Bitmask of GPIOs configuration may select for the LED.
+    #[n(21)]
+    pub led_candidate_gpio_mask: u64,
 }
 
 impl From<&DeviceCapabilities> for CapabilityReport {
@@ -342,6 +354,7 @@ impl From<&DeviceCapabilities> for CapabilityReport {
             presence_bootsel: caps.presence.bootsel,
             presence_external_button: caps.presence.external_button,
             presence_external_button_gpio: caps.presence.external_button_gpio,
+            led_candidate_gpio_mask: caps.led.candidate_gpio_mask,
         }
     }
 }
@@ -384,22 +397,25 @@ pub struct StatusReport {
 /// configuration.
 pub struct ManagementService {
     capabilities: DeviceCapabilities,
+    identity: BoardIdentity,
     lifecycle: LifecycleManager,
     config: DeviceConfig,
     staged: Option<DeviceConfig>,
 }
 
 impl ManagementService {
-    /// Create a service for a device with the given capabilities and initial
-    /// configuration.
+    /// Create a service for a device with the given capabilities, board
+    /// identity and initial configuration.
     #[must_use]
     pub const fn new(
         capabilities: DeviceCapabilities,
+        identity: BoardIdentity,
         config: DeviceConfig,
         lifecycle: LifecycleState,
     ) -> Self {
         Self {
             capabilities,
+            identity,
             lifecycle: LifecycleManager::new(lifecycle),
             config,
             staged: None,
@@ -410,6 +426,12 @@ impl ManagementService {
     #[must_use]
     pub const fn capabilities(&self) -> DeviceCapabilities {
         self.capabilities
+    }
+
+    /// Board identity declared by the active board profile.
+    #[must_use]
+    pub const fn identity(&self) -> BoardIdentity {
+        self.identity
     }
 
     /// Current lifecycle state.
@@ -430,10 +452,17 @@ impl ManagementService {
         self.staged.is_some()
     }
 
+    /// Configuration staged for commit, if any.
+    #[must_use]
+    pub const fn staged(&self) -> Option<&DeviceConfig> {
+        self.staged.as_ref()
+    }
+
     fn context(&self) -> ValidationContext<'_> {
         ValidationContext {
             capabilities: &self.capabilities,
             lifecycle: self.lifecycle.state(),
+            identity: self.identity,
         }
     }
 
@@ -441,7 +470,7 @@ impl ManagementService {
     pub fn handle(&mut self, command: ManagementCommand, payload: &[u8]) -> Response {
         match command {
             ManagementCommand::GetDeviceInfo => {
-                Response::with_payload(&DeviceInfo::current(&self.capabilities))
+                Response::with_payload(&DeviceInfo::current(&self.identity, &self.capabilities))
             }
             ManagementCommand::GetCapabilities => {
                 Response::with_payload(&CapabilityReport::from(&self.capabilities))
@@ -534,7 +563,7 @@ impl ManagementService {
     fn factory_reset(&mut self) -> Response {
         match self.lifecycle.factory_reset() {
             Ok(()) => {
-                self.config = DeviceConfig::official_defaults();
+                self.config = DeviceConfig::for_board(self.identity, &self.capabilities);
                 self.staged = None;
                 Response::ok()
             }
@@ -547,9 +576,21 @@ impl ManagementService {
 mod tests {
     use super::*;
 
+    fn identity() -> BoardIdentity {
+        BoardIdentity::new(
+            "AegisToken",
+            crate::PRODUCT_USB_STRING,
+            "Generic RP2350",
+            0,
+            crate::configuration::DEFAULT_VENDOR_ID,
+            crate::configuration::DEFAULT_PRODUCT_ID,
+        )
+    }
+
     fn service() -> ManagementService {
         ManagementService::new(
             DeviceCapabilities::rp2350a(),
+            identity(),
             DeviceConfig::official_defaults(),
             LifecycleState::Factory,
         )
@@ -565,7 +606,8 @@ mod tests {
         let response = service.handle(ManagementCommand::GetDeviceInfo, &[]);
         assert!(response.status.is_ok());
         let info: DeviceInfo = codec::decode_from(&response.payload).unwrap();
-        assert_eq!(info.product.as_str(), PRODUCT_USB_STRING);
+        assert_eq!(info.product.as_str(), crate::PRODUCT_USB_STRING);
+        assert_eq!(info.manufacturer.as_str(), "AegisToken");
         assert_eq!(info.config_version, crate::configuration::CONFIG_VERSION);
     }
 
@@ -613,6 +655,29 @@ mod tests {
     }
 
     #[test]
+    fn staged_configuration_is_exposed_for_live_apply() {
+        static CAPS: DeviceCapabilities = {
+            let mut c = DeviceCapabilities::rp2350a();
+            c.led.configurable_gpio = true;
+            c.led.candidate_gpio_mask = (1 << 16) | (1 << 25);
+            c
+        };
+        let mut service = ManagementService::new(
+            CAPS,
+            identity(),
+            DeviceConfig::official_defaults(),
+            LifecycleState::Factory,
+        );
+        let mut proposed = DeviceConfig::official_defaults();
+        proposed.led.gpio = 16;
+        let mut buf = [0u8; codec::MAX_STORED_CONFIG_LEN];
+        let len = proposed.encode(&mut buf).unwrap();
+        let response = service.handle(ManagementCommand::SetConfiguration, &buf[..len]);
+        assert!(response.status.is_ok());
+        assert_eq!(service.staged().map(|config| config.led.gpio), Some(16));
+    }
+
+    #[test]
     fn commit_without_staging_is_invalid_state() {
         let mut service = service();
         let response = service.handle(ManagementCommand::CommitConfiguration, &[]);
@@ -653,6 +718,7 @@ mod tests {
     fn configuration_change_is_unauthorized_when_active() {
         let mut service = ManagementService::new(
             DeviceCapabilities::rp2350a(),
+            identity(),
             DeviceConfig::official_defaults(),
             LifecycleState::Active,
         );
@@ -681,6 +747,7 @@ mod tests {
     fn commission_is_rejected_when_active() {
         let mut service = ManagementService::new(
             DeviceCapabilities::rp2350a(),
+            identity(),
             DeviceConfig::official_defaults(),
             LifecycleState::Active,
         );
@@ -769,6 +836,7 @@ mod tests {
     fn decommission_then_factory_reset() {
         let mut service = ManagementService::new(
             DeviceCapabilities::rp2350a(),
+            identity(),
             DeviceConfig::official_defaults(),
             LifecycleState::Active,
         );

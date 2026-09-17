@@ -380,6 +380,7 @@ mod tests {
             rp_id: FixedString::new("example.com").unwrap(),
             user_id: heapless::Vec::from_slice(&[id]).unwrap(),
             private_key: [id; 32],
+            algorithm: crate::ctap2::COSE_ALG_ES256,
             sign_count: 0,
             discoverable: true,
         }

@@ -3,12 +3,24 @@
 Documento da Fase 10: como validar os critérios de aceitação (AC-001..AC-015)
 do MVP em hardware RP2350A (e depois RP2350B).
 
-> **Estado atual:** um dispositivo AegisToken (VID `0x1209`, PID `0x0001`) foi
-> validado em hardware. A interface **Management HID** passou **12/12** checks e
-> a interface **FIDO HID** passou **13/13**, incluindo `authenticatorGetInfo`,
-> `authenticatorMakeCredential` e `authenticatorGetAssertion` com User Presence
-> (BOOTSEL) e `clientPIN`. Restam apenas os itens dependentes do bootrom/OTP de
-> produção (AC-010, AC-014, AC-015) e o ciclo físico de energia (AC-008).
+> **Estado atual:** um dispositivo AegisToken no perfil genérico (VID `0x1209`,
+> PID `0x0001`) foi validado em hardware. A interface **Management HID** passou
+> **12/12** checks e a interface **FIDO HID** passou **13/13**, incluindo
+> `authenticatorGetInfo`, `authenticatorMakeCredential` e
+> `authenticatorGetAssertion` com User Presence (BOOTSEL) e `clientPIN`. Restam
+> apenas os itens dependentes do bootrom/OTP de produção (AC-010, AC-014,
+> AC-015) e o ciclo físico de energia (AC-008).
+>
+> Firmwares construídos para uma placa de terceiros (`AEGIS_BOARD=<perfil>`)
+> enumeram com o `VID:PID` da placa (ex.: Waveshare RP2350-Zero `0x2E8A:0x10B0`)
+> e reportam o fabricante da placa em `GET_DEVICE_INFO`; a validação Management
+> deve então usar `aegistoken-host --vid 0x2E8A --pid 0x10B0`. A matriz de
+> critérios abaixo foi executada no perfil genérico.
+>
+> Fase 17: os applets (PIV, OATH, OpenPGP ECC + RSA-2048) estão completos em
+> firmware com 147 testes de host; o autoteste on-target cobre roteamento por
+> AID (`applet-select`); a validação PC/SC e de interop (AC-016..AC-021)
+> aguarda dispositivo físico, com procedimentos e scripts prontos.
 
 ## Ferramentas
 
@@ -16,6 +28,7 @@ do MVP em hardware RP2350A (e depois RP2350B).
 - `picotool` — conversão de UF2 e `picotool info` (valida imagem RP2350).
 - `python-fido2` — validação FIDO2/U2F (`scripts/validate_fido.py`).
 - `hidapi` + `cbor2` — validação do Management HID (`scripts/validate_management.py`).
+- `pyscard` — validação CCID/ISO 7816 dos applets (`scripts/validate_ccid.py`).
 - `aegistoken-host` — CLI de host em Rust sobre **libusb** para o Management HID,
   sem WinUSB/Zadig (ver abaixo).
 - Autoteste on-target no boot (log via defmt/RTT).
@@ -42,8 +55,116 @@ codificação `getInfo`, resposta do Management HID e leitura de BOOTSEL; com
 ```powershell
 python scripts/validate_management.py   # Management HID (AC-003..AC-009)
 python scripts/validate_fido.py         # FIDO2/U2F (AC-002, AC-011, AC-013)
+python scripts/validate_ccid.py         # CCID (AC-016)
+python scripts/validate_piv.py          # PIV (AC-017/AC-021)
+python scripts/validate_oath.py         # OATH/TOTP/HOTP (AC-018)
+python scripts/validate_openpgp.py      # OpenPGP Card P-256/Ed25519/X25519/RSA-2048 (AC-019/AC-021)
 python scripts/set_pin.py               # define/altera o PIN do clientPIN
 ```
+
+## CCID / applets ISO 7816 (Fase 11)
+
+O dispositivo compõe uma quarta interface, **CCID** (classe USB `0x0B`), que
+expõe os applets PIV, OpenPGP e OATH via PC/SC. O roteamento por AID, o
+enquadramento APDU/CCID e o framework de PIN vivem em `aegis-applets`
+(testáveis em host); o firmware apenas transporta bytes entre os endpoints bulk
+e o roteador.
+
+- **Windows** — a interface é reivindicada automaticamente pelo driver inbox
+  `usbccid.sys`; confirme em **Gerenciador de Dispositivos → Leitores de cartão
+  inteligente**. Não é preciso WinUSB/Zadig.
+- **Linux** — instale `pcscd` e `ccid`; `opensc-tool -l` deve listar o leitor.
+
+Enquanto os applets reais não chegam (fases 12-14), cada AID registra um
+*placeholder*: `SELECT` responde `9000` e qualquer outra instrução responde
+`6D00`.
+
+```powershell
+python scripts/validate_ccid.py
+# em um host com outros leitores, selecione o correto:
+python scripts/validate_ccid.py --reader Aegis
+```
+
+Critérios verificados: enumeração PC/SC, ATR `3B 00`, `SELECT` de PIV/OpenPGP/
+OATH (`9000`), AID desconhecido (`6A82`), instrução não suportada (`6D00`),
+CLAss proprietária (`6E00`), `GET RESPONSE` sem pendência (`6985`) e comando
+sem seleção prévia (`6985`).
+
+## PIV (Fase 12)
+
+O applet PIV responde às ferramentas padrão (`pivy`, OpenSC, `yubico-piv-tool`)
+com os defaults de fábrica: PIN `123456`, PUK `12345678` e management key 3DES
+`0102030405060708` repetida três vezes. O PIN/PUK são exigidos com padding
+`0xFF` até 8 bytes; os contadores de tentativa (`63Cx` → `6983`) são
+persistidos a cada verificação.
+
+```powershell
+python scripts/validate_piv.py
+python scripts/validate_piv.py --reader Aegis   # em hosts com outros leitores
+```
+
+Critérios verificados: `SELECT` PIV, `GET DATA` do CCC/CHUID, objeto
+desconhecido (`6A82`), `PUT DATA` sem autenticação de administrador (`6982`),
+verificação do PIN (retries `63Cx` e sucesso `9000`), autenticação **mútua** do
+management key (3DES: o cartão devolve `7C { 80 E(nonce) }`, o host decifra e
+devolve o nonce em `80`, e o cartão responde `7C { 82 E(challenge) }`),
+`GENERATE ASYMMETRIC KEY PAIR` P-256 (`7F49 { 86 ponto }`) e assinatura via
+`GENERAL AUTHENTICATE` com verificação externa em `cryptography`.
+
+O teste com `pivy --admin --genkey` e com `pkcs11-tool` (OpenSC) usa os mesmos
+comandos; a touch policy padrão é `never` (o `AB` do `GENERATE` pode exigir
+presença, respondida pelo botão BOOTSEL).
+
+> **Persistência no firmware:** com a chave raiz provisionada, PIN/PUK e
+> contadores usam `SealedPivStore` (AES-256-GCM na região de applets) e
+> sobrevivem a power cycle; sem a chave, o firmware usa `MemoryPivStore`.
+
+## OATH / TOTP / HOTP (Fase 13)
+
+O applet OATH usa o protocolo YKOATH sobre a mesma interface CCID. Os segredos
+ficam no estado interno e nunca são retornados por `LIST`, `CALCULATE ALL` ou
+respostas de erro. O host fornece o moving factor em oito bytes big-endian:
+`timestamp / period` para TOTP ou o contador interno para HOTP.
+
+```powershell
+python scripts/validate_oath.py
+python scripts/validate_oath.py --reader Aegis
+```
+
+O script grava uma credencial TOTP temporária com o vetor RFC 6238, executa
+`LIST`, calcula o código para moving factor `1` (esperado `94287082`) e remove
+a credencial. Os testes de host cobrem também RFC 4226, SHA-256/SHA-512,
+access code, persistência serializada e touch-required.
+
+## OpenPGP Card v3.4 (Fase 14–16)
+
+O applet OpenPGP usa o AID v3.4 e implementa PW1/PW3, retry counters, os DOs
+principais (`6E`, `C1`-`C5`, `C4`, `C7`–`C9`, `DE`, `7A/93`), key generation
+P-256/Ed25519/X25519/RSA-2048 (algoritmo por slot via `PUT DATA C1`–`C3`),
+ECDSA/EdDSA e RSA (`PSO:COMPUTE DIGITAL SIGNATURE` com bloco EM ou
+`DigestInfo`) para assinatura, `INTERNAL AUTHENTICATE` cru e ECDH P-256 /
+X25519 ou RSA cru em `PSO:DECIPHER`. Assinaturas ECDSA saem em `r||s` bruto,
+como o GnuPG espera.
+
+```powershell
+python scripts/validate_openpgp.py
+python scripts/validate_openpgp.py --reader Aegis
+```
+
+O script verifica `SELECT`, C1/C4, PW3, geração de chave, PW1, assinatura e
+verificação externa com `cryptography`, além dos fluxos Ed25519 (atributos,
+keygen, assinatura 64 bytes), X25519 (acordo com chave efêmera) e RSA-2048
+(AC-021: atributos `01 0800 0020`, keygen, assinatura `DigestInfo` verificada
+por OpenSSL, decifra com bloco cru, fingerprint `C7`). KDF OpenPGP completo,
+certificados completos e `gpg --card-edit` ficam para validação posterior.
+
+## SSH / Git signing (Fase 15, AC-020)
+
+`validate_fido.py` cobre `makeCredential`/`getAssertion` Ed25519 (`alg -8`,
+assinatura de 64 bytes) além dos fluxos ES256. Com hardware, o fluxo completo
+é `ssh-keygen -t ed25519-sk` (residente ou não), `ssh-agent` e assinatura Git
+via `gpg.format ssh` — ver o guia em `docs/ssh-git.md`. O dispositivo é
+presença-apenas (BOOTSEL): a opção `verify-required` do OpenSSH não se aplica.
 
 ## Ferramenta de host em Rust (libusb)
 
@@ -227,12 +348,18 @@ acessível via `hidraw`.
 | AC-013 | Material privado nunca exportado | Ausência de API de exportação + testes | **Verificado** / revisão |
 | AC-014 | Firmware inválido não executa | Secure boot do bootrom (secp256k1 + OTP) | Pendente (produção) |
 | AC-015 | Rollback não autorizado não executa | `update` (testes) + rollback do bootrom | Lógica OK; OTP pendente |
+| AC-016 | CCID enumera e roteia por AID | `validate_ccid.py` + `opensc-tool -l` + selftest `applet-select` | Transporte e roteamento OK em host/tests e no autoteste on-target; PC/SC em hardware pendente |
+| AC-017 | PIV: PIN, chaves P-256/P-384 e assinatura | `validate_piv.py` + `pivy`/OpenSC | Applet OK em testes de host; hardware pendente; persistência selada entregue |
+| AC-018 | OATH: HOTP/TOTP e CCID | `validate_oath.py` + RFC 4226/6238 | Applet OK em testes de host; hardware pendente; persistência selada entregue |
+| AC-019 | OpenPGP Card: PW1/PW3, ECC e assinatura | `validate_openpgp.py` + GnuPG/OpenSC | Slices P-256/Ed25519/X25519 OK em testes de host; hardware pendente; persistência selada entregue |
+| AC-020 | SSH/Git (`ed25519-sk`) + OpenPGP Ed25519/X25519 | `validate_fido.py` + `validate_openpgp.py` + OpenSSH | Firmware pronto em testes de host; hardware pendente |
+| AC-021 | RSA-2048 (PIV/OpenPGP): keygen, assinatura, decifra | `validate_piv.py` + `validate_openpgp.py` + OpenSSL/GnuPG/`pkcs11-tool` | Firmware pronto em testes de host (147 `aegis-applets`); hardware pendente; RSA-3072/PSS fora de escopo |
 
 ### Evidência — Management HID (12/12)
 
 ```
 [PASS] AC-003 Management HID enumeration
-[PASS] AC-004 GET_DEVICE_INFO        (AegisToken FIDO2 Authenticator, família RP2350, 0.1.0)
+[PASS] AC-004 GET_DEVICE_INFO        (AegisToken FIDO2 USB Authenticator, família RP2350, 0.1.0)
 [PASS] AC-005 GET_CAPABILITIES
 [PASS] AC-009 automatic discovery    (gpio_count=30)
 [PASS] capabilities advertise both HID interfaces
@@ -255,6 +382,43 @@ acessível via `hidraw`.
 [PASS] clientPIN getPINRetries — retries=8
 [PASS] AC-013 no credential export API
 ```
+
+### Evidência — applets/RSA em host (147 `aegis-applets`, 193 `aegis-core`)
+
+```
+[PASS] rsa textbook n=3233 round trip (Montgomery end-to-end)
+[PASS] rsa keygen e*d=1 mod phi, n 2048-bit, CRT == full private op
+[PASS] rsa EMSA-PKCS1-v1_5 + DigestInfo encode/verify, blinding determinism
+[PASS] piv GENERATE RSA-2048 -> 7F49{81 n, 82 010001}; raw SIGN inverts via public_op
+[PASS] piv RSA PIN-once gate, touch always/confirm/deny, reopen persistence
+[PASS] openpgp C1-C3 RSA attrs (5/6-byte forms), GENERATE/READ PUBLIC 7F49{81,82}
+[PASS] openpgp PSO:CDS DigestInfo + raw-EM sign, AUT raw challenge, DECIPHER (bare/00|02/MPI)
+[PASS] openpgp RSA fingerprint vs pacote RFC 4880 reconstruído; estado v2->v3
+```
+
+### AC-021 em hardware (procedimento, pendente de dispositivo)
+
+Com o dispositivo conectado e a interface CCID ativa (`opensc-tool -l`):
+
+```powershell
+python scripts/validate_piv.py       # AC-021: GENERATE 9A + SIGN + s^e mod n
+python scripts/validate_openpgp.py   # AC-021: attrs + GENERATE + sign (OpenSSL) + decipher + C7
+```
+
+Interop complementar (regressão ECC preservada):
+
+```powershell
+pivy --admin --genkey --slot 9A --alg RSA2048   # PIV via pivy
+pkcs11-tool --module opensc-pkcs11.dll --test  # PIV via OpenSC
+gpg --card-edit  # key-attr rsa2048 -> generate -> sign/decrypt
+```
+
+Suposições de interop registradas em código e confirmadas só com hardware:
+`PSO:DECIPHER` devolve o bloco cru de 256 B (o GnuPG remove o padding
+PKCS#1); `PSO:CDS` aceita bloco EM de 256 B ou `DigestInfo` com EMSA
+on-card. A geração RSA-2048 on-device leva segundos (dezenas de tentativas
+Miller-Rabin em host; medir no alvo e alimentar o watchdog na tarefa CCID
+se exceder o timeout).
 
 ### Correções encontradas em hardware
 
@@ -286,3 +450,10 @@ A validação com um cliente real revelou dois bugs de transporte, já corrigido
   são etapas de produção.
 - **Storage persistente de credenciais:** o firmware usa store em memória até o
   refactor de compartilhamento de storage (ver `roadmap.md`).
+- **Applets em hardware (AC-016..AC-021):** sem dispositivo físico nesta
+  sessão; cobertura = testes de host (147), autoteste `applet-select`
+  on-target e scripts PC/SC prontos (`validate_ccid/piv/oath/openpgp.py`).
+- **RSA (AC-021):** RSA-2048/PKCS#1 v1.5 apenas; RSA-3072 e PSS fora de escopo.
+  Keygen probabilístico (Miller-Rabin 12 rounds, sem certificação FIPS);
+  setup de Montgomery sobre módulos secretos e índice do scan de unpad são
+  canais laterais residuais documentados em `crates/aegis-applets/src/rsa.rs`.

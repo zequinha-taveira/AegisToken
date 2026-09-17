@@ -87,6 +87,10 @@ pub struct LedCapabilities {
     pub available: bool,
     /// The LED GPIO may be chosen by configuration.
     pub configurable_gpio: bool,
+    /// GPIOs configuration may select, as a bitmask (`bit n` = GPIO `n`).
+    ///
+    /// Only meaningful when `configurable_gpio` is true.
+    pub candidate_gpio_mask: u64,
     /// Brightness may be configured.
     pub brightness: bool,
     /// Supported drivers.
@@ -156,10 +160,14 @@ impl DeviceCapabilities {
         Self::for_variant(Rp2350Family::Rp2354, Rp2350Package::Qfn80)
     }
 
-    /// Baseline capability set for a family/package combination.
+    /// Synthetic reference capability set for a family/package combination.
     ///
-    /// Board integration overrides the board-specific entries (LED GPIO,
-    /// external button) during hardware discovery.
+    /// This models a fully-featured development carrier (LED on GPIO 25 with a
+    /// candidate mask, dimmable, external button optional). The firmware never
+    /// uses it: real devices derive their set with
+    /// [`crate::discovery::derive_capabilities`] from the board hardware
+    /// profile, which may report fewer features. It remains as a stable fixture
+    /// for host tests and simulations.
     #[must_use]
     pub const fn for_variant(family: Rp2350Family, package: Rp2350Package) -> Self {
         let internal_flash = matches!(family, Rp2350Family::Rp2354);
@@ -181,6 +189,7 @@ impl DeviceCapabilities {
             led: LedCapabilities {
                 available: true,
                 configurable_gpio: true,
+                candidate_gpio_mask: 1 << 25,
                 brightness: true,
                 drivers: LedDriverCapabilities {
                     gpio: true,

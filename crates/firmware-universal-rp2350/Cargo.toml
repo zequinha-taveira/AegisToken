@@ -14,6 +14,9 @@ path = "src/main.rs"
 # Board target selection; exactly one applies. Non-default targets require
 # `--no-default-features` because Cargo features are additive.
 default = ["rp2350a"]
+# Unified image for all four variants (RP2350A/B, RP2354A/B): RP2350A pinout
+# subset with runtime package detection. Produces `AegisToken-<version>.uf2`.
+universal = ["board-generic-rp2350/universal"]
 # RP2350A/B (QFN-60/80, external QSPI flash).
 rp2350a = ["board-generic-rp2350/rp235xa"]
 rp2350b = ["board-generic-rp2350/rp235xb"]
@@ -24,6 +27,7 @@ rp2354b = ["board-generic-rp2350/rp2354b"]
 selftest = []
 
 [dependencies]
+aegis-applets.workspace = true
 aegis-core.workspace = true
 minicbor.workspace = true
 heapless.workspace = true

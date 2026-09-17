@@ -88,6 +88,22 @@ impl<S: Storage> SlotStore<S> {
         Ok(best)
     }
 
+    /// Load one slot by index into `out`, returning `(sequence, length)`.
+    ///
+    /// Unlike [`SlotStore::load`], which resolves the newest valid record,
+    /// this exposes individual slots so multi-shard stores can recover the
+    /// newest generation present in *every* shard after a torn write.
+    pub fn load_slot(
+        &mut self,
+        index: u32,
+        out: &mut [u8],
+    ) -> Result<Option<(u32, usize)>, CoreError> {
+        if index >= SLOT_COUNT {
+            return Err(CoreError::StorageError);
+        }
+        self.read_slot(index, out)
+    }
+
     /// Load the newest valid record into `out`, returning `(sequence, length)`.
     pub fn load(&mut self, out: &mut [u8]) -> Result<Option<(u32, usize)>, CoreError> {
         let mut scratch = [0u8; MAX_PAYLOAD_BYTES];
@@ -186,6 +202,18 @@ impl<S: Storage> SecretStorage<S> {
     /// Load the sealed blob into `out`, returning `(sequence, length)`.
     pub fn load(&mut self, out: &mut [u8]) -> Result<Option<(u32, usize)>, CoreError> {
         self.slots.load(out)
+    }
+
+    /// Load one slot by index, returning `(sequence, length)`.
+    ///
+    /// Passthrough to [`SlotStore::load_slot`] for generational recovery in
+    /// multi-shard sealed stores.
+    pub fn load_slot(
+        &mut self,
+        index: u32,
+        out: &mut [u8],
+    ) -> Result<Option<(u32, usize)>, CoreError> {
+        self.slots.load_slot(index, out)
     }
 
     /// Store a sealed blob, returning the new sequence number.

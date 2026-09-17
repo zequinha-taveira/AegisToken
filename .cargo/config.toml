@@ -7,6 +7,8 @@ build-fw-rp2354a = "build -p firmware-universal-rp2350 --no-default-features --f
 build-fw-rp2354b = "build -p firmware-universal-rp2350 --no-default-features --features rp2354b --target thumbv8m.main-none-eabihf"
 test-core = "test -p aegis-core"
 clippy-core = "clippy -p aegis-core --all-targets -- -D warnings"
+test-applets = "test -p aegis-applets"
+clippy-applets = "clippy -p aegis-applets --all-targets -- -D warnings"
 
 [env]
 DEFMT_LOG = "debug"

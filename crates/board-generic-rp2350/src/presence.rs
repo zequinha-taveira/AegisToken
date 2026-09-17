@@ -28,22 +28,27 @@ pub trait Button {
     fn is_pressed(&mut self) -> bool;
 }
 
-/// A plain GPIO button (active low).
+/// A plain GPIO button.
 pub struct GpioButton {
     pin: Input<'static>,
+    active_low: bool,
 }
 
 impl GpioButton {
-    /// Wrap a configured input pin.
+    /// Wrap a configured input pin, honouring the board's button polarity.
     #[must_use]
-    pub fn new(pin: Input<'static>) -> Self {
-        Self { pin }
+    pub fn new(pin: Input<'static>, active_low: bool) -> Self {
+        Self { pin, active_low }
     }
 }
 
 impl Button for GpioButton {
     fn is_pressed(&mut self) -> bool {
-        self.pin.is_low()
+        if self.active_low {
+            self.pin.is_low()
+        } else {
+            self.pin.is_high()
+        }
     }
 }
 
@@ -104,29 +109,6 @@ pub fn bootsel_pressed() -> bool {
     (status & INFROM_PAD_BIT) == 0
 }
 
-/// Wait for the BOOTSEL button to be pressed, using the core presence machine.
-///
-/// This is the async counterpart of [`ButtonPresence`] and does not require
-/// ownership of the BOOTSEL peripheral token, so a FIDO task can await it
-/// without contending for the board.
-pub async fn await_bootsel(timing: PresenceTiming) -> Result<(), PresenceError> {
-    let mut controller = PresenceController::new(timing);
-    controller.disarm();
-    let mut now_ms = 0u64;
-    controller.arm(1, now_ms)?;
-    loop {
-        let pressed = bootsel_pressed();
-        if let Some(outcome) = controller.update(pressed, now_ms) {
-            return match outcome {
-                PresenceOutcome::Confirmed { .. } => Ok(()),
-                PresenceOutcome::Timeout { .. } => Err(PresenceError::Timeout),
-            };
-        }
-        Timer::after_millis(POLL_MS).await;
-        now_ms += POLL_MS;
-    }
-}
-
 /// The BOOTSEL button.
 pub struct BootselButton {
     bootsel: Peri<'static, BOOTSEL>,
@@ -170,27 +152,92 @@ impl<B: Button> ButtonPresence<B> {
     pub fn is_pressed(&mut self) -> bool {
         self.button.is_pressed()
     }
+
+    /// Arm a fresh operation, invalidating any press observed before it.
+    fn begin_operation(&mut self) -> Result<(), PresenceError> {
+        self.operation_counter = self.operation_counter.wrapping_add(1);
+        let operation_id = self.operation_counter;
+        self.controller.disarm();
+        self.controller.arm(operation_id, 0)
+    }
+
+    /// Feed one sample into the state machine.
+    fn poll(&mut self, now_ms: u64) -> Option<PresenceOutcome> {
+        let pressed = self.button.is_pressed();
+        self.controller.update(pressed, now_ms)
+    }
+
+    /// Map a terminal presence outcome to a result.
+    fn finish(outcome: PresenceOutcome) -> Result<(), PresenceError> {
+        match outcome {
+            PresenceOutcome::Confirmed { .. } => Ok(()),
+            PresenceOutcome::Timeout { .. } => Err(PresenceError::Timeout),
+        }
+    }
+
+    /// Await User Presence, yielding to the executor between samples.
+    ///
+    /// Unlike the [`UserPresence`] implementation (which busy-waits with
+    /// `block_for` and is meant for a dedicated context), this keeps the USB
+    /// and Management tasks responsive while the button is being held.
+    pub async fn wait(&mut self) -> Result<(), PresenceError> {
+        self.begin_operation()?;
+        let mut now_ms = 0u64;
+        loop {
+            if let Some(outcome) = self.poll(now_ms) {
+                return Self::finish(outcome);
+            }
+            Timer::after(Duration::from_millis(POLL_MS)).await;
+            now_ms += POLL_MS;
+        }
+    }
 }
 
 impl<B: Button> UserPresence for ButtonPresence<B> {
     fn wait_for_presence(&mut self) -> Result<(), PresenceError> {
-        self.operation_counter = self.operation_counter.wrapping_add(1);
-        let operation_id = self.operation_counter;
-
-        self.controller.disarm();
+        self.begin_operation()?;
         let mut now_ms = 0u64;
-        self.controller.arm(operation_id, now_ms)?;
-
         loop {
-            let pressed = self.button.is_pressed();
-            if let Some(outcome) = self.controller.update(pressed, now_ms) {
-                return match outcome {
-                    PresenceOutcome::Confirmed { .. } => Ok(()),
-                    PresenceOutcome::Timeout { .. } => Err(PresenceError::Timeout),
-                };
+            if let Some(outcome) = self.poll(now_ms) {
+                return Self::finish(outcome);
             }
             block_for(Duration::from_millis(POLL_MS));
             now_ms += POLL_MS;
+        }
+    }
+}
+
+/// The User Presence source selected by the board hardware profile.
+///
+/// Wrapping the two concrete [`ButtonPresence`] instantiations in one enum lets
+/// [`crate::hardware::Board`] honour whatever the profile declares without
+/// exposing the button type to the firmware.
+pub enum PresenceAdapter {
+    /// BOOTSEL is the presence source.
+    Bootsel(ButtonPresence<BootselButton>),
+    /// A dedicated external button is the presence source.
+    Gpio(ButtonPresence<GpioButton>),
+}
+
+// The synchronous `UserPresence` surface is for callers outside the async
+// executor. The firmware awaits [`PresenceAdapter::wait`] instead, since the
+// single cooperative executor must keep servicing USB and the watchdog.
+impl UserPresence for PresenceAdapter {
+    fn wait_for_presence(&mut self) -> Result<(), PresenceError> {
+        match self {
+            PresenceAdapter::Bootsel(presence) => presence.wait_for_presence(),
+            PresenceAdapter::Gpio(presence) => presence.wait_for_presence(),
+        }
+    }
+}
+
+impl PresenceAdapter {
+    /// Await User Presence on the profile-selected source, without blocking the
+    /// executor between samples.
+    pub async fn wait(&mut self) -> Result<(), PresenceError> {
+        match self {
+            PresenceAdapter::Bootsel(presence) => presence.wait().await,
+            PresenceAdapter::Gpio(presence) => presence.wait().await,
         }
     }
 }
