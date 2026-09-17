@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-applets"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aegis-core",
  "aes",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "aegistoken-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aegis-core",
  "minicbor",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "board-generic-rp2350"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aegis-core",
  "critical-section",
@@ -1040,7 +1040,7 @@ checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
 name = "firmware-universal-rp2350"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aegis-applets",
  "aegis-core",
@@ -1881,27 +1881,27 @@ dependencies = [
 
 [[package]]
 name = "security-key-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "security-key-crypto"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "security-key-ctap"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "security-key-hal"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "security-key-storage"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "security-key-usb"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "semver"
