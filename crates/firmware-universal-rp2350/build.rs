@@ -50,8 +50,13 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
 
     // Firmware-update vendor key.
+    //
+    // NOTE: CI runners export `env:` entries even when the backing secret is
+    // unset, so an empty value must fall back to the dev key exactly like a
+    // missing variable. Only a non-empty malformed value is a hard error.
     println!("cargo:rerun-if-env-changed=AEGIS_UPDATE_VENDOR_PUBKEY");
     let (key, is_dev) = match env::var("AEGIS_UPDATE_VENDOR_PUBKEY") {
+        Ok(hex) if hex.trim().is_empty() => (DEV_VENDOR_PUBLIC_KEY, true),
         Ok(hex) => match parse_sec1_hex(&hex) {
             Some(key) => (key, false),
             None => panic!(
@@ -61,6 +66,12 @@ fn main() {
         },
         Err(_) => (DEV_VENDOR_PUBLIC_KEY, true),
     };
+    if is_dev {
+        println!(
+            "cargo:warning=firmware-update vendor key is the DEVELOPMENT key; \
+             set AEGIS_UPDATE_VENDOR_PUBKEY for production images"
+        );
+    }
 
     let mut file = File::create(out.join("vendor_key.rs")).unwrap();
     write!(
