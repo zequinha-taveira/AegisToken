@@ -47,7 +47,8 @@ da placa, o chip instalado e a fiação não se misturem:
 Uma nova placa, PCB própria ou placa de terceiros só precisa de um novo
 `BoardProfile` (identidade + hardware profile); o firmware universal não muda.
 
-O perfil genérico `AegisToken` usa `VID:PID = 1209:0001` (pid.codes). As placas
+O perfil genérico `AegisToken` usa `VID:PID = 1209:0001` (id próprio no
+pid.codes). As placas
 de terceiros usam o `vendor_id` `2E8A` sublicenciado pela Raspberry Pi e o
 `product_id` alocado ao fabricante, conforme a lista oficial
 [raspberrypi/usb-pid](https://github.com/raspberrypi/usb-pid); o `manufacturer`
@@ -80,6 +81,10 @@ O perfil é selecionado em tempo de build por `AEGIS_BOARD` (ou `-BoardProfile`
 em `scripts/build-uf2.ps1`); o padrão `generic` mantém a identidade AegisToken.
 O número de série USB continua vindo da OTP do chip, não da placa.
 
+> A identidade USB YubiKey que `ykman` / Yubico Authenticator reconhecem
+> automaticamente é um build opt-in (`VIDPID=Yubikey5`), apenas para testes
+> locais — não distribuir.
+
 ## Funcionalidades
 
 - **FIDO2/CTAP2**: `authenticatorGetInfo`, `makeCredential`, `getAssertion`,
@@ -96,7 +101,9 @@ O número de série USB continua vindo da OTP do chip, não da placa.
   LIST/CALCULATE e RFC 4226/6238; o applet **OpenPGP Card** implementa o
   slice v3.4 com P-256, Ed25519, X25519 e RSA-2048 (PW1/PW3, DOs, keygen,
   ECDSA/EdDSA, internal auth crua, ECDH/decifra RSA e fingerprints
-  RFC 4880); RSA-3072/PSS e KDF OpenPGP completo ficam fora de escopo.
+  RFC 4880); PIV com P-256/P-384. Sem brainpoolP512r1 / X448 / Ed448
+   (sem aritmética `no_std` madura em Rust); brainpoolP256r1 e P384r1
+   seguem suportados. RSA-3072/PSS e KDF OpenPGP completo ficam fora de escopo.
 - **User Presence** contextual via botão BOOTSEL, com debounce, timeout,
   consume-once e anti-replay; presença só é aceita em `FidoWaitPresence`.
 - **Configuração** versionada em CBOR, com validação, integridade (CRC-32) e
@@ -228,6 +235,10 @@ ou remapeamento para o driver HID genérico).
 
 ## Segurança
 
+- Sem secure element: OTP + secure boot são endurecimento real, mas ataques
+  físicos estão fora de escopo.
+- Backup de seed cobre só a identidade determinística — passkeys residentes e
+  chaves OpenPGP/PIV não sobrevivem à troca de placa.
 - Segredos nunca são exportados nem registrados em log; são selados com chave
   derivada da OTP.
 - Chaves privadas e material sensível são ignorados pelo `.gitignore`

@@ -1,14 +1,20 @@
 name: release
 
-# Build the universal firmware image with scripts/build-uf2.ps1 and publish the
-# single UF2 artifact as a GitHub release. Triggered by pushing a `v*` tag; tags containing a hyphen
-# (e.g. v0.2.0-rc1) are published as pre-releases. To embed the release update
-# key, set the repository secret AEGIS_UPDATE_VENDOR_PUBKEY (65-byte SEC1 P-256
-# hex, from scripts/gen-update-key.py); otherwise a development key is embedded.
+# development -> rolling `nightly-development` (Pre-release, not Latest).
+# main        -> rolling `nightly-stable` (Pre-release, not Latest).
+# main + tag `vX.Y.Z` -> versioned release (Latest); `-rc` suffix stays Pre-release.
+# Versioned releases require the AEGIS_UPDATE_VENDOR_PUBKEY secret (65-byte SEC1
+# P-256 hex from scripts/gen-update-key.py); nightlies warn when embedding the
+# development key.
 
 on:
   push:
+    branches: [development, main]
     tags: ["v*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -23,12 +29,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Verify tag points to main
+      - name: Verify release tag
+        if: github.ref_type == 'tag'
+        env:
+          AEGIS_UPDATE_VENDOR_PUBKEY: ${{ secrets.AEGIS_UPDATE_VENDOR_PUBKEY }}
         run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Use a versioned tag such as v0.2.2 or v0.2.2-rc1."
+            exit 1
+          fi
           git fetch --no-tags origin main
           main_sha="$(git rev-parse FETCH_HEAD)"
-          if [ "$main_sha" != "$GITHUB_SHA" ]; then
+          release_sha="$(git rev-parse HEAD)"
+          if [ "$main_sha" != "$release_sha" ]; then
             echo "::error::Release tags must point to the current main commit."
+            exit 1
+          fi
+          if [ -z "$AEGIS_UPDATE_VENDOR_PUBKEY" ]; then
+            echo "::error::Versioned releases require AEGIS_UPDATE_VENDOR_PUBKEY; do not publish the development update key."
             exit 1
           fi
 
@@ -58,10 +76,46 @@ jobs:
         run: |
           pwsh -NoProfile -File scripts/build-uf2.ps1 -Board universal
 
-      - name: Publish release
+      - name: Publish nightly
+        if: github.ref_type == 'branch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AEGIS_UPDATE_VENDOR_PUBKEY: ${{ secrets.AEGIS_UPDATE_VENDOR_PUBKEY }}
+        run: |
+          case "$GITHUB_REF_NAME" in
+            development) tag=nightly-development; title="Nightly Development" ;;
+            main) tag=nightly-stable; title="Nightly Stable" ;;
+            *) exit 1 ;;
+          esac
+          current_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$GITHUB_REF_NAME" --jq '.object.sha')"
+          if [ "$current_sha" != "$GITHUB_SHA" ]; then
+            echo "Skipping superseded nightly build."
+            exit 0
+          fi
+          notes="Automated build from ${GITHUB_REF_NAME} at ${GITHUB_SHA}. For testing only."
+          if [ -z "$AEGIS_UPDATE_VENDOR_PUBKEY" ]; then
+            notes+=" WARNING: embeds the DEVELOPMENT firmware-update key. Do not use in production."
+          fi
+          artifact="AegisToken-${tag}.uf2"
+          mv AegisToken-*.uf2 "$artifact"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+            gh release upload "$tag" "$artifact" --clobber
+            gh release edit "$tag" --title "$title" --notes "$notes" --prerelease --latest=false
+          else
+            gh release create "$tag" "$artifact" --target "$GITHUB_SHA" \
+              --title "$title" --notes "$notes" --prerelease --latest=false
+          fi
+
+      - name: Publish versioned release
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          args=(--title "AegisToken ${GITHUB_REF_NAME}" --generate-notes)
-          case "${GITHUB_REF_NAME}" in *-*) args+=(--prerelease);; esac
-          gh release create "${GITHUB_REF_NAME}" "${args[@]}" AegisToken-*.uf2
+          args=(--title "AegisToken ${GITHUB_REF_NAME}" --generate-notes --verify-tag)
+          case "$GITHUB_REF_NAME" in
+            *-*) args+=(--prerelease --latest=false) ;;
+            *) args+=(--latest) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" "${args[@]}" AegisToken-*.uf2

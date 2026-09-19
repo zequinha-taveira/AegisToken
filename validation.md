@@ -15,7 +15,10 @@ do MVP em hardware RP2350A (e depois RP2350B).
 > enumeram com o `VID:PID` da placa (ex.: Waveshare RP2350-Zero `0x2E8A:0x10B0`)
 > e reportam o fabricante da placa em `GET_DEVICE_INFO`; a validação Management
 > deve então usar `aegistoken-host --vid 0x2E8A --pid 0x10B0`. A matriz de
-> critérios abaixo foi executada no perfil genérico.
+> critérios abaixo foi executada no perfil genérico (`0x1209:0x0001`, id próprio
+> no pid.codes). A identidade USB YubiKey que `ykman` / Yubico Authenticator
+> reconhecem automaticamente é um build opt-in (`VIDPID=Yubikey5`), só para
+> testes locais — não distribuir.
 >
 > Fase 17: os applets (PIV, OATH, OpenPGP ECC + RSA-2048) estão completos em
 > firmware com 147 testes de host; o autoteste on-target cobre roteamento por
@@ -157,6 +160,8 @@ keygen, assinatura 64 bytes), X25519 (acordo com chave efêmera) e RSA-2048
 (AC-021: atributos `01 0800 0020`, keygen, assinatura `DigestInfo` verificada
 por OpenSSL, decifra com bloco cru, fingerprint `C7`). KDF OpenPGP completo,
 certificados completos e `gpg --card-edit` ficam para validação posterior.
+Curvas fora de escopo: brainpoolP512r1 / X448 / Ed448 (sem aritmética `no_std`
+madura em Rust); brainpoolP256r1 e P384r1 seguem suportados.
 
 ## SSH / Git signing (Fase 15, AC-020)
 
@@ -440,6 +445,10 @@ A validação com um cliente real revelou dois bugs de transporte, já corrigido
 
 ## Limitações conhecidas
 
+- **Sem secure element:** OTP + secure boot são endurecimento real, mas ataques
+  físicos estão fora de escopo.
+- **Backup:** cobre só a identidade determinística — passkeys residentes e
+  chaves OpenPGP/PIV não sobrevivem à troca de placa.
 - **Keepalive:** durante a espera de User Presence o firmware não envia
   `CTAPHID_KEEPALIVE`; a resposta chega dentro do timeout de presença (15 s).
   Melhoria prevista para a integração final.
@@ -454,6 +463,7 @@ A validação com um cliente real revelou dois bugs de transporte, já corrigido
   sessão; cobertura = testes de host (147), autoteste `applet-select`
   on-target e scripts PC/SC prontos (`validate_ccid/piv/oath/openpgp.py`).
 - **RSA (AC-021):** RSA-2048/PKCS#1 v1.5 apenas; RSA-3072 e PSS fora de escopo.
+  Sem brainpoolP512r1 / X448 / Ed448 (sem aritmética `no_std` madura em Rust).
   Keygen probabilístico (Miller-Rabin 12 rounds, sem certificação FIPS);
   setup de Montgomery sobre módulos secretos e índice do scan de unpad são
   canais laterais residuais documentados em `crates/aegis-applets/src/rsa.rs`.

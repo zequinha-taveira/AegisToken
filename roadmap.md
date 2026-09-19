@@ -23,7 +23,7 @@ Documento vivo: cada fase é marcada conforme concluída e verificada.
 | 13 | OATH (TOTP/HOTP) | Concluída (hardware pendente; persistência selada entregue) |
 | 14 | OpenPGP card (v3.4) | Concluída (P-256 slice; hardware pendente; persistência selada entregue) |
 | 15 | SSH/Git signing + Ed25519 no CTAP2 | Concluída (firmware; hardware pendente) |
-| 16 | RSA (PIV/OpenPGP) | Em andamento (16a–16c em firmware; hardware pendente) |
+| 16 | RSA (PIV/OpenPGP) | Em andamento (16a–16d em firmware; hardware pendente) |
 | 17 | Conformidade e validação dos applets | Em andamento (firmware; hardware pendente) |
 
 ## Decisões arquiteturais fixadas
@@ -902,7 +902,7 @@ adiado.
 
 ---
 
-## Fase 16 — RSA para PIV/OpenPGP (em andamento: 16a–16c entregues em firmware; hardware pendente)
+## Fase 16 — RSA para PIV/OpenPGP (em andamento: 16a–16d entregues em firmware; hardware pendente)
 
 **Entregue (firmware + host)**
 
@@ -928,7 +928,15 @@ adiado.
 - Validadores estendidos: `validate_openpgp.py` (AC-021: attrs, keygen,
   assinatura verificada por `cryptography`, decifra, fingerprint) com
   `find_tlv` corrigido (tags de 2 bytes, comprimentos longos) e APDUs
-  estendidas; `validate_piv.py` com RSA fica para a fatia de hardware.
+  estendidas.
+- 16d — `validate_piv.py` com RSA (paridade AC-021, host-only): re-`VERIFY`
+  explícito antes do RSA, `GENERATE`+`SIGN` nos dois slots (9A + 9C),
+  check cru `s^e mod n` por slot e round-trip `DigestInfo`/EMSA-PKCS1-v1_5
+  verificado com `cryptography` (mesmo padrão do OpenPGP); EM DigestInfo
+  validado off-card (`DigestInfo EM round-trip OK`).
+- RSA-3072 e PSS: adiados com o produto funcional em ECC+RSA-2048
+  (exigiriam tipos `U1536`/`U3072`, estouro do registro PIV de 1536 B,
+  rebalance do estado OpenPGP e revisão de watchdog; ver `rsa.rs`).
 - Testes de host: 147 `aegis-applets` (inclui round-trip contra `public_op`,
   equivalência CRT vs potência cheia, determinismo sob blinding, vetores
   didáticos `n=3233`, rejeição de paddings/atributos); clippy limpo, build de
@@ -936,8 +944,6 @@ adiado.
 
 **Pendências**
 
-- RSA-3072, PSS e `validate_piv.py` com RSA: fatia 16d ou adiados com o
-  produto funcional em ECC+RSA-2048.
 - **AC-021 em hardware:** `validate_openpgp.py`, `gpg --card-edit`/`pkcs11-tool`
   com chaves RSA-2048 ainda não executados em dispositivo físico (Fase 17).
 - Suposições de interop a confirmar em hardware: GnuPG remove o padding da
