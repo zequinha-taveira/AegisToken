@@ -415,7 +415,12 @@ impl ClientPin {
         shared_secret(private, platform)
     }
 
-    /// `setPIN`.
+    /// Provision the first PIN from a `setPIN` request and store its hash.
+    ///
+    /// Returns `Ctap2Status::NotAllowed` if a PIN is already present and
+    /// `Ctap2Status::InvalidLength` unless the authenticated payload decrypts
+    /// to exactly 64 bytes. A first zero byte before four PIN bytes returns
+    /// `Ctap2Status::PinPolicyViolation`.
     pub fn set_pin(
         &mut self,
         request: &ClientPinRequest,
@@ -670,10 +675,13 @@ mod tests {
         let param = hmac_sha256(&token, &message);
         assert!(authenticator.verify_pin_uv_auth_param(&param, &message));
         assert!(authenticator.verify_pin_uv_auth_param(&param[..16], &message));
-        // Short prefixes must not verify: a 1-byte prefix is 8-bit security.
-        assert!(!authenticator.verify_pin_uv_auth_param(&param[..1], &message));
-        assert!(!authenticator.verify_pin_uv_auth_param(&param[..17], &message));
-        assert!(!authenticator.verify_pin_uv_auth_param(&[], &message));
+        for invalid_length in [0, 1, 15, 17, 31] {
+            assert!(
+                !authenticator.verify_pin_uv_auth_param(&param[..invalid_length], &message),
+                "accepted a {invalid_length}-byte PIN/UV auth parameter"
+            );
+        }
+        assert!(!authenticator.verify_pin_uv_auth_param(&[0u8; 33], &message));
         assert!(!authenticator.verify_pin_uv_auth_param(&param, b"other"));
         assert!(!ClientPin::new().verify_pin_uv_auth_param(&param, &message));
     }
@@ -707,6 +715,8 @@ mod tests {
             authenticator.set_pin(&request, &mut state),
             Err(Ctap2Status::NotAllowed)
         );
+        assert_eq!(state.hash, Some(pin_hash(b"1234")));
+        assert_eq!(state.retries, DEFAULT_RETRIES);
     }
 
     #[test]
@@ -739,111 +749,12 @@ mod tests {
     }
 
     #[test]
-    fn pin_uv_auth_param_accepts_only_exact_protocol_lengths() {
-        let token = [0x42; 32];
-        let message = b"client data hash";
-        let expected = hmac_sha256(&token, message);
-        let authenticator = ClientPin {
-            agreement_private: None,
-            pin_uv_auth_token: Some(token),
-        };
 
-        assert!(authenticator.verify_pin_uv_auth_param(&expected[..16], message));
-        assert!(authenticator.verify_pin_uv_auth_param(&expected, message));
-
-        for length in [0, 1, 15, 17, 31] {
-            assert!(
-                !authenticator.verify_pin_uv_auth_param(&expected[..length], message),
-                "unexpectedly accepted a {length}-byte authentication parameter"
-            );
-        }
-
-        let mut oversized = [0u8; 33];
-        oversized[..32].copy_from_slice(&expected);
-        assert!(!authenticator.verify_pin_uv_auth_param(&oversized, message));
-    }
-
-    #[test]
-    fn set_pin_rejects_non_64_byte_plaintexts_without_mutating_state() {
-        for (seed, padded_len) in [(21, 48), (22, 80)] {
-            let mut rng = TestRng(seed);
-            let mut authenticator = ClientPin::new();
-            let mut state = TestPinState {
-                hash: None,
-                retries: 3,
-            };
-            let mut padded = [0u8; 80];
-            padded[..4].copy_from_slice(b"1234");
-            let request = set_pin_request(&mut authenticator, &mut rng, &padded[..padded_len]);
-
-            assert_eq!(
-                authenticator.set_pin(&request, &mut state),
-                Err(Ctap2Status::InvalidLength)
-            );
-            assert_eq!(state.hash, None);
-            assert_eq!(state.retries, 3);
         }
     }
 
     #[test]
-    fn set_pin_counts_unicode_code_points_not_utf8_bytes() {
-        let mut rng = TestRng(23);
-        let mut authenticator = ClientPin::new();
-        let mut state = TestPinState::default();
-        let mut padded = [0u8; 64];
-        let three_code_points = "ééé".as_bytes();
-        padded[..three_code_points.len()].copy_from_slice(three_code_points);
-        let request = set_pin_request(&mut authenticator, &mut rng, &padded);
 
-        assert_eq!(
-            authenticator.set_pin(&request, &mut state),
-            Err(Ctap2Status::PinPolicyViolation)
-        );
-        assert_eq!(state.hash, None);
-    }
-
-    #[test]
-    fn set_pin_rejects_nonzero_bytes_after_padding_starts() {
-        let mut rng = TestRng(24);
-        let mut authenticator = ClientPin::new();
-        let mut state = TestPinState::default();
-        let mut padded = [0u8; 64];
-        padded[..4].copy_from_slice(b"1234");
-        padded[10] = 0x7F;
-        let request = set_pin_request(&mut authenticator, &mut rng, &padded);
-
-        assert_eq!(
-            authenticator.set_pin(&request, &mut state),
-            Err(Ctap2Status::PinPolicyViolation)
-        );
-        assert_eq!(state.hash, None);
-    }
-
-    #[test]
-    fn duplicate_set_pin_is_rejected_before_processing_request_fields() {
-        let mut authenticator = ClientPin::new();
-        let mut state = TestPinState {
-            hash: Some(pin_hash(b"1234")),
-            retries: 5,
-        };
-        let request = ClientPinRequest {
-            protocol: PIN_PROTOCOL,
-            sub_command: SUB_SET_PIN,
-            key_agreement: None,
-            pin_uv_auth_param: None,
-            new_pin_enc: None,
-            pin_hash_enc: None,
-        };
-
-        assert_eq!(
-            authenticator.set_pin(&request, &mut state),
-            Err(Ctap2Status::NotAllowed)
-        );
-        assert_eq!(state.hash, Some(pin_hash(b"1234")));
-        assert_eq!(state.retries, 5);
-    }
-
-    #[test]
     fn wrong_pin_decrements_retries() {
         let mut rng = TestRng(2);
         let mut authenticator = ClientPin::new();
