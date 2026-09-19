@@ -133,7 +133,9 @@ impl<'a, const RESPONSE: usize> Router<'a, RESPONSE> {
                     Response::status(Sw::FILE_NOT_FOUND)
                 }
             }
-        } else if apdu.ins == INS_GET_RESPONSE || apdu.ins == INS_SEND_REMAINING {
+        } else if apdu.ins == INS_GET_RESPONSE
+            || (apdu.ins == INS_SEND_REMAINING && chain.is_pending())
+        {
             chain.get_response(apdu.expected_len())
         } else {
             let Some(index) = *selected else {
@@ -381,6 +383,45 @@ mod tests {
             &mut TestRng,
         );
         assert_eq!(second.data.len(), 44);
+        assert_eq!(second.sw, Sw::OK);
+        assert_eq!(second.data, &[0xAB; 44]);
+    }
+
+    #[test]
+    fn send_remaining_without_pending_is_forwarded_to_applet() {
+        let mut applet = TestApplet::new(aid::PIV);
+        let mut applets: [&mut dyn Applet; 1] = [&mut applet];
+        let mut router = Router::<64>::new(&mut applets);
+
+        router.command(
+            &command(INS_SELECT, SELECT_BY_DF_NAME, aid::PIV, None),
+            &mut TestRng,
+        );
+        // No chained bytes pending: 0xA5 must reach the applet (OpenPGP
+        // SELECT DATA) instead of being swallowed as SEND REMAINING.
+        // TestApplet rejects it, proving it was forwarded.
+        let response = router.command(&command(INS_SEND_REMAINING, 0x00, &[], None), &mut TestRng);
+        assert_eq!(response.sw, Sw::INS_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn send_remaining_with_pending_drains_chain() {
+        let mut applet = TestApplet::new(aid::PIV);
+        applet.payload.extend_from_slice(&[0xAB; 300]).unwrap();
+        let mut applets: [&mut dyn Applet; 1] = [&mut applet];
+        let mut router = Router::<512>::new(&mut applets);
+
+        router.command(
+            &command(INS_SELECT, SELECT_BY_DF_NAME, aid::PIV, None),
+            &mut TestRng,
+        );
+        let first = router.command(&command(0x02, 0x00, &[], Some(0x00)), &mut TestRng);
+        assert!(first.sw.is_bytes_remaining());
+
+        let second = router.command(
+            &command(INS_SEND_REMAINING, 0x00, &[], Some(0x00)),
+            &mut TestRng,
+        );
         assert_eq!(second.sw, Sw::OK);
         assert_eq!(second.data, &[0xAB; 44]);
     }
