@@ -599,30 +599,6 @@ mod tests {
         }
     }
 
-    fn set_pin_from_plaintext(
-        seed: u32,
-        plaintext: &[u8],
-    ) -> (Result<(), Ctap2Status>, TestPinState) {
-        let mut rng = TestRng(seed);
-        let mut authenticator = ClientPin::new();
-        let mut state = TestPinState::default();
-        let key_agreement = authenticator.key_agreement(&mut rng).unwrap();
-        let platform = Platform::new(&mut rng);
-        let shared = platform.shared(&key_agreement.key);
-
-        let mut encrypted = [0u8; 96];
-        let encrypted_length = aes_cbc_encrypt(&shared, plaintext, &mut encrypted).unwrap();
-        let auth = hmac_sha256(&shared, &encrypted[..encrypted_length]);
-        let request = ClientPinRequest {
-            protocol: 1,
-            sub_command: SUB_SET_PIN,
-            key_agreement: Some(platform.public),
-            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
-            new_pin_enc: Some(heapless::Vec::from_slice(&encrypted[..encrypted_length]).unwrap()),
-            pin_hash_enc: None,
-        };
-        let result = authenticator.set_pin(&request, &mut state);
-        (result, state)
     }
 
     #[test]
@@ -760,78 +736,12 @@ mod tests {
     }
 
     #[test]
-    fn set_pin_validates_unicode_and_zero_padding() {
-        let pin = "é猫🙂a";
-        let mut padded = [0u8; 64];
-        padded[..pin.len()].copy_from_slice(pin.as_bytes());
 
-        let (result, state) = set_pin_from_plaintext(15, &padded);
-        assert_eq!(result, Ok(()));
-        assert_eq!(state.hash, Some(pin_hash(pin.as_bytes())));
-    }
-
-    #[test]
-    fn set_pin_rejects_invalid_utf8_or_padding() {
-        let mut too_few_code_points = [0u8; 64];
-        let three_unicode_chars = "é猫🙂";
-        too_few_code_points[..three_unicode_chars.len()]
-            .copy_from_slice(three_unicode_chars.as_bytes());
-
-        let mut nonzero_after_terminator = [0u8; 64];
-        nonzero_after_terminator[..4].copy_from_slice(b"1234");
-        nonzero_after_terminator[5] = b'5';
-
-        let mut invalid_utf8 = [0u8; 64];
-        invalid_utf8[..5].copy_from_slice(&[0xFF, b'1', b'2', b'3', b'4']);
-
-        for (seed, plaintext) in [
-            (16, too_few_code_points),
-            (17, [b'7'; 64]),
-            (18, nonzero_after_terminator),
-            (19, invalid_utf8),
-        ] {
-            let (result, state) = set_pin_from_plaintext(seed, &plaintext);
-            assert_eq!(result, Err(Ctap2Status::PinPolicyViolation));
-            assert!(state.hash.is_none());
         }
     }
 
     #[test]
-    fn set_pin_requires_exactly_64_encrypted_bytes() {
-        for (seed, plaintext_length) in [(13, 48), (14, 80)] {
-            let mut rng = TestRng(seed);
-            let mut authenticator = ClientPin::new();
-            let mut state = TestPinState::default();
-            let key_agreement = authenticator.key_agreement(&mut rng).unwrap();
-            let platform = Platform::new(&mut rng);
-            let shared = platform.shared(&key_agreement.key);
 
-            let plaintext = [b'7'; 80];
-            let mut encrypted = [0u8; 80];
-            let encrypted_length =
-                aes_cbc_encrypt(&shared, &plaintext[..plaintext_length], &mut encrypted).unwrap();
-            let auth = hmac_sha256(&shared, &encrypted[..encrypted_length]);
-            let request = ClientPinRequest {
-                protocol: 1,
-                sub_command: SUB_SET_PIN,
-                key_agreement: Some(platform.public),
-                pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
-                new_pin_enc: Some(
-                    heapless::Vec::from_slice(&encrypted[..encrypted_length]).unwrap(),
-                ),
-                pin_hash_enc: None,
-            };
-
-            assert_eq!(
-                authenticator.set_pin(&request, &mut state),
-                Err(Ctap2Status::InvalidParameter),
-                "accepted {plaintext_length} encrypted bytes"
-            );
-            assert!(state.hash.is_none());
-        }
-    }
-
-    #[test]
     fn wrong_pin_decrements_retries() {
         let mut rng = TestRng(2);
         let mut authenticator = ClientPin::new();

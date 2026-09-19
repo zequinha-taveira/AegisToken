@@ -437,6 +437,43 @@ mod tests {
     }
 
     #[test]
+    fn send_remaining_is_forwarded_after_pending_chain_is_drained() {
+        let mut applet = TestApplet::new(aid::PIV);
+        applet.payload.extend_from_slice(&[0xAB; 300]).unwrap();
+        let mut applets: [&mut dyn Applet; 1] = [&mut applet];
+        let mut router = Router::<512>::new(&mut applets);
+
+        router.command(
+            &command(INS_SELECT, SELECT_BY_DF_NAME, aid::PIV, None),
+            &mut TestRng,
+        );
+        let first = router.command(&command(0x02, 0x00, &[], Some(0x00)), &mut TestRng);
+        assert!(first.sw.is_bytes_remaining());
+
+        let final_chunk = router.command(
+            &command(INS_SEND_REMAINING, 0x00, &[], Some(0x00)),
+            &mut TestRng,
+        );
+        assert_eq!(final_chunk.sw, Sw::OK);
+        assert_eq!(final_chunk.data, &[0xAB; 44]);
+
+        // Once the chain is empty, the same instruction belongs to the
+        // selected applet again rather than the transport chainer.
+        let forwarded = router.command(&command(INS_SEND_REMAINING, 0x00, &[], None), &mut TestRng);
+        assert_eq!(forwarded.sw, Sw::INS_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn send_remaining_without_pending_still_requires_a_selected_applet() {
+        let mut applet = TestApplet::new(aid::PIV);
+        let mut applets: [&mut dyn Applet; 1] = [&mut applet];
+        let mut router = Router::<64>::new(&mut applets);
+
+        let response = router.command(&command(INS_SEND_REMAINING, 0x00, &[], None), &mut TestRng);
+        assert_eq!(response.sw, Sw::CONDITIONS_NOT_SATISFIED);
+    }
+
+    #[test]
     fn get_response_without_pending_is_rejected() {
         let mut applet = TestApplet::new(aid::PIV);
         let mut applets: [&mut dyn Applet; 1] = [&mut applet];
