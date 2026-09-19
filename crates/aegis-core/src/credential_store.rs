@@ -426,6 +426,19 @@ mod tests {
         }
     }
 
+    fn corrupt_slot_but_preserve_crc(storage: &mut RamStorage, slot: u32) {
+        let slot_start = (slot * SLOT_SIZE) as usize;
+        let payload_start = slot_start + crate::storage::SLOT_HEADER_LEN;
+        let length = usize::from(u16::from_le_bytes([
+            storage.data[slot_start + 10],
+            storage.data[slot_start + 11],
+        ]));
+
+        storage.data[payload_start + NONCE_LEN] ^= 0x01;
+        let crc = crate::configuration::crc32(&storage.data[payload_start..payload_start + length]);
+        storage.data[slot_start + 12..slot_start + 16].copy_from_slice(&crc.to_le_bytes());
+    }
+
     #[test]
     fn empty_store_opens() {
         let store =
@@ -435,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn open_prefers_max_counter_over_slot_sequence() {
+    fn reopen_uses_surviving_newer_slot_after_other_crc_failure() {
         // Two commits land in alternating slots. Corrupt the older slot:
         // reopen must still yield the newest counter, and the next flush
         // must advance past it (no nonce reuse with the surviving record).
@@ -458,6 +471,80 @@ mod tests {
         let store =
             SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
         assert_eq!(store.count(), 3);
+    }
+
+    #[test]
+    fn open_prefers_max_counter_over_slot_sequence() {
+        let mut storage = RamStorage::new();
+        {
+            let mut store =
+                SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
+            store.insert(credential(1)).unwrap();
+
+            // Simulate a recovered generation whose database counter is ahead
+            // of the physical slot sequence.
+            store.counter = 9;
+            store.insert(credential(2)).unwrap();
+
+            // A later physical write based on stale state has a newer slot
+            // sequence but a lower database counter.
+            store.counter = 0;
+            store.remove(&[2u8; 16]).unwrap();
+        }
+
+        let store =
+            SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
+        assert_eq!(store.counter, 10);
+        assert_eq!(store.count(), 2);
+        assert!(store.get(&[2u8; 16]).is_some());
+    }
+
+    #[test]
+    fn open_uses_valid_newer_slot_when_older_slot_fails_authentication() {
+        let mut storage = RamStorage::new();
+        {
+            let mut store =
+                SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
+            store.insert(credential(1)).unwrap();
+            store.insert(credential(2)).unwrap();
+        }
+        corrupt_slot_but_preserve_crc(&mut storage, 0);
+
+        let store =
+            SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
+        assert_eq!(store.count(), 2);
+        assert_eq!(store.counter, 2);
+    }
+
+    #[test]
+    fn open_rejects_newer_slot_that_fails_authentication() {
+        let mut storage = RamStorage::new();
+        {
+            let mut store =
+                SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
+            store.insert(credential(1)).unwrap();
+            store.insert(credential(2)).unwrap();
+        }
+        corrupt_slot_but_preserve_crc(&mut storage, 1);
+
+        assert!(matches!(
+            SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)),
+            Err(CoreError::StorageError)
+        ));
+    }
+
+    #[test]
+    fn open_rejects_undersized_crc_valid_slot() {
+        let mut storage = RamStorage::new();
+        {
+            let mut slots = SecretStorage::new(&mut storage, 0, SLOT_SIZE);
+            slots.store(&[0xA5; NONCE_LEN + TAG_LEN - 1]).unwrap();
+        }
+
+        assert!(matches!(
+            SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)),
+            Err(CoreError::StorageError)
+        ));
     }
 
     #[test]
