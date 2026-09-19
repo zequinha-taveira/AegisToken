@@ -159,19 +159,22 @@ impl<S: Storage> SealedCredentialStore<S> {
             pin_hash: None,
             pin_retries: DEFAULT_PIN_RETRIES,
         };
-        let mut have_state = false;
+        let mut state_sequence = None;
         let mut saw_blob = false;
-        let mut auth_failed = false;
+        let mut newest_auth_failed_sequence = None;
 
         for index in 0..crate::storage::SLOT_COUNT {
             let slot_blob = if index == 0 { &mut blob } else { &mut blob1 };
-            let Some((_sequence, length)) = secret_storage.load_slot(index, slot_blob)? else {
+            let Some((sequence, length)) = secret_storage.load_slot(index, slot_blob)? else {
                 continue;
             };
+            saw_blob = true;
             if length < NONCE_LEN + TAG_LEN {
+                if newest_auth_failed_sequence.is_none_or(|failed| sequence > failed) {
+                    newest_auth_failed_sequence = Some(sequence);
+                }
                 continue;
             }
-            saw_blob = true;
             let nonce: [u8; NONCE_LEN] = slot_blob[..NONCE_LEN]
                 .try_into()
                 .map_err(|_| CoreError::StorageError)?;
@@ -180,27 +183,35 @@ impl<S: Storage> SealedCredentialStore<S> {
                 Ok(plain_len) => {
                     match decode_db(&plain[..plain_len]) {
                         Ok(candidate) => {
-                            if !have_state || candidate.counter > state.counter {
+                            if state_sequence.is_none() || candidate.counter > state.counter {
                                 state = candidate;
-                                have_state = true;
+                                state_sequence = Some(sequence);
                             }
                         }
                         Err(_) => {
                             // Valid tag but undecodable body: treat as
                             // tamper and fail closed below.
-                            auth_failed = true;
+                            if newest_auth_failed_sequence.is_none_or(|failed| sequence > failed) {
+                                newest_auth_failed_sequence = Some(sequence);
+                            }
                         }
                     }
                 }
                 Err(_) => {
-                    auth_failed = true;
+                    if newest_auth_failed_sequence.is_none_or(|failed| sequence > failed) {
+                        newest_auth_failed_sequence = Some(sequence);
+                    }
                 }
             }
         }
 
-        // Slots held data but nothing decrypted: wrong key or tamper.
-        // Fail closed instead of opening an empty store.
-        if saw_blob && !have_state && auth_failed {
+        // Fail closed if nothing decrypted, or if a newer physical record
+        // failed authentication. Falling back in the latter case would roll
+        // back to stale state after authenticated storage was tampered with.
+        if saw_blob
+            && newest_auth_failed_sequence
+                .is_some_and(|failed| state_sequence.is_none_or(|selected| failed > selected))
+        {
             return Err(CoreError::StorageError);
         }
 
@@ -368,7 +379,8 @@ impl<S: Storage> crate::pin::PinState for SealedCredentialStore<S> {
 mod tests {
     use super::*;
     use crate::authenticator::Credential;
-    use crate::configuration::FixedString;
+    use crate::configuration::{FixedString, crc32};
+    use crate::storage::SLOT_HEADER_LEN;
 
     const SLOT_SIZE: u32 = 4096;
     fn test_key(seed: u8) -> [u8; KEY_LEN] {
@@ -461,6 +473,19 @@ mod tests {
         store_sealed_plain(slots, counter, &plain[..plain_len], key)
     }
 
+    fn corrupt_slot_payload_preserving_crc(storage: &mut RamStorage, index: u32) {
+        let slot_offset = (index * SLOT_SIZE) as usize;
+        let length = usize::from(u16::from_le_bytes([
+            storage.data[slot_offset + 10],
+            storage.data[slot_offset + 11],
+        ]));
+        let payload_offset = slot_offset + SLOT_HEADER_LEN;
+
+        storage.data[payload_offset + NONCE_LEN] ^= 0x01;
+        let checksum = crc32(&storage.data[payload_offset..payload_offset + length]);
+        storage.data[slot_offset + 12..slot_offset + 16].copy_from_slice(&checksum.to_le_bytes());
+    }
+
     #[test]
     fn empty_store_opens() {
         let store =
@@ -504,8 +529,8 @@ mod tests {
         let mut storage = RamStorage::new();
         {
             let mut slots = SecretStorage::new(&mut storage, 0, SLOT_SIZE);
-            store_database(&mut slots, 3, &[3], &test_key(0x5A));
             store_database(&mut slots, 99, &[9], &test_key(0x5B));
+            store_database(&mut slots, 3, &[3], &test_key(0x5A));
         }
 
         let store =
@@ -514,6 +539,35 @@ mod tests {
         assert_eq!(store.count(), 1);
         assert!(store.get(&[3u8; 16]).is_some());
         assert!(store.get(&[9u8; 16]).is_none());
+    }
+
+    #[test]
+    fn newer_crc_valid_slot_failing_authentication_fails_closed() {
+        let mut storage = RamStorage::new();
+        {
+            let mut slots = SecretStorage::new(&mut storage, 0, SLOT_SIZE);
+            store_database(&mut slots, 1, &[1], &test_key(0x5A));
+            store_database(&mut slots, 2, &[2], &test_key(0x5A));
+        }
+
+        // Keep the record CRC-valid so the changed ciphertext reaches AES-GCM
+        // authentication instead of being discarded by SlotStore::read_slot.
+        corrupt_slot_payload_preserving_crc(&mut storage, 1);
+
+        let result = SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A));
+        assert!(matches!(result, Err(CoreError::StorageError)));
+    }
+
+    #[test]
+    fn undersized_record_fails_closed() {
+        let mut storage = RamStorage::new();
+        {
+            let mut slots = SecretStorage::new(&mut storage, 0, SLOT_SIZE);
+            slots.store(&[0u8; NONCE_LEN + TAG_LEN - 1]).unwrap();
+        }
+
+        let result = SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A));
+        assert!(matches!(result, Err(CoreError::StorageError)));
     }
 
     #[test]

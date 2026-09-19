@@ -417,10 +417,10 @@ impl ClientPin {
 
     /// Provision the first PIN from a `setPIN` request and store its hash.
     ///
-    /// Returns `Ctap2Status::NotAllowed` if a PIN is already present and
-    /// `Ctap2Status::InvalidLength` unless the authenticated payload decrypts
-    /// to exactly 64 bytes. A first zero byte before four PIN bytes returns
-    /// `Ctap2Status::PinPolicyViolation`.
+    /// Returns `Ctap2Status::PinAuthInvalid` if a PIN is already present and
+    /// `Ctap2Status::InvalidParameter` unless the authenticated payload decrypts
+    /// to exactly 64 bytes. Invalid UTF-8, padding, or fewer than four Unicode
+    /// code points returns `Ctap2Status::PinPolicyViolation`.
     pub fn set_pin(
         &mut self,
         request: &ClientPinRequest,
@@ -430,7 +430,7 @@ impl ClientPin {
         // must go through `changePIN`, otherwise any host with USB access
         // could overwrite the victim PIN after a bare key agreement.
         if state.pin_hash().is_some() {
-            return Err(Ctap2Status::NotAllowed);
+            return Err(Ctap2Status::PinAuthInvalid);
         }
         let shared = self.shared(request)?;
         let new_pin_enc = request
@@ -450,17 +450,24 @@ impl ClientPin {
         let mut plain = [0u8; 96];
         let length = aes_cbc_decrypt(&shared, new_pin_enc, &mut plain)?;
         if length != 64 {
-            return Err(Ctap2Status::InvalidLength);
+            return Err(Ctap2Status::InvalidParameter);
         }
         // CTAP2 requires a minimum PIN length of 4 Unicode code points. The
-        // plaintext is zero-padded to 64 bytes, so the effective length is
-        // the offset of the trailing zero padding.
-        let pin_len = plain[..64].iter().position(|&b| b == 0).unwrap_or(64);
-        if pin_len < 4 {
+        // UTF-8 PIN must be terminated and zero-padded to exactly 64 bytes.
+        let pin_len = plain[..64]
+            .iter()
+            .position(|&byte| byte == 0)
+            .ok_or(Ctap2Status::PinPolicyViolation)?;
+        if plain[pin_len..64].iter().any(|&byte| byte != 0) {
+            return Err(Ctap2Status::PinPolicyViolation);
+        }
+        let pin =
+            core::str::from_utf8(&plain[..pin_len]).map_err(|_| Ctap2Status::PinPolicyViolation)?;
+        if pin.chars().count() < 4 {
             return Err(Ctap2Status::PinPolicyViolation);
         }
         state
-            .set_pin_hash(pin_hash(&plain[..64]))
+            .set_pin_hash(pin_hash(pin.as_bytes()))
             .map_err(|_| Ctap2Status::Other)
     }
 
@@ -592,6 +599,32 @@ mod tests {
         }
     }
 
+    fn set_pin_from_plaintext(
+        seed: u32,
+        plaintext: &[u8],
+    ) -> (Result<(), Ctap2Status>, TestPinState) {
+        let mut rng = TestRng(seed);
+        let mut authenticator = ClientPin::new();
+        let mut state = TestPinState::default();
+        let key_agreement = authenticator.key_agreement(&mut rng).unwrap();
+        let platform = Platform::new(&mut rng);
+        let shared = platform.shared(&key_agreement.key);
+
+        let mut encrypted = [0u8; 96];
+        let encrypted_length = aes_cbc_encrypt(&shared, plaintext, &mut encrypted).unwrap();
+        let auth = hmac_sha256(&shared, &encrypted[..encrypted_length]);
+        let request = ClientPinRequest {
+            protocol: 1,
+            sub_command: SUB_SET_PIN,
+            key_agreement: Some(platform.public),
+            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
+            new_pin_enc: Some(heapless::Vec::from_slice(&encrypted[..encrypted_length]).unwrap()),
+            pin_hash_enc: None,
+        };
+        let result = authenticator.set_pin(&request, &mut state);
+        (result, state)
+    }
+
     #[test]
     fn pin_hash_is_sha256_of_padded_pin() {
         let expected = Sha256::digest([b"1234".as_slice(), &[0u8; 60]].concat());
@@ -691,7 +724,7 @@ mod tests {
         };
         assert_eq!(
             authenticator.set_pin(&request, &mut state),
-            Err(Ctap2Status::NotAllowed)
+            Err(Ctap2Status::PinAuthInvalid)
         );
         assert_eq!(state.hash, Some(pin_hash(b"1234")));
         assert_eq!(state.retries, DEFAULT_RETRIES);
@@ -727,6 +760,43 @@ mod tests {
     }
 
     #[test]
+    fn set_pin_validates_unicode_and_zero_padding() {
+        let pin = "é猫🙂a";
+        let mut padded = [0u8; 64];
+        padded[..pin.len()].copy_from_slice(pin.as_bytes());
+
+        let (result, state) = set_pin_from_plaintext(15, &padded);
+        assert_eq!(result, Ok(()));
+        assert_eq!(state.hash, Some(pin_hash(pin.as_bytes())));
+    }
+
+    #[test]
+    fn set_pin_rejects_invalid_utf8_or_padding() {
+        let mut too_few_code_points = [0u8; 64];
+        let three_unicode_chars = "é猫🙂";
+        too_few_code_points[..three_unicode_chars.len()]
+            .copy_from_slice(three_unicode_chars.as_bytes());
+
+        let mut nonzero_after_terminator = [0u8; 64];
+        nonzero_after_terminator[..4].copy_from_slice(b"1234");
+        nonzero_after_terminator[5] = b'5';
+
+        let mut invalid_utf8 = [0u8; 64];
+        invalid_utf8[..5].copy_from_slice(&[0xFF, b'1', b'2', b'3', b'4']);
+
+        for (seed, plaintext) in [
+            (16, too_few_code_points),
+            (17, [b'7'; 64]),
+            (18, nonzero_after_terminator),
+            (19, invalid_utf8),
+        ] {
+            let (result, state) = set_pin_from_plaintext(seed, &plaintext);
+            assert_eq!(result, Err(Ctap2Status::PinPolicyViolation));
+            assert!(state.hash.is_none());
+        }
+    }
+
+    #[test]
     fn set_pin_requires_exactly_64_encrypted_bytes() {
         for (seed, plaintext_length) in [(13, 48), (14, 80)] {
             let mut rng = TestRng(seed);
@@ -754,7 +824,7 @@ mod tests {
 
             assert_eq!(
                 authenticator.set_pin(&request, &mut state),
-                Err(Ctap2Status::InvalidLength),
+                Err(Ctap2Status::InvalidParameter),
                 "accepted {plaintext_length} encrypted bytes"
             );
             assert!(state.hash.is_none());
