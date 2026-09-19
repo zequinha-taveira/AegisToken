@@ -139,6 +139,9 @@ impl<S: Storage> SealedCredentialStore<S> {
     /// trusting the slot sequence alone) prevents AEAD nonce reuse after a
     /// torn write falls back to the older slot: the next `flush()` always
     /// uses `max(observed) + 1`.
+    ///
+    /// If stored sealed records exist but none authenticate and decode, this
+    /// returns `CoreError::StorageError` instead of opening an empty store.
     pub fn open(
         storage: S,
         base: u32,

@@ -98,7 +98,10 @@ impl<'a, const RESPONSE: usize> Router<'a, RESPONSE> {
         self.selected.is_some()
     }
 
-    /// Handle one command APDU and produce the response.
+    /// Parse and route one command APDU, applying response chaining.
+    ///
+    /// [`INS_SEND_REMAINING`] drains a pending chained response; when no bytes
+    /// are pending, the instruction is forwarded to the selected applet.
     pub fn command(&mut self, frame: &[u8], rng: &mut dyn Rng) -> Response<'_> {
         let apdu = match Apdu::parse(frame) {
             Ok(apdu) => apdu,

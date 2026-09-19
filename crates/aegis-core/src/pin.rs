@@ -415,7 +415,12 @@ impl ClientPin {
         shared_secret(private, platform)
     }
 
-    /// `setPIN`.
+    /// Provision the first PIN from a `setPIN` request and store its hash.
+    ///
+    /// Returns `Ctap2Status::NotAllowed` if a PIN is already present and
+    /// `Ctap2Status::InvalidLength` unless the authenticated payload decrypts
+    /// to exactly 64 bytes. A first zero byte before four PIN bytes returns
+    /// `Ctap2Status::PinPolicyViolation`.
     pub fn set_pin(
         &mut self,
         request: &ClientPinRequest,
