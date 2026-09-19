@@ -99,6 +99,10 @@ impl<'a, const RESPONSE: usize> Router<'a, RESPONSE> {
     }
 
     /// Handle one command APDU and produce the response.
+    ///
+    /// `GET RESPONSE` drains the pending response chain. `SEND REMAINING` does
+    /// the same only while data is pending; otherwise it is forwarded to the
+    /// selected applet.
     pub fn command(&mut self, frame: &[u8], rng: &mut dyn Rng) -> Response<'_> {
         let apdu = match Apdu::parse(frame) {
             Ok(apdu) => apdu,

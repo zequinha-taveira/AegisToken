@@ -132,13 +132,12 @@ fn decode_db(plain: &[u8]) -> Result<Database, CoreError> {
 }
 
 impl<S: Storage> SealedCredentialStore<S> {
-    /// Open (or create) the store at `base`, sealing under the device root key.
+    /// Open or create the store at `base`, sealing under the device root key.
     ///
-    /// Both flash slots are scanned and the valid record with the highest
-    /// database counter wins. Scanning the decrypted counters (instead of
-    /// trusting the slot sequence alone) prevents AEAD nonce reuse after a
-    /// torn write falls back to the older slot: the next `flush()` always
-    /// uses `max(observed) + 1`.
+    /// Both flash slots are scanned, and the authenticated, decodable record
+    /// with the highest database counter is restored. If sealed records are
+    /// present but none can be authenticated and decoded, opening fails rather
+    /// than returning an empty store.
     pub fn open(
         storage: S,
         base: u32,

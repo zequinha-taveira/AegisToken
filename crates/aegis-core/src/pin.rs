@@ -415,7 +415,11 @@ impl ClientPin {
         shared_secret(private, platform)
     }
 
-    /// `setPIN`.
+    /// Provision the first PIN from an authenticated, encrypted `setPIN` request.
+    ///
+    /// Rejects attempts to replace an existing PIN, decrypted PIN blocks that
+    /// are not exactly 64 bytes, and values shorter than four bytes before zero
+    /// padding.
     pub fn set_pin(
         &mut self,
         request: &ClientPinRequest,
