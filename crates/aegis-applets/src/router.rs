@@ -228,6 +228,7 @@ mod tests {
             match apdu.ins {
                 0x01 => Response::ok(&[0x01]),
                 0x02 => Response::ok(&self.payload),
+                INS_SEND_REMAINING => Response::ok(&[INS_SEND_REMAINING]),
                 _ => Response::status(Sw::INS_NOT_SUPPORTED),
             }
         }
@@ -402,9 +403,9 @@ mod tests {
         );
         // No chained bytes pending: 0xA5 must reach the applet (OpenPGP
         // SELECT DATA) instead of being swallowed as SEND REMAINING.
-        // TestApplet rejects it, proving it was forwarded.
         let response = router.command(&command(INS_SEND_REMAINING, 0x00, &[], None), &mut TestRng);
-        assert_eq!(response.sw, Sw::INS_NOT_SUPPORTED);
+        assert_eq!(response.sw, Sw::OK);
+        assert_eq!(response.data, &[INS_SEND_REMAINING]);
     }
 
     #[test]
@@ -427,6 +428,12 @@ mod tests {
         );
         assert_eq!(second.sw, Sw::OK);
         assert_eq!(second.data, &[0xAB; 44]);
+
+        // Once the chain is empty, the same instruction belongs to the
+        // selected applet again rather than the response chainer.
+        let third = router.command(&command(INS_SEND_REMAINING, 0x00, &[], None), &mut TestRng);
+        assert_eq!(third.sw, Sw::OK);
+        assert_eq!(third.data, &[INS_SEND_REMAINING]);
     }
 
     #[test]

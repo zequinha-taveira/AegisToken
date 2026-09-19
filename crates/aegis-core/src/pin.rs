@@ -653,10 +653,13 @@ mod tests {
         let param = hmac_sha256(&token, &message);
         assert!(authenticator.verify_pin_uv_auth_param(&param, &message));
         assert!(authenticator.verify_pin_uv_auth_param(&param[..16], &message));
-        // Short prefixes must not verify: a 1-byte prefix is 8-bit security.
-        assert!(!authenticator.verify_pin_uv_auth_param(&param[..1], &message));
-        assert!(!authenticator.verify_pin_uv_auth_param(&param[..17], &message));
-        assert!(!authenticator.verify_pin_uv_auth_param(&[], &message));
+        for invalid_length in [0, 1, 15, 17, 31] {
+            assert!(
+                !authenticator.verify_pin_uv_auth_param(&param[..invalid_length], &message),
+                "accepted a {invalid_length}-byte PIN/UV auth parameter"
+            );
+        }
+        assert!(!authenticator.verify_pin_uv_auth_param(&[0u8; 33], &message));
         assert!(!authenticator.verify_pin_uv_auth_param(&param, b"other"));
         assert!(!ClientPin::new().verify_pin_uv_auth_param(&param, &message));
     }
@@ -690,6 +693,8 @@ mod tests {
             authenticator.set_pin(&request, &mut state),
             Err(Ctap2Status::NotAllowed)
         );
+        assert_eq!(state.hash, Some(pin_hash(b"1234")));
+        assert_eq!(state.retries, DEFAULT_RETRIES);
     }
 
     #[test]
@@ -719,6 +724,41 @@ mod tests {
             Err(Ctap2Status::PinPolicyViolation)
         );
         assert!(state.hash.is_none());
+    }
+
+    #[test]
+    fn set_pin_requires_exactly_64_encrypted_bytes() {
+        for (seed, plaintext_length) in [(13, 48), (14, 80)] {
+            let mut rng = TestRng(seed);
+            let mut authenticator = ClientPin::new();
+            let mut state = TestPinState::default();
+            let key_agreement = authenticator.key_agreement(&mut rng).unwrap();
+            let platform = Platform::new(&mut rng);
+            let shared = platform.shared(&key_agreement.key);
+
+            let plaintext = [b'7'; 80];
+            let mut encrypted = [0u8; 80];
+            let encrypted_length =
+                aes_cbc_encrypt(&shared, &plaintext[..plaintext_length], &mut encrypted).unwrap();
+            let auth = hmac_sha256(&shared, &encrypted[..encrypted_length]);
+            let request = ClientPinRequest {
+                protocol: 1,
+                sub_command: SUB_SET_PIN,
+                key_agreement: Some(platform.public),
+                pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
+                new_pin_enc: Some(
+                    heapless::Vec::from_slice(&encrypted[..encrypted_length]).unwrap(),
+                ),
+                pin_hash_enc: None,
+            };
+
+            assert_eq!(
+                authenticator.set_pin(&request, &mut state),
+                Err(Ctap2Status::InvalidLength),
+                "accepted {plaintext_length} encrypted bytes"
+            );
+            assert!(state.hash.is_none());
+        }
     }
 
     #[test]
