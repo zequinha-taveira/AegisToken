@@ -133,6 +133,12 @@ fn decode_db(plain: &[u8]) -> Result<Database, CoreError> {
 
 impl<S: Storage> SealedCredentialStore<S> {
     /// Open (or create) the store at `base`, sealing under the device root key.
+    ///
+    /// Both flash slots are scanned and the valid record with the highest
+    /// database counter wins. Scanning the decrypted counters (instead of
+    /// trusting the slot sequence alone) prevents AEAD nonce reuse after a
+    /// torn write falls back to the older slot: the next `flush()` always
+    /// uses `max(observed) + 1`.
     pub fn open(
         storage: S,
         base: u32,
@@ -143,22 +149,56 @@ impl<S: Storage> SealedCredentialStore<S> {
         let mut secret_storage = SecretStorage::new(storage, base, slot_size);
 
         let mut blob = [0u8; MAX_PAYLOAD_BYTES];
+        let mut blob1 = [0u8; MAX_PAYLOAD_BYTES];
         let mut state = Database {
             cache: heapless::Vec::new(),
             counter: 0,
             pin_hash: None,
             pin_retries: DEFAULT_PIN_RETRIES,
         };
+        let mut have_state = false;
+        let mut saw_blob = false;
+        let mut auth_failed = false;
 
-        if let Some((_sequence, length)) = secret_storage.load(&mut blob)? {
-            if length >= NONCE_LEN + TAG_LEN {
-                let nonce: [u8; NONCE_LEN] = blob[..NONCE_LEN]
-                    .try_into()
-                    .map_err(|_| CoreError::StorageError)?;
-                let mut plain = [0u8; MAX_SEALED_PLAIN];
-                let plain_len = sealer.open(&nonce, &blob[NONCE_LEN..length], &mut plain)?;
-                state = decode_db(&plain[..plain_len])?;
+        for index in 0..crate::storage::SLOT_COUNT {
+            let slot_blob = if index == 0 { &mut blob } else { &mut blob1 };
+            let Some((_sequence, length)) = secret_storage.load_slot(index, slot_blob)? else {
+                continue;
+            };
+            if length < NONCE_LEN + TAG_LEN {
+                continue;
             }
+            saw_blob = true;
+            let nonce: [u8; NONCE_LEN] = slot_blob[..NONCE_LEN]
+                .try_into()
+                .map_err(|_| CoreError::StorageError)?;
+            let mut plain = [0u8; MAX_SEALED_PLAIN];
+            match sealer.open(&nonce, &slot_blob[NONCE_LEN..length], &mut plain) {
+                Ok(plain_len) => {
+                    match decode_db(&plain[..plain_len]) {
+                        Ok(candidate) => {
+                            if !have_state || candidate.counter > state.counter {
+                                state = candidate;
+                                have_state = true;
+                            }
+                        }
+                        Err(_) => {
+                            // Valid tag but undecodable body: treat as
+                            // tamper and fail closed below.
+                            auth_failed = true;
+                        }
+                    }
+                }
+                Err(_) => {
+                    auth_failed = true;
+                }
+            }
+        }
+
+        // Slots held data but nothing decrypted: wrong key or tamper.
+        // Fail closed instead of opening an empty store.
+        if saw_blob && !have_state && auth_failed {
+            return Err(CoreError::StorageError);
         }
 
         Ok(Self {
@@ -392,6 +432,32 @@ mod tests {
             SealedCredentialStore::open(RamStorage::new(), 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
         assert_eq!(store.count(), 0);
         assert!(store.pin_hash().is_none());
+    }
+
+    #[test]
+    fn open_prefers_max_counter_over_slot_sequence() {
+        // Two commits land in alternating slots. Corrupt the older slot:
+        // reopen must still yield the newest counter, and the next flush
+        // must advance past it (no nonce reuse with the surviving record).
+        let mut storage = RamStorage::new();
+        {
+            let mut store =
+                SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
+            store.insert(credential(1)).unwrap();
+            store.insert(credential(2)).unwrap();
+        }
+        // Older slot is at offset 0 (sequence 1); corrupt its payload CRC.
+        storage.data[crate::storage::SLOT_HEADER_LEN] ^= 0xFF;
+
+        let mut store =
+            SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
+        assert_eq!(store.count(), 2);
+        store.insert(credential(3)).unwrap();
+        drop(store);
+
+        let store =
+            SealedCredentialStore::open(&mut storage, 0, SLOT_SIZE, &test_key(0x5A)).unwrap();
+        assert_eq!(store.count(), 3);
     }
 
     #[test]
