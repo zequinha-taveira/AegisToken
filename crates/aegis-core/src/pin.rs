@@ -358,12 +358,16 @@ impl ClientPin {
     /// Verify a `pinUvAuthParam` against the active PIN/UV auth token.
     ///
     /// `message` is the `clientDataHash` for `makeCredential`/`getAssertion`.
+    /// Only the spec lengths are accepted: 32 bytes (full HMAC) or 16 bytes
+    /// (truncated form used by `makeCredential`/`getAssertion` under protocol
+    /// 1). Shorter prefixes would reduce security to a few bits and allow
+    /// online brute force, so they are rejected.
     #[must_use]
     pub fn verify_pin_uv_auth_param(&self, param: &[u8], message: &[u8]) -> bool {
         let Some(token) = self.pin_uv_auth_token else {
             return false;
         };
-        if param.is_empty() || param.len() > 32 {
+        if param.len() != 16 && param.len() != 32 {
             return false;
         }
         let expected = hmac_sha256(&token, message);
@@ -417,6 +421,12 @@ impl ClientPin {
         request: &ClientPinRequest,
         state: &mut impl PinState,
     ) -> Result<(), Ctap2Status> {
+        // `setPIN` provisions the first PIN only. Rotation of an existing PIN
+        // must go through `changePIN`, otherwise any host with USB access
+        // could overwrite the victim PIN after a bare key agreement.
+        if state.pin_hash().is_some() {
+            return Err(Ctap2Status::NotAllowed);
+        }
         let shared = self.shared(request)?;
         let new_pin_enc = request
             .new_pin_enc
@@ -434,8 +444,15 @@ impl ClientPin {
 
         let mut plain = [0u8; 96];
         let length = aes_cbc_decrypt(&shared, new_pin_enc, &mut plain)?;
-        if length < 64 {
+        if length != 64 {
             return Err(Ctap2Status::InvalidLength);
+        }
+        // CTAP2 requires a minimum PIN length of 4 Unicode code points. The
+        // plaintext is zero-padded to 64 bytes, so the effective length is
+        // the offset of the trailing zero padding.
+        let pin_len = plain[..64].iter().position(|&b| b == 0).unwrap_or(64);
+        if pin_len < 4 {
+            return Err(Ctap2Status::PinPolicyViolation);
         }
         state
             .set_pin_hash(pin_hash(&plain[..64]))
@@ -631,8 +648,72 @@ mod tests {
         let param = hmac_sha256(&token, &message);
         assert!(authenticator.verify_pin_uv_auth_param(&param, &message));
         assert!(authenticator.verify_pin_uv_auth_param(&param[..16], &message));
+        // Short prefixes must not verify: a 1-byte prefix is 8-bit security.
+        assert!(!authenticator.verify_pin_uv_auth_param(&param[..1], &message));
+        assert!(!authenticator.verify_pin_uv_auth_param(&param[..17], &message));
+        assert!(!authenticator.verify_pin_uv_auth_param(&[], &message));
         assert!(!authenticator.verify_pin_uv_auth_param(&param, b"other"));
         assert!(!ClientPin::new().verify_pin_uv_auth_param(&param, &message));
+    }
+
+    #[test]
+    fn set_pin_rejected_when_already_set() {
+        let mut rng = TestRng(11);
+        let mut authenticator = ClientPin::new();
+        let mut state = TestPinState {
+            hash: Some(pin_hash(b"1234")),
+            retries: DEFAULT_RETRIES,
+        };
+        let key_agreement = authenticator.key_agreement(&mut rng).unwrap();
+        let platform = Platform::new(&mut rng);
+        let shared = platform.shared(&key_agreement.key);
+
+        let mut padded = [0u8; 64];
+        padded[..4].copy_from_slice(b"5678");
+        let mut new_pin_enc = [0u8; 64];
+        let length = aes_cbc_encrypt(&shared, &padded, &mut new_pin_enc).unwrap();
+        let auth = hmac_sha256(&shared, &new_pin_enc[..length]);
+        let request = ClientPinRequest {
+            protocol: 1,
+            sub_command: SUB_SET_PIN,
+            key_agreement: Some(platform.public),
+            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
+            new_pin_enc: Some(heapless::Vec::from_slice(&new_pin_enc[..length]).unwrap()),
+            pin_hash_enc: None,
+        };
+        assert_eq!(
+            authenticator.set_pin(&request, &mut state),
+            Err(Ctap2Status::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn set_pin_rejects_short_pin() {
+        let mut rng = TestRng(12);
+        let mut authenticator = ClientPin::new();
+        let mut state = TestPinState::default();
+        let key_agreement = authenticator.key_agreement(&mut rng).unwrap();
+        let platform = Platform::new(&mut rng);
+        let shared = platform.shared(&key_agreement.key);
+
+        let mut padded = [0u8; 64];
+        padded[..3].copy_from_slice(b"123");
+        let mut new_pin_enc = [0u8; 64];
+        let length = aes_cbc_encrypt(&shared, &padded, &mut new_pin_enc).unwrap();
+        let auth = hmac_sha256(&shared, &new_pin_enc[..length]);
+        let request = ClientPinRequest {
+            protocol: 1,
+            sub_command: SUB_SET_PIN,
+            key_agreement: Some(platform.public),
+            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
+            new_pin_enc: Some(heapless::Vec::from_slice(&new_pin_enc[..length]).unwrap()),
+            pin_hash_enc: None,
+        };
+        assert_eq!(
+            authenticator.set_pin(&request, &mut state),
+            Err(Ctap2Status::PinPolicyViolation)
+        );
+        assert!(state.hash.is_none());
     }
 
     #[test]
