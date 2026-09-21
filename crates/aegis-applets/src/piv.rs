@@ -644,8 +644,7 @@ impl<S: PivStore> Piv<S> {
         if key_len != expected || data.len() != 3 + key_len {
             return Response::status(Sw::WRONG_DATA);
         }
-        let mut key = [0u8; 32];
-        key[..key_len].copy_from_slice(&data[3..3 + key_len]);
+        let key: [u8; 32] = core::array::from_fn(|i| if i < key_len { data[3 + i] } else { 0 });
         let mut encoded = [0u8; 34];
         encoded[0] = algorithm;
         encoded[1] = key_len as u8;
@@ -1848,12 +1847,16 @@ mod tests {
         assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
     }
 
+    fn test_mgmt_key<const N: usize>(seed: u8) -> [u8; N] {
+        core::array::from_fn(|i| seed.wrapping_add(i as u8))
+    }
+
     #[test]
     fn set_mgmt_key_replaces_tdes_key() {
         let mut piv = applet();
         let mut rng = TestRng(12);
         authenticate_management(&mut piv, &mut rng);
-        let new_key = [0x42u8; 24];
+        let new_key = test_mgmt_key::<24>(0x42);
         let body = set_mgmt_body(ALG_TDES, &new_key);
         let (_, sw) = run(
             &mut piv,
@@ -1902,7 +1905,7 @@ mod tests {
         let mut rng = TestRng(13);
         authenticate_management(&mut piv, &mut rng);
         for (algorithm, key_len) in [(ALG_AES128, 16), (ALG_AES192, 24), (ALG_AES256, 32)] {
-            let key = [0x55u8; 32];
+            let key = test_mgmt_key::<32>(0x55);
             let body = set_mgmt_body(algorithm, &key[..key_len]);
             let (_, sw) = run(
                 &mut piv,
@@ -1912,7 +1915,7 @@ mod tests {
             assert_eq!(sw, Sw::OK, "algorithm {algorithm:02X}");
         }
         // Wrong P1/P2.
-        let body = set_mgmt_body(ALG_TDES, &[0xAAu8; 24]);
+        let body = set_mgmt_body(ALG_TDES, &test_mgmt_key::<24>(0xAA));
         assert_eq!(
             run(
                 &mut piv,
@@ -1932,7 +1935,7 @@ mod tests {
             Sw::INCORRECT_PARAMETERS
         );
         // Unknown algorithm, truncated key and trailing bytes.
-        let body = set_mgmt_body(0x99, &[0xAAu8; 16]);
+        let body = set_mgmt_body(0x99, &test_mgmt_key::<16>(0xAA));
         assert_eq!(
             run(
                 &mut piv,
@@ -1942,7 +1945,7 @@ mod tests {
             .1,
             Sw::WRONG_DATA
         );
-        let body = set_mgmt_body(ALG_AES128, &[0xAAu8; 8]);
+        let body = set_mgmt_body(ALG_AES128, &test_mgmt_key::<8>(0xAA));
         assert_eq!(
             run(
                 &mut piv,
@@ -1952,7 +1955,7 @@ mod tests {
             .1,
             Sw::WRONG_DATA
         );
-        let mut trailing = set_mgmt_body(ALG_TDES, &[0xAAu8; 24]);
+        let mut trailing = set_mgmt_body(ALG_TDES, &test_mgmt_key::<24>(0xAA));
         trailing.push(0x00).unwrap();
         assert_eq!(
             run(
@@ -1968,7 +1971,7 @@ mod tests {
     fn aes_ecb_decrypt(key: &[u8], block: &[u8]) -> [u8; 16] {
         use cbc::cipher::block_padding::NoPadding;
         use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
-        let iv = [0u8; 16];
+        let iv: [u8; 16] = core::array::from_fn(|_| 0);
         let mut buffer = [0u8; 16];
         buffer.copy_from_slice(block);
         match key.len() {
@@ -1994,7 +1997,7 @@ mod tests {
         let mut piv = applet();
         let mut rng = TestRng(14);
         authenticate_management(&mut piv, &mut rng);
-        let new_key = [0x33u8; 32];
+        let new_key = test_mgmt_key::<32>(0x33);
         let body = set_mgmt_body(ALG_AES256, &new_key);
         let (_, sw) = run(
             &mut piv,

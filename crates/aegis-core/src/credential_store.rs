@@ -447,8 +447,10 @@ mod tests {
         plain: &[u8],
         key: &[u8; KEY_LEN],
     ) -> u32 {
-        let mut nonce = [0u8; NONCE_LEN];
-        nonce[..8].copy_from_slice(&counter.to_le_bytes());
+        let nonce: [u8; NONCE_LEN] = core::array::from_fn(|i| {
+            let bytes = counter.to_le_bytes();
+            if i < bytes.len() { bytes[i] } else { 0 }
+        });
         let mut blob = [0u8; MAX_PAYLOAD_BYTES];
         blob[..NONCE_LEN].copy_from_slice(&nonce);
         let sealed_len = AesGcmSealer::new(key)
