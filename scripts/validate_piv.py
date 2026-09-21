@@ -41,7 +41,7 @@ try:
         from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
     except ImportError:  # pragma: no cover - older cryptography
         from cryptography.hazmat.primitives.ciphers.algorithms import TripleDES
-    from cryptography.hazmat.primitives.ciphers import Cipher, modes
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 except ImportError as exc:  # pragma: no cover - tooling dependency
     print("cryptography is required: pip install cryptography")
     print(exc)
@@ -60,6 +60,7 @@ DEFAULT_MGMT_KEY = bytes.fromhex("0102030405060708" * 3)
 
 ALG_TDES = 0x03
 ALG_RSA2048 = 0x07
+ALG_AES256 = 0x0C
 ALG_ECCP256 = 0x11
 REF_PIN = 0x80
 REF_MANAGEMENT = 0x9B
@@ -125,6 +126,16 @@ def tdes_ecb_decrypt(key: bytes, block: bytes) -> bytes:
 
 def tdes_ecb_encrypt(key: bytes, block: bytes) -> bytes:
     cipher = Cipher(TripleDES(key), modes.ECB())
+    return cipher.encryptor().update(block)
+
+
+def aes_ecb_decrypt(key: bytes, block: bytes) -> bytes:
+    cipher = Cipher(algorithms.AES(key), modes.ECB())
+    return cipher.decryptor().update(block)
+
+
+def aes_ecb_encrypt(key: bytes, block: bytes) -> bytes:
+    cipher = Cipher(algorithms.AES(key), modes.ECB())
     return cipher.encryptor().update(block)
 
 
@@ -225,6 +236,12 @@ def main() -> int:
     _, sw = transmit(connection, [0x00, 0x20, 0x00, REF_PIN, 8, *padded_pin(DEFAULT_PIN)])
     record("AC-017 VERIFY default PIN", sw == 0x9000, f"sw={sw:04X}")
 
+    # SET MANAGEMENT KEY requires admin authentication
+    dummy_key = b"\x55" * 32
+    body = bytes([ALG_AES256, REF_MANAGEMENT, len(dummy_key)]) + dummy_key
+    _, sw = transmit(connection, [0x00, 0xFF, 0xFF, 0xFF, len(body), *body])
+    record("AC-017 SET MANAGEMENT KEY requires auth", sw == 0x6982, f"sw={sw:04X}")
+
     # Management key: mutual authentication with the default 3DES key.
     data, sw = transmit(
         connection,
@@ -261,6 +278,50 @@ def main() -> int:
 
     if not authenticated:
         return summarize()
+
+    # SET MANAGEMENT KEY (Yubico extension 00 FF FF FF):
+    # Replaces key with AES-256, verifies AES-256 mutual auth, and restores default 3DES key.
+    temp_aes_key = os.urandom(32)
+    body = bytes([ALG_AES256, REF_MANAGEMENT, len(temp_aes_key)]) + temp_aes_key
+    _, sw = transmit(connection, [0x00, 0xFF, 0xFF, 0xFF, len(body), *body])
+    record("AC-017 SET MANAGEMENT KEY (AES-256)", sw == 0x9000, f"sw={sw:04X}")
+
+    aes_authenticated = False
+    if sw == 0x9000:
+        data, sw = transmit(
+            connection,
+            [0x00, 0x87, ALG_AES256, REF_MANAGEMENT, 0x04, 0x7C, 0x02, 0x80, 0x00],
+        )
+        template = tlv_find(data, 0x7C) if sw == 0x9000 else None
+        witness = tlv_find(template, 0x80) if template is not None else None
+        if witness is not None:
+            nonce = aes_ecb_decrypt(temp_aes_key, witness)
+            challenge = os.urandom(16)
+            inner = (
+                bytes([0x80, 0x10])
+                + nonce
+                + bytes([0x81, 0x10])
+                + challenge
+                + bytes([0x82, 0x00])
+            )
+            body = bytes([0x7C, len(inner)]) + inner
+            data, sw = transmit(
+                connection,
+                [0x00, 0x87, ALG_AES256, REF_MANAGEMENT, len(body), *body],
+            )
+            response = tlv_find(data, 0x7C)
+            encrypted = tlv_find(response, 0x82) if response is not None else None
+            aes_authenticated = (
+                sw == 0x9000
+                and encrypted is not None
+                and aes_ecb_decrypt(temp_aes_key, encrypted) == challenge
+            )
+    record("AC-017 AES-256 management key mutual auth", aes_authenticated)
+
+    # Restore default 3DES management key so the token remains in factory state
+    body = bytes([ALG_TDES, REF_MANAGEMENT, len(DEFAULT_MGMT_KEY)]) + DEFAULT_MGMT_KEY
+    _, sw = transmit(connection, [0x00, 0xFF, 0xFF, 0xFF, len(body), *body])
+    record("AC-017 restore default 3DES management key", sw == 0x9000, f"sw={sw:04X}")
 
     # GENERATE ASYMMETRIC KEY PAIR: P-256 in slot 9C, PIN once, no touch.
     ac = bytes([0xAC, 0x06, 0x80, 0x01, ALG_ECCP256, 0xAA, 0x01, 0x02])

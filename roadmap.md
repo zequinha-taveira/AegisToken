@@ -699,8 +699,10 @@ adiado.
 - **RSA (Fase 16):** slots/`GENERATE` com algoritmos RSA respondem `6A81`.
 - **Fora do escopo desta fase:** `9D`/ECDH, slots aposentados (`82`–`95`),
   `PUT DATA` de objetos não certificado já é aceito, mas `GET METADATA` e
-  `SET MANAGEMENT KEY`/`SET PIN RETRIES` (extensões Yubico) respondem `6D00`;
+  `SET PIN RETRIES` (extensões Yubico) respondem `6D00`;
   `pkilint`/metadata de touch policy dependem dessas extensões.
+  `SET MANAGEMENT KEY` (`00 FF FF FF|FE`, TDES/AES) entregue para
+  provisionamento com segurança total (ver `specs/piv-set-mgmt-key.md`).
 - **Atestação PIV** (`AUTHENTICATE` com `9A`/`9E` para `INTERNAL AUTHENTICATE`)
   usa o mesmo caminho de assinatura, mas não há certificado de fábrica
   provisionado.
