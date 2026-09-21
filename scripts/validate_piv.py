@@ -10,9 +10,10 @@ Run with an AegisToken device connected. Requires ``pyscard`` and
 The script selects the PIV application, reads the CCC and CHUID, exercises the
 default PIN and the 3DES management key (mutual authentication), generates a
 P-256 key in slot 9C, signs a digest and verifies the signature off-card with
-``cryptography``. The RSA section (AC-021) then generates an RSA-2048 key in
-slot 9A, signs a 256-byte block and checks ``s^e mod n`` in plain Python
-(raw private operation, no padding library needed).
+``cryptography``. The RSA section (AC-021, Phase 16d) then covers both RSA
+slots (9A + 9C): explicit PIN re-verification, RSA-2048 key generation,
+raw-block sign with ``s^e mod n`` check, and a DigestInfo/EMSA-PKCS1-v1_5
+round-trip verified with the ``cryptography`` padding library.
 
 Exit code is 0 when every check passes, 1 otherwise.
 """
@@ -32,7 +33,7 @@ except ImportError as exc:  # pragma: no cover - tooling dependency
 
 try:
     from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa as rsa_mod
     from cryptography.hazmat.primitives.asymmetric import utils as asym_utils
 
     try:
@@ -40,7 +41,7 @@ try:
         from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
     except ImportError:  # pragma: no cover - older cryptography
         from cryptography.hazmat.primitives.ciphers.algorithms import TripleDES
-    from cryptography.hazmat.primitives.ciphers import Cipher, modes
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 except ImportError as exc:  # pragma: no cover - tooling dependency
     print("cryptography is required: pip install cryptography")
     print(exc)
@@ -59,6 +60,7 @@ DEFAULT_MGMT_KEY = bytes.fromhex("0102030405060708" * 3)
 
 ALG_TDES = 0x03
 ALG_RSA2048 = 0x07
+ALG_AES256 = 0x0C
 ALG_ECCP256 = 0x11
 REF_PIN = 0x80
 REF_MANAGEMENT = 0x9B
@@ -124,6 +126,16 @@ def tdes_ecb_decrypt(key: bytes, block: bytes) -> bytes:
 
 def tdes_ecb_encrypt(key: bytes, block: bytes) -> bytes:
     cipher = Cipher(TripleDES(key), modes.ECB())
+    return cipher.encryptor().update(block)
+
+
+def aes_ecb_decrypt(key: bytes, block: bytes) -> bytes:
+    cipher = Cipher(algorithms.AES(key), modes.ECB())
+    return cipher.decryptor().update(block)
+
+
+def aes_ecb_encrypt(key: bytes, block: bytes) -> bytes:
+    cipher = Cipher(algorithms.AES(key), modes.ECB())
     return cipher.encryptor().update(block)
 
 
@@ -224,6 +236,12 @@ def main() -> int:
     _, sw = transmit(connection, [0x00, 0x20, 0x00, REF_PIN, 8, *padded_pin(DEFAULT_PIN)])
     record("AC-017 VERIFY default PIN", sw == 0x9000, f"sw={sw:04X}")
 
+    # SET MANAGEMENT KEY requires admin authentication
+    dummy_key = b"\x55" * 32
+    body = bytes([ALG_AES256, REF_MANAGEMENT, len(dummy_key)]) + dummy_key
+    _, sw = transmit(connection, [0x00, 0xFF, 0xFF, 0xFF, len(body), *body])
+    record("AC-017 SET MANAGEMENT KEY requires auth", sw == 0x6982, f"sw={sw:04X}")
+
     # Management key: mutual authentication with the default 3DES key.
     data, sw = transmit(
         connection,
@@ -260,6 +278,50 @@ def main() -> int:
 
     if not authenticated:
         return summarize()
+
+    # SET MANAGEMENT KEY (Yubico extension 00 FF FF FF):
+    # Replaces key with AES-256, verifies AES-256 mutual auth, and restores default 3DES key.
+    temp_aes_key = os.urandom(32)
+    body = bytes([ALG_AES256, REF_MANAGEMENT, len(temp_aes_key)]) + temp_aes_key
+    _, sw = transmit(connection, [0x00, 0xFF, 0xFF, 0xFF, len(body), *body])
+    record("AC-017 SET MANAGEMENT KEY (AES-256)", sw == 0x9000, f"sw={sw:04X}")
+
+    aes_authenticated = False
+    if sw == 0x9000:
+        data, sw = transmit(
+            connection,
+            [0x00, 0x87, ALG_AES256, REF_MANAGEMENT, 0x04, 0x7C, 0x02, 0x80, 0x00],
+        )
+        template = tlv_find(data, 0x7C) if sw == 0x9000 else None
+        witness = tlv_find(template, 0x80) if template is not None else None
+        if witness is not None:
+            nonce = aes_ecb_decrypt(temp_aes_key, witness)
+            challenge = os.urandom(16)
+            inner = (
+                bytes([0x80, 0x10])
+                + nonce
+                + bytes([0x81, 0x10])
+                + challenge
+                + bytes([0x82, 0x00])
+            )
+            body = bytes([0x7C, len(inner)]) + inner
+            data, sw = transmit(
+                connection,
+                [0x00, 0x87, ALG_AES256, REF_MANAGEMENT, len(body), *body],
+            )
+            response = tlv_find(data, 0x7C)
+            encrypted = tlv_find(response, 0x82) if response is not None else None
+            aes_authenticated = (
+                sw == 0x9000
+                and encrypted is not None
+                and aes_ecb_decrypt(temp_aes_key, encrypted) == challenge
+            )
+    record("AC-017 AES-256 management key mutual auth", aes_authenticated)
+
+    # Restore default 3DES management key so the token remains in factory state
+    body = bytes([ALG_TDES, REF_MANAGEMENT, len(DEFAULT_MGMT_KEY)]) + DEFAULT_MGMT_KEY
+    _, sw = transmit(connection, [0x00, 0xFF, 0xFF, 0xFF, len(body), *body])
+    record("AC-017 restore default 3DES management key", sw == 0x9000, f"sw={sw:04X}")
 
     # GENERATE ASYMMETRIC KEY PAIR: P-256 in slot 9C, PIN once, no touch.
     ac = bytes([0xAC, 0x06, 0x80, 0x01, ALG_ECCP256, 0xAA, 0x01, 0x02])
@@ -309,50 +371,85 @@ def main() -> int:
     )
     record("AC-017 signature verifies (P-256)", verified, error)
 
-    # --- Phase 16: RSA-2048 (AC-021) --------------------------------------
+    # --- Phase 16d: RSA-2048 (AC-021), both slots -------------------------
     # On-device key generation takes seconds; the PC/SC timeout covers it.
-    ac = bytes([0xAC, 0x06, 0x80, 0x01, ALG_RSA2048, 0xAA, 0x01, 0x02])
-    data, sw = transmit(
-        connection,
-        [0x00, 0x47, 0x00, REF_PIV_AUTH, len(ac), *ac],
-    )
-    template = tlv_find(data, 0x7F49) if sw == 0x9000 else None
-    modulus = tlv_find(template, 0x81) if template is not None else None
-    exponent = tlv_find(template, 0x82) if template is not None else None
-    record(
-        "AC-021 GENERATE RSA-2048 key",
-        modulus is not None
-        and len(modulus) == 256
-        and exponent == bytes([0x01, 0x00, 0x01]),
-        f"sw={sw:04X}",
-    )
-    if modulus is None:
+    # Explicit re-VERIFY: do not rely on the PIN-`once` state cached from the
+    # P-256 flow above.
+    _, sw = transmit(connection, [0x00, 0x20, 0x00, REF_PIN, 8, *padded_pin(DEFAULT_PIN)])
+    record("AC-021 VERIFY PIN before RSA", sw == 0x9000, f"sw={sw:04X}")
+    if sw != 0x9000:
         return summarize()
 
-    block = os.urandom(256)
-    inner = bytes([0x82, 0x00, 0x81, 0x82, 0x01, 0x00]) + block
-    body = bytes([0x7C, 0x82, (len(inner) >> 8) & 0xFF, len(inner) & 0xFF]) + inner
-    data, sw = transmit(
-        connection,
-        xapdu(0x00, 0x87, ALG_RSA2048, REF_PIV_AUTH, body),
-    )
-    template = tlv_find(data, 0x7C) if sw == 0x9000 else None
-    raw = tlv_find(template, 0x82) if template is not None else None
-    record(
-        "AC-021 GENERAL AUTHENTICATE RSA sign",
-        raw is not None and len(raw) == 256,
-        f"sw={sw:04X}",
-    )
+    for slot, label in ((REF_PIV_AUTH, "9A"), (REF_SIGNATURE, "9C")):
+        ac = bytes([0xAC, 0x06, 0x80, 0x01, ALG_RSA2048, 0xAA, 0x01, 0x02])
+        data, sw = transmit(
+            connection,
+            [0x00, 0x47, 0x00, slot, len(ac), *ac],
+        )
+        template = tlv_find(data, 0x7F49) if sw == 0x9000 else None
+        modulus = tlv_find(template, 0x81) if template is not None else None
+        exponent = tlv_find(template, 0x82) if template is not None else None
+        record(
+            f"AC-021 GENERATE RSA-2048 key ({label})",
+            modulus is not None
+            and len(modulus) == 256
+            and exponent == bytes([0x01, 0x00, 0x01]),
+            f"sw={sw:04X}",
+        )
+        if modulus is None:
+            return summarize()
 
-    # Raw RSA check without a padding library: s^e mod n must equal the block.
-    # PIN policy is `once` and the PIN is still verified from the P-256 flow.
-    n = int.from_bytes(modulus, "big")
-    e = int.from_bytes(exponent, "big")
-    verified = (
-        raw is not None
-        and pow(int.from_bytes(raw, "big"), e, n) == int.from_bytes(block, "big")
-    )
-    record("AC-021 RSA signature inverts with the public key", verified)
+        block = os.urandom(256)
+        inner = bytes([0x82, 0x00, 0x81, 0x82, 0x01, 0x00]) + block
+        body = bytes([0x7C, 0x82, (len(inner) >> 8) & 0xFF, len(inner) & 0xFF]) + inner
+        data, sw = transmit(
+            connection,
+            xapdu(0x00, 0x87, ALG_RSA2048, slot, body),
+        )
+        template = tlv_find(data, 0x7C) if sw == 0x9000 else None
+        raw = tlv_find(template, 0x82) if template is not None else None
+        record(
+            f"AC-021 GENERAL AUTHENTICATE RSA sign ({label})",
+            raw is not None and len(raw) == 256,
+            f"sw={sw:04X}",
+        )
+
+        # Raw RSA check without a padding library: s^e mod n must equal the block.
+        n = int.from_bytes(modulus, "big")
+        e = int.from_bytes(exponent, "big")
+        verified = (
+            raw is not None
+            and pow(int.from_bytes(raw, "big"), e, n) == int.from_bytes(block, "big")
+        )
+        record(f"AC-021 RSA signature inverts with the public key ({label})", verified)
+
+        # DigestInfo/EMSA-PKCS1-v1_5 round-trip: host frames the EM, card
+        # applies the raw private operation, host verifies with the padding
+        # library (same pattern as validate_openpgp.py AC-021).
+        digest = hashlib.sha256(b"abc").digest()
+        digest_info = bytes.fromhex("3031300D060960864801650304020105000420") + digest
+        em = b"\x00\x01" + b"\xff" * (256 - len(digest_info) - 3) + b"\x00" + digest_info
+        inner = bytes([0x82, 0x00, 0x81, 0x82, 0x01, 0x00]) + em
+        body = bytes([0x7C, 0x82, (len(inner) >> 8) & 0xFF, len(inner) & 0xFF]) + inner
+        data, sw = transmit(
+            connection,
+            xapdu(0x00, 0x87, ALG_RSA2048, slot, body),
+        )
+        template = tlv_find(data, 0x7C) if sw == 0x9000 else None
+        sig = tlv_find(template, 0x82) if template is not None else None
+        em_ok = False
+        try:
+            numbers = rsa_mod.RSAPublicNumbers(n, e)
+            numbers.public_key().verify(
+                sig,
+                digest,
+                padding.PKCS1v15(),
+                asym_utils.Prehashed(hashes.SHA256()),
+            )
+            em_ok = sw == 0x9000 and sig is not None and len(sig) == 256
+        except Exception:
+            em_ok = False
+        record(f"AC-021 RSA DigestInfo signature verifies ({label})", em_ok, f"sw={sw:04X}")
 
     return summarize()
 

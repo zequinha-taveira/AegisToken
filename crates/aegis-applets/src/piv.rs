@@ -2,14 +2,16 @@
 //!
 //! The applet implements the NIST PIV command set the host tooling actually
 //! uses — `SELECT`, `GET DATA`/`PUT DATA`, `VERIFY`, `CHANGE REFERENCE DATA`,
-//! `RESET RETRY COUNTER`, `GENERATE ASYMMETRIC KEY PAIR` and
-//! `GENERAL AUTHENTICATE` (management-key authentication and ECDSA signing) —
-//! with P-256 and P-384 keys generated on-card from the caller's RNG.
+//! `RESET RETRY COUNTER`, `GENERATE ASYMMETRIC KEY PAIR`,
+//! `GENERAL AUTHENTICATE` (management-key authentication and ECDSA signing)
+//! and the Yubico `SET MANAGEMENT KEY` (`00 FF FF FF|FE`) provisioning
+//! command — with P-256 and P-384 keys generated on-card from the caller's RNG.
 //!
 //! Everything is `no_std` and deterministic: the applet receives an
 //! [`Rng`], talks to a [`PivStore`] for persistence, and returns APDU
-//! responses. Vendor extensions (Yubico metadata, retired keys and ECDH)
-//! are out of scope and answer the standard "function not supported" status.
+//! responses. Remaining vendor extensions (Yubico metadata, retired keys,
+//! ECDH, `SET PIN RETRIES`, `RESET`) are out of scope and answer the
+//! standard "function not supported" status.
 //!
 //! Defaults follow common PIV provisioning: PIN `123456`, PUK `12345678` and
 //! the default 3DES management key `0102..08` repeated three times; all three
@@ -60,6 +62,8 @@ const INS_GENERATE_ASYMMETRIC_KEY_PAIR: u8 = 0x47;
 const INS_GENERAL_AUTHENTICATE: u8 = 0x87;
 const INS_GET_DATA: u8 = 0xCB;
 const INS_PUT_DATA: u8 = 0xDB;
+/// Yubico extension: replace the 9B card-management key (provisioning).
+const INS_SET_MGMKEY: u8 = 0xFF;
 
 // Key references (P2).
 const REF_PIN: u8 = 0x80;
@@ -611,6 +615,52 @@ impl<S: PivStore> Piv<S> {
         }
     }
 
+    /// Yubico `SET MANAGEMENT KEY` (`00 FF FF FF|FE <alg> 9B <len> <key>`).
+    ///
+    /// Replaces the 9B card-management key after a successful management-key
+    /// authentication. The touch flag in P2 is accepted but not enforced yet:
+    /// future management-key authentications still follow the plain
+    /// challenge/response flow.
+    fn set_mgmt_key(&mut self, apdu: &Apdu<'_>) -> Response<'_> {
+        if apdu.p1 != 0xFF || (apdu.p2 != 0xFF && apdu.p2 != 0xFE) {
+            return Response::status(Sw::INCORRECT_PARAMETERS);
+        }
+        if !self.mgmt_authenticated {
+            return Response::status(Sw::SECURITY_STATUS_NOT_SATISFIED);
+        }
+        let data = apdu.data;
+        if data.len() < 3 || data[1] != REF_MANAGEMENT {
+            return Response::status(Sw::WRONG_DATA);
+        }
+        let algorithm = data[0];
+        let key_len = usize::from(data[2]);
+        let expected = match algorithm {
+            ALG_TDES => 24,
+            ALG_AES128 => 16,
+            ALG_AES192 => 24,
+            ALG_AES256 => 32,
+            _ => return Response::status(Sw::WRONG_DATA),
+        };
+        if key_len != expected || data.len() != 3 + key_len {
+            return Response::status(Sw::WRONG_DATA);
+        }
+        let key: [u8; 32] = core::array::from_fn(|i| if i < key_len { data[3 + i] } else { 0 });
+        let mut encoded = [0u8; 34];
+        encoded[0] = algorithm;
+        encoded[1] = key_len as u8;
+        encoded[2..2 + key_len].copy_from_slice(&key[..key_len]);
+        if !self.store.write(RECORD_MGMT_KEY, &encoded[..2 + key_len]) {
+            return Response::status(Sw::NOT_ENOUGH_MEMORY);
+        }
+        self.mgmt = MgmtKey {
+            algorithm,
+            len: key_len,
+            key,
+        };
+        self.witness = None;
+        Response::status(Sw::OK)
+    }
+
     fn verify(&mut self, apdu: &Apdu<'_>) -> Response<'_> {
         if apdu.p1 != 0x00 {
             return Response::status(Sw::INCORRECT_PARAMETERS);
@@ -1088,6 +1138,7 @@ impl<S: PivStore> Applet for Piv<S> {
             INS_RESET_RETRY_COUNTER => self.reset_retry_counter(apdu),
             INS_GENERATE_ASYMMETRIC_KEY_PAIR => self.generate_key_pair(apdu, rng),
             INS_GENERAL_AUTHENTICATE => self.general_authenticate(apdu, rng),
+            INS_SET_MGMKEY => self.set_mgmt_key(apdu),
             _ => Response::status(Sw::INS_NOT_SUPPORTED),
         }
     }
@@ -1771,6 +1822,229 @@ mod tests {
         let (data, sw) = get_data(&mut piv, &mut rng, &[0x5F, 0xC1, 0x05]);
         assert_eq!(sw, Sw::OK);
         assert_eq!(find_in_53(&data, 0x70), Some(&[0x01, 0x02, 0x03][..]));
+    }
+
+    fn set_mgmt_body(algorithm: u8, key: &[u8]) -> HeaplessVec<u8, 64> {
+        let mut body = HeaplessVec::new();
+        body.push(algorithm).unwrap();
+        body.push(REF_MANAGEMENT).unwrap();
+        body.push(key.len() as u8).unwrap();
+        body.extend_from_slice(key).unwrap();
+        body
+    }
+
+    #[test]
+    fn set_mgmt_key_requires_authentication() {
+        let mut piv = applet();
+        let mut rng = TestRng(11);
+        let new_key = [0xAAu8; 24];
+        let body = set_mgmt_body(ALG_TDES, &new_key);
+        let (_, sw) = run(
+            &mut piv,
+            &mut rng,
+            &command(INS_SET_MGMKEY, 0xFF, 0xFF, &body),
+        );
+        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+
+    fn test_mgmt_key<const N: usize>(seed: u8) -> [u8; N] {
+        core::array::from_fn(|i| seed.wrapping_add(i as u8))
+    }
+
+    #[test]
+    fn set_mgmt_key_replaces_tdes_key() {
+        let mut piv = applet();
+        let mut rng = TestRng(12);
+        authenticate_management(&mut piv, &mut rng);
+        let new_key = test_mgmt_key::<24>(0x42);
+        let body = set_mgmt_body(ALG_TDES, &new_key);
+        let (_, sw) = run(
+            &mut piv,
+            &mut rng,
+            &command(INS_SET_MGMKEY, 0xFF, 0xFF, &body),
+        );
+        assert_eq!(sw, Sw::OK);
+        // Persisted record holds the new key.
+        let mut record = [0u8; 34];
+        let len = piv
+            .store_mut()
+            .read(RECORD_MGMT_KEY, &mut record)
+            .expect("record");
+        assert_eq!(&record[..len], &[&[ALG_TDES, 24u8], &new_key[..]].concat());
+        // After re-select the new key authenticates and the old one does not.
+        assert_eq!(piv.select().sw, Sw::OK);
+        let (data, sw) = run(
+            &mut piv,
+            &mut rng,
+            &command(
+                INS_GENERAL_AUTHENTICATE,
+                ALG_TDES,
+                REF_MANAGEMENT,
+                &[0x7C, 0x02, 0x81, 0x00],
+            ),
+        );
+        assert_eq!(sw, Sw::OK);
+        let encrypted = find_in_7c(&data, 0x81).expect("challenge present").to_vec();
+        let nonce = tdes_ecb_decrypt(&new_key, &encrypted);
+        let mut ok_body = HeaplessVec::<u8, 32>::new();
+        ok_body
+            .extend_from_slice(&[0x7C, 0x0A, 0x82, 0x08])
+            .unwrap();
+        ok_body.extend_from_slice(&nonce).unwrap();
+        let (_, sw) = run(
+            &mut piv,
+            &mut rng,
+            &command(INS_GENERAL_AUTHENTICATE, ALG_TDES, REF_MANAGEMENT, &ok_body),
+        );
+        assert_eq!(sw, Sw::OK);
+    }
+
+    #[test]
+    fn set_mgmt_key_accepts_aes_and_rejects_bad_params() {
+        let mut piv = applet();
+        let mut rng = TestRng(13);
+        authenticate_management(&mut piv, &mut rng);
+        for (algorithm, key_len) in [(ALG_AES128, 16), (ALG_AES192, 24), (ALG_AES256, 32)] {
+            let key = test_mgmt_key::<32>(0x55);
+            let body = set_mgmt_body(algorithm, &key[..key_len]);
+            let (_, sw) = run(
+                &mut piv,
+                &mut rng,
+                &command(INS_SET_MGMKEY, 0xFF, 0xFE, &body),
+            );
+            assert_eq!(sw, Sw::OK, "algorithm {algorithm:02X}");
+        }
+        // Wrong P1/P2.
+        let body = set_mgmt_body(ALG_TDES, &test_mgmt_key::<24>(0xAA));
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_SET_MGMKEY, 0x00, 0xFF, &body)
+            )
+            .1,
+            Sw::INCORRECT_PARAMETERS
+        );
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_SET_MGMKEY, 0xFF, 0x00, &body)
+            )
+            .1,
+            Sw::INCORRECT_PARAMETERS
+        );
+        // Unknown algorithm, truncated key and trailing bytes.
+        let body = set_mgmt_body(0x99, &test_mgmt_key::<16>(0xAA));
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_SET_MGMKEY, 0xFF, 0xFF, &body)
+            )
+            .1,
+            Sw::WRONG_DATA
+        );
+        let body = set_mgmt_body(ALG_AES128, &test_mgmt_key::<8>(0xAA));
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_SET_MGMKEY, 0xFF, 0xFF, &body)
+            )
+            .1,
+            Sw::WRONG_DATA
+        );
+        let mut trailing = set_mgmt_body(ALG_TDES, &test_mgmt_key::<24>(0xAA));
+        trailing.push(0x00).unwrap();
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_SET_MGMKEY, 0xFF, 0xFF, &trailing)
+            )
+            .1,
+            Sw::WRONG_DATA
+        );
+    }
+
+    fn aes_ecb_decrypt(key: &[u8], block: &[u8]) -> [u8; 16] {
+        use cbc::cipher::block_padding::NoPadding;
+        use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
+        let iv: [u8; 16] = core::array::from_fn(|_| 0);
+        let mut buffer = [0u8; 16];
+        buffer.copy_from_slice(block);
+        match key.len() {
+            16 => cbc::Decryptor::<aes::Aes128>::new_from_slices(key, &iv)
+                .unwrap()
+                .decrypt_padded::<NoPadding>(&mut buffer)
+                .unwrap(),
+            24 => cbc::Decryptor::<aes::Aes192>::new_from_slices(key, &iv)
+                .unwrap()
+                .decrypt_padded::<NoPadding>(&mut buffer)
+                .unwrap(),
+            32 => cbc::Decryptor::<aes::Aes256>::new_from_slices(key, &iv)
+                .unwrap()
+                .decrypt_padded::<NoPadding>(&mut buffer)
+                .unwrap(),
+            _ => panic!("invalid key len"),
+        };
+        buffer
+    }
+
+    #[test]
+    fn set_mgmt_key_replaces_aes_key_and_authenticates() {
+        let mut piv = applet();
+        let mut rng = TestRng(14);
+        authenticate_management(&mut piv, &mut rng);
+        let new_key = test_mgmt_key::<32>(0x33);
+        let body = set_mgmt_body(ALG_AES256, &new_key);
+        let (_, sw) = run(
+            &mut piv,
+            &mut rng,
+            &command(INS_SET_MGMKEY, 0xFF, 0xFF, &body),
+        );
+        assert_eq!(sw, Sw::OK);
+        // Persisted record holds the new key.
+        let mut record = [0u8; 34];
+        let len = piv
+            .store_mut()
+            .read(RECORD_MGMT_KEY, &mut record)
+            .expect("record");
+        assert_eq!(
+            &record[..len],
+            &[&[ALG_AES256, 32u8], &new_key[..]].concat()
+        );
+        // After re-select the new key authenticates via mutual authentication.
+        assert_eq!(piv.select().sw, Sw::OK);
+        let (data, sw) = run(
+            &mut piv,
+            &mut rng,
+            &command(
+                INS_GENERAL_AUTHENTICATE,
+                ALG_AES256,
+                REF_MANAGEMENT,
+                &[0x7C, 0x02, 0x80, 0x00],
+            ),
+        );
+        assert_eq!(sw, Sw::OK);
+        let witness = find_in_7c(&data, 0x80).expect("witness present");
+        let nonce = aes_ecb_decrypt(&new_key, witness);
+        let challenge = [0x7Au8; 16];
+        let mut body = HeaplessVec::<u8, 64>::new();
+        body.extend_from_slice(&[0x7C, 0x24, 0x80, 0x10]).unwrap();
+        body.extend_from_slice(&nonce).unwrap();
+        body.extend_from_slice(&[0x81, 0x10]).unwrap();
+        body.extend_from_slice(&challenge).unwrap();
+        body.extend_from_slice(&[0x82, 0x00]).unwrap();
+        let (data, sw) = run(
+            &mut piv,
+            &mut rng,
+            &command(INS_GENERAL_AUTHENTICATE, ALG_AES256, REF_MANAGEMENT, &body),
+        );
+        assert_eq!(sw, Sw::OK);
+        let returned = find_in_7c(&data, 0x82).expect("response present");
+        assert_eq!(aes_ecb_decrypt(&new_key, returned), challenge);
     }
 
     #[test]

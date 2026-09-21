@@ -130,7 +130,7 @@ proprietário:
 | Applet | Padrão de fábrica | Troca |
 |--------|-------------------|-------|
 | PIV PIN / PUK | `123456` / `12345678` | `CHANGE REFERENCE DATA`, `pivy`, `yubico-piv-tool` |
-| PIV management key | 3DES `0102030405060708` ×3 | ainda fixa (`SET MANAGEMENT KEY` responde `6D00`; trocar exige novo provisionamento) |
+| PIV management key | 3DES `0102030405060708` ×3 | `SET MANAGEMENT KEY` (`00 FF FF FF\|FE`, Yubico) após auth; TDES/AES-128/192/256, persiste selado |
 | OpenPGP PW1 / PW3 | `123456` / `12345678` | `CHANGE REFERENCE DATA`, `gpg --card-edit` |
 | OATH password | ausente (opcional) | `SET CODE` via `ykman oath` |
 

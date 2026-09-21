@@ -98,7 +98,10 @@ impl<'a, const RESPONSE: usize> Router<'a, RESPONSE> {
         self.selected.is_some()
     }
 
-    /// Handle one command APDU and produce the response.
+    /// Parse and route one command APDU, applying response chaining.
+    ///
+    /// [`INS_SEND_REMAINING`] drains a pending chained response; when no bytes
+    /// are pending, the instruction is forwarded to the selected applet.
     pub fn command(&mut self, frame: &[u8], rng: &mut dyn Rng) -> Response<'_> {
         let apdu = match Apdu::parse(frame) {
             Ok(apdu) => apdu,
@@ -133,7 +136,9 @@ impl<'a, const RESPONSE: usize> Router<'a, RESPONSE> {
                     Response::status(Sw::FILE_NOT_FOUND)
                 }
             }
-        } else if apdu.ins == INS_GET_RESPONSE || apdu.ins == INS_SEND_REMAINING {
+        } else if apdu.ins == INS_GET_RESPONSE
+            || (apdu.ins == INS_SEND_REMAINING && chain.is_pending())
+        {
             chain.get_response(apdu.expected_len())
         } else {
             let Some(index) = *selected else {
@@ -223,6 +228,7 @@ mod tests {
             match apdu.ins {
                 0x01 => Response::ok(&[0x01]),
                 0x02 => Response::ok(&self.payload),
+                INS_SEND_REMAINING => Response::ok(&[INS_SEND_REMAINING]),
                 _ => Response::status(Sw::INS_NOT_SUPPORTED),
             }
         }
@@ -383,6 +389,51 @@ mod tests {
         assert_eq!(second.data.len(), 44);
         assert_eq!(second.sw, Sw::OK);
         assert_eq!(second.data, &[0xAB; 44]);
+    }
+
+    #[test]
+    fn send_remaining_without_pending_is_forwarded_to_applet() {
+        let mut applet = TestApplet::new(aid::PIV);
+        let mut applets: [&mut dyn Applet; 1] = [&mut applet];
+        let mut router = Router::<64>::new(&mut applets);
+
+        router.command(
+            &command(INS_SELECT, SELECT_BY_DF_NAME, aid::PIV, None),
+            &mut TestRng,
+        );
+        // No chained bytes pending: 0xA5 must reach the applet (OpenPGP
+        // SELECT DATA) instead of being swallowed as SEND REMAINING.
+        let response = router.command(&command(INS_SEND_REMAINING, 0x00, &[], None), &mut TestRng);
+        assert_eq!(response.sw, Sw::OK);
+        assert_eq!(response.data, &[INS_SEND_REMAINING]);
+    }
+
+    #[test]
+    fn send_remaining_with_pending_drains_chain() {
+        let mut applet = TestApplet::new(aid::PIV);
+        applet.payload.extend_from_slice(&[0xAB; 300]).unwrap();
+        let mut applets: [&mut dyn Applet; 1] = [&mut applet];
+        let mut router = Router::<512>::new(&mut applets);
+
+        router.command(
+            &command(INS_SELECT, SELECT_BY_DF_NAME, aid::PIV, None),
+            &mut TestRng,
+        );
+        let first = router.command(&command(0x02, 0x00, &[], Some(0x00)), &mut TestRng);
+        assert!(first.sw.is_bytes_remaining());
+
+        let second = router.command(
+            &command(INS_SEND_REMAINING, 0x00, &[], Some(0x00)),
+            &mut TestRng,
+        );
+        assert_eq!(second.sw, Sw::OK);
+        assert_eq!(second.data, &[0xAB; 44]);
+
+        // Once the chain is empty, the same instruction belongs to the
+        // selected applet again rather than the response chainer.
+        let third = router.command(&command(INS_SEND_REMAINING, 0x00, &[], None), &mut TestRng);
+        assert_eq!(third.sw, Sw::OK);
+        assert_eq!(third.data, &[INS_SEND_REMAINING]);
     }
 
     #[test]
