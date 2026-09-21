@@ -188,6 +188,34 @@ teste destrutivo do store selado:
 cargo build -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf --features selftest
 ```
 
+## Pipeline de releases
+
+O fluxo de CI/CD em [`.github/workflows/release.yml`](.github/workflows/release.yml) publica os artefatos UF2 automatizados conforme o branch ou tag:
+
+```text
+push development
+       ↓
+Nightly Development
+
+push main
+       ↓
+Nightly Stable
+
+git tag v
+       ↓
+Version  → Latest
+```
+
+| Gatilho | Release / Tag GitHub | Status | Artefato UF2 | Descrição |
+|---|---|---|---|---|
+| `push` em `development` | `nightly-development` | Pre-release | `AegisToken-nightly-development.uf2` | Build contínuo dos últimos avanços em desenvolvimento. Destinado a testes. |
+| `push` em `main` | `nightly-stable` | Pre-release | `AegisToken-nightly-stable.uf2` | Build contínuo do branch principal e estável. |
+| `git tag v*` (ex.: `v0.2.1`) | `vX.Y.Z` | **Latest** | `AegisToken-vX.Y.Z.uf2` | Release oficial versionada. Requer a tag apontando para o commit atual de `main` e o secret `AEGIS_UPDATE_VENDOR_PUBKEY`. Sufixos pré-lançamento (ex.: `-rc1`) são mantidos como Pre-release. |
+
+> **Vantagem das rolling tags (`nightly-development` e `nightly-stable`)**:
+> - **Link permanente e previsível**: o link de download para quem testa é sempre o mesmo e nunca quebra (ex.: `releases/tag/nightly-development`), sem poluir a aba de releases com centenas de tags diárias.
+> - **Download sempre do último commit**: toda vez que um push ou merge de PR entra na branch correspondente, o artefato UF2 é substituído (`gh release upload --clobber`) e a tag é apontada para o novo commit de forma transparente.
+
 ## Ferramenta de host
 
 O crate `aegistoken-host` fala com o Management HID via libusb:
