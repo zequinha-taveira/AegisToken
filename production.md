@@ -164,3 +164,29 @@ do próprio libusb (sem WinUSB/Zadig):
 ```powershell
 cargo run -p aegistoken-host -- validate
 ```
+
+## Publicação automatizada de releases (GitHub Actions)
+
+A publicação no GitHub segue o fluxo de [`.github/workflows/release.yml`](.github/workflows/release.yml):
+
+```text
+push development
+       ↓
+Nightly Development
+
+push main
+       ↓
+Nightly Stable
+
+git tag v
+       ↓
+Version  → Latest
+```
+
+1. **`push development`** &rarr; Atualiza a tag contínua `nightly-development` (**Nightly Development**, pré-lançamento).
+2. **`push main`** &rarr; Atualiza a tag contínua `nightly-stable` (**Nightly Stable**, pré-lançamento).
+3. **`git tag v*` (ex.: `v0.2.1`)** &rarr; Gera uma release versionada oficial (**Latest**; sufixos como `-rc1` são mantidos como pré-lançamento). A tag deve apontar para o commit de `main` e o secret `AEGIS_UPDATE_VENDOR_PUBKEY` deve estar configurado no GitHub.
+
+> **Observação sobre as rolling tags**: As releases móveis utilizam `gh release upload --clobber` para substituir o artefato e atualizam o ponteiro da tag para o commit mais recente (`PATCH refs/tags/$tag`), mantendo URLs de download perenes e evitando o acúmulo de centenas de tags descartáveis.
+
+
