@@ -7,7 +7,6 @@
 
 use ed25519_dalek::{Signer as EdSigner, SigningKey as EdSigningKey};
 use minicbor::encode::{Encoder, Write};
-use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use sha2::{Digest, Sha256};
 
