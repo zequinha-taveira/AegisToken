@@ -1434,17 +1434,17 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Single-block Triple-DES ECB encryption.
 fn tdes_ecb_encrypt(key: &[u8], block: &mut [u8]) -> bool {
-    use des::cipher::generic_array::GenericArray;
-    use des::cipher::{BlockEncrypt, KeyInit};
+    use des::cipher::{Block, BlockCipherEncrypt, KeyInit};
     if key.len() != 24 || block.len() != 8 {
         return false;
     }
     let Ok(cipher) = des::TdesEde3::new_from_slice(key) else {
         return false;
     };
-    let mut buffer = GenericArray::clone_from_slice(block);
-    cipher.encrypt_block(&mut buffer);
-    block.copy_from_slice(&buffer);
+    let Ok(buffer) = <&mut Block<des::TdesEde3>>::try_from(block) else {
+        return false;
+    };
+    cipher.encrypt_block(buffer);
     true
 }
 
@@ -1618,10 +1618,9 @@ mod tests {
     }
 
     fn tdes_ecb_decrypt(key: &[u8], block: &[u8]) -> [u8; 8] {
-        use des::cipher::generic_array::GenericArray;
-        use des::cipher::{BlockDecrypt, KeyInit};
+        use des::cipher::{Block, BlockCipherDecrypt, KeyInit};
         let cipher = des::TdesEde3::new_from_slice(key).unwrap();
-        let mut buffer = GenericArray::clone_from_slice(block);
+        let mut buffer = Block::<des::TdesEde3>::try_from(block).unwrap();
         cipher.decrypt_block(&mut buffer);
         let mut out = [0u8; 8];
         out.copy_from_slice(&buffer);
