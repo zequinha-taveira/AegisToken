@@ -44,17 +44,22 @@ Documento vivo: cada fase é marcada conforme concluída e verificada.
 - **Persistência:** escrita atômica com integridade (CRC-32), evoluindo para
   `sequential-storage` sobre `embedded-storage`.
 - **Segredos:** nunca exportados; selados com chave derivada de OTP.
-- **Identidade de placa / USB:** o `DeviceManager` separa três entidades —
-  `BoardIdentity` (fabricante, produto, placa, revisão, `vendor_id`/`product_id`),
-  `BoardHardwareProfile` (LED, presença, flash) e `McuIdentity` (família,
-  package, revisão, CHIPID). O perfil genérico usa `0x1209:0x0001`; placas de
-  terceiros usam `0x2E8A` (sublicenciado pela Raspberry Pi) + o PID alocado ao
-  fabricante ([`raspberrypi/usb-pid`](https://github.com/raspberrypi/usb-pid)),
-  selecionadas em build por `AEGIS_BOARD`. O número de série USB vem da OTP do
-  chip, não da placa. Os padrões de fábrica são derivados da placa
-  (`DeviceConfig::for_board`): o USB da configuração só pode espelhar a
-  identidade da placa (`ValidationContext.identity`) e o LED já nasce desligado
-  em placas sem LED.
+- **Identidade de placa / USB e provisionamento pós-flash:** o `DeviceManager`
+  separa três entidades — `BoardIdentity` (fabricante, produto, placa, revisão,
+  `vendor_id`/`product_id`), `BoardHardwareProfile` (LED, presença, flash) e
+  `McuIdentity` (família, package, revisão, CHIPID). A imagem binária universal
+  é única para todas as placas. Em estado de fábrica (`Factory`), aspectos como
+  `product_string`, `vendor_id`, `product_id` e mapeamentos de GPIO podem ser
+  provisionados pós-flash via Management HID (`aegistoken-host provision` ou
+  Desktop Manager) sem recompilação. O firmware é a autoridade máxima sobre
+  as capacidades (`GET_CAPABILITIES`), e o Manager adapta sua interface
+  estritamente ao que o hardware expõe. Uma vez comissionado (`Active`), a
+  identidade USB é selada contra adulterações não autorizadas. Ao comitar
+  alterações na identidade USB (`COMMIT_CONFIGURATION`), o firmware executa
+  soft-detach para re-enumeração com os novos descritores. No boot, o
+  `DeviceManager` restaura a identidade provisionada persistida na flash,
+  recaindo no padrão universal caso a flash esteja virgem. O número de série USB
+  vem sempre da OTP do chip, não da placa.
 - **Configuração de LED em runtime:** o `DeviceConfig` é aplicado ao hardware no
   boot e a cada `SET_CONFIGURATION` (pré-visualização) e
   `COMMIT_CONFIGURATION` (persistência). O GPIO do LED pode ser escolhido em

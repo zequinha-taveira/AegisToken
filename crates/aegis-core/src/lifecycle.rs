@@ -70,6 +70,15 @@ impl LifecycleState {
         )
     }
 
+    /// Whether hardware identity (USB VID/PID, product string) can be provisioned in this state.
+    ///
+    /// Hardware identity is a factory-time concern; subsequent commissioning or operational
+    /// states seal the identity against tampering.
+    #[must_use]
+    pub const fn allows_identity_provisioning(self) -> bool {
+        matches!(self, LifecycleState::Factory)
+    }
+
     /// Whether the device is retired.
     #[must_use]
     pub const fn is_decommissioned(self) -> bool {
