@@ -69,6 +69,7 @@ pub fn derive_capabilities(
             fido_hid: true,
             management_hid: true,
             max_product_string_len: DEFAULT_PRODUCT_STRING_LEN,
+            configurable_identity: true,
         },
         led: LedCapabilities {
             available: profile.led.available(),

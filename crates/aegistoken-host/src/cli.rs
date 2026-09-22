@@ -153,6 +153,7 @@ fn dispatch(
         "factory-reset" => (0x0C, Vec::new()),
         "soft-detach" => (0x0D, Vec::new()),
         "last-fido" => (GET_LAST_FIDO_STATUS, Vec::new()),
+        "provision" | "provision-board" => return provision_board(device, positional),
         "send" => {
             let code = positional
                 .first()
@@ -413,7 +414,7 @@ fn validate(device: &mut ManagementDevice) -> Result<ExitCode, String> {
 
         harness.check("AC-007 reject bad USB identity", || {
             let mut invalid = config.clone();
-            invalid.usb.product_string = FixedString::new("Evil Key")?;
+            invalid.usb.vid = 0;
             let mut buffer = [0u8; codec::MAX_STORED_CONFIG_LEN];
             let length = invalid.encode(&mut buffer)?;
             let status = device.request(0x04, &buffer[..length])?.status;
@@ -457,6 +458,171 @@ fn restore(device: &mut ManagementDevice, config: &DeviceConfig) {
         let _ = device.request(0x04, &buffer[..length]);
         let _ = device.request(0x06, &[]);
     }
+}
+
+/// Provision a board post-flash with custom identity and hardware parameters.
+fn provision_board(device: &mut ManagementDevice, args: &[String]) -> Result<ExitCode, String> {
+    let info_res = device.request(0x01, &[]).map_err(|e| e.to_string())?;
+    let info = codec::decode_from::<DeviceInfo>(&info_res.body)
+        .map_err(|e| format!("decode DeviceInfo: {e:?}"))?;
+
+    let caps_res = device.request(0x02, &[]).map_err(|e| e.to_string())?;
+    let caps = codec::decode_from::<CapabilityReport>(&caps_res.body)
+        .map_err(|e| format!("decode CapabilityReport: {e:?}"))?;
+
+    println!("Detected device:");
+    println!("  Product:       {}", info.product.as_str());
+    println!("  Manufacturer:  {}", info.manufacturer.as_str());
+    println!(
+        "  Hardware:      Family=0x{:02x} Package=0x{:02x} ({} GPIOs)",
+        caps.family, caps.package, caps.gpio_count
+    );
+    println!("  Flash:         {} KiB", caps.flash_size_bytes / 1024);
+    println!(
+        "  Configurable:  USB identity={}",
+        caps.usb_configurable_identity
+    );
+
+    let config_res = device.request(0x03, &[]).map_err(|e| e.to_string())?;
+    let mut config = DeviceConfig::decode(&config_res.body)
+        .map_err(|e| format!("decode DeviceConfig: {e:?}"))?;
+
+    let mut i = 0;
+    let mut product_override = None;
+    let mut vid_override = None;
+    let mut pid_override = None;
+    let mut led_gpio_override = None;
+    let mut led_behavior_override = None;
+    let mut led_brightness_override = None;
+
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--product" && i + 1 < args.len() {
+            product_override = Some(args[i + 1].clone());
+            i += 2;
+        } else if let Some(val) = arg.strip_prefix("--product=") {
+            product_override = Some(val.to_string());
+            i += 1;
+        } else if arg == "--vid" && i + 1 < args.len() {
+            vid_override = Some(parse_u16(&args[i + 1])?);
+            i += 2;
+        } else if let Some(val) = arg.strip_prefix("--vid=") {
+            vid_override = Some(parse_u16(val)?);
+            i += 1;
+        } else if arg == "--pid" && i + 1 < args.len() {
+            pid_override = Some(parse_u16(&args[i + 1])?);
+            i += 2;
+        } else if let Some(val) = arg.strip_prefix("--pid=") {
+            pid_override = Some(parse_u16(val)?);
+            i += 1;
+        } else if arg == "--led-gpio" && i + 1 < args.len() {
+            led_gpio_override = Some(parse_u8(&args[i + 1])?);
+            i += 2;
+        } else if let Some(val) = arg.strip_prefix("--led-gpio=") {
+            led_gpio_override = Some(parse_u8(val)?);
+            i += 1;
+        } else if arg == "--led-behavior" && i + 1 < args.len() {
+            led_behavior_override = Some(args[i + 1].clone());
+            i += 2;
+        } else if let Some(val) = arg.strip_prefix("--led-behavior=") {
+            led_behavior_override = Some(val.to_string());
+            i += 1;
+        } else if arg == "--led-brightness" && i + 1 < args.len() {
+            led_brightness_override = Some(parse_u8(&args[i + 1])?);
+            i += 2;
+        } else if let Some(val) = arg.strip_prefix("--led-brightness=") {
+            led_brightness_override = Some(parse_u8(val)?);
+            i += 1;
+        } else {
+            return Err(format!("unknown provision option: {arg}"));
+        }
+    }
+
+    if let Some(p) = product_override {
+        config.usb.product_string =
+            FixedString::new(&p).map_err(|e| format!("product string invalid: {e:?}"))?;
+    }
+    if let Some(vid) = vid_override {
+        config.usb.vid = vid;
+    }
+    if let Some(pid) = pid_override {
+        config.usb.pid = pid;
+    }
+    if let Some(gpio) = led_gpio_override {
+        if caps.led_configurable_gpio && (caps.led_candidate_gpio_mask & (1 << gpio)) == 0 {
+            return Err(format!(
+                "GPIO {gpio} is not a valid candidate pin for this board (mask=0x{:x})",
+                caps.led_candidate_gpio_mask
+            ));
+        }
+        config.led.gpio = gpio;
+        config.led.enabled = true;
+    }
+    if let Some(b) = led_behavior_override {
+        config.led.behavior = match b.to_lowercase().as_str() {
+            "solid" => LedBehavior::Solid,
+            "blink" => LedBehavior::Blink,
+            "activity" => LedBehavior::Activity,
+            "off" => LedBehavior::Off,
+            other => return Err(format!("unknown led behavior: {other}")),
+        };
+    }
+    if let Some(brightness) = led_brightness_override {
+        config.led.brightness = brightness;
+    }
+
+    println!("\nApplying provisioned configuration:");
+    println!(
+        "  USB VID:PID:   {:04x}:{:04x}",
+        config.usb.vid, config.usb.pid
+    );
+    println!("  Product:       {}", config.usb.product_string.as_str());
+    println!(
+        "  LED:           enabled={} gpio={} behavior={:?} brightness={}",
+        config.led.enabled, config.led.gpio, config.led.behavior, config.led.brightness
+    );
+
+    let mut buffer = [0u8; codec::MAX_STORED_CONFIG_LEN];
+    let len = config
+        .encode(&mut buffer)
+        .map_err(|e| format!("encode error: {e:?}"))?;
+    let set_res = device
+        .request(0x04, &buffer[..len])
+        .map_err(|e| e.to_string())?;
+    if set_res.status != 0 {
+        return Err(format!(
+            "SET_CONFIGURATION failed with status 0x{:02x} ({})",
+            set_res.status,
+            status_name(set_res.status)
+        ));
+    }
+    println!("  [OK] Staged configuration accepted");
+
+    let commit_res = device.request(0x06, &[]).map_err(|e| e.to_string())?;
+    if commit_res.status != 0 {
+        return Err(format!(
+            "COMMIT_CONFIGURATION failed with status 0x{:02x} ({})",
+            commit_res.status,
+            status_name(commit_res.status)
+        ));
+    }
+    println!("  [OK] Configuration committed to flash");
+
+    let comm_res = device.request(0x08, &[]).map_err(|e| e.to_string())?;
+    if comm_res.status != 0 {
+        println!(
+            "  Note: COMMISSION_DEVICE returned status 0x{:02x} ({})",
+            comm_res.status,
+            status_name(comm_res.status)
+        );
+    } else {
+        println!("  [OK] Device lifecycle transitioned to Commissioned");
+    }
+
+    println!(
+        "\nProvisioning complete! Device will detach and re-enumerate with the new descriptors."
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 // --- Parsing helpers --------------------------------------------------------
@@ -578,6 +744,7 @@ COMMANDS:
   commit                COMMIT_CONFIGURATION
   lifecycle             GET_LIFECYCLE
   commission            COMMISSION_DEVICE
+  provision [OPTIONS]   provision board hardware post-flash (product, VID/PID, LED, ...)
   status                GET_STATUS
   diagnostics           GET_DIAGNOSTICS
   decommission          DECOMMISSION_DEVICE

@@ -49,6 +49,7 @@ use static_cell::StaticCell;
 use crate::capabilities::BoardProfile;
 use crate::ccid::{CcidClass, State as CcidState};
 use crate::hid::{HidReader, HidReaderWriter, HidWriter, State as HidState};
+use aegis_core::identity::BoardIdentity;
 
 /// Interface name for the FIDO HID function.
 const FIDO_INTERFACE_NAME: &str = "HID FIDO Authenticator";
@@ -235,15 +236,27 @@ pub struct Usb {
     pub ccid: Ccid,
 }
 
+/// Scratch buffer for the runtime-derived USB product string.
+static PRODUCT_STRING_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+
+/// Intern a product string slice into static storage for embassy-usb.
+pub fn intern_product_string(s: &str) -> &'static str {
+    let mut buf = [0u8; 64];
+    let len = s.len().min(64);
+    buf[..len].copy_from_slice(&s.as_bytes()[..len]);
+    let bytes = PRODUCT_STRING_BUF.init(buf);
+    core::str::from_utf8(&bytes[..len]).unwrap_or("AegisToken")
+}
+
 impl Usb {
     /// Build the USB device from the USB peripheral and board profile.
-    ///
-    /// The manufacturer, product and USB vendor/product identifiers come from
-    /// the board profile (Board Identity), while the serial number comes from
-    /// the RP2350's unique chip identifier (MCU Identity).
     pub fn new(usb: Peri<'static, USB>, profile: &BoardProfile) -> Self {
+        Self::with_identity(usb, profile.identity())
+    }
+
+    /// Build the USB device using an explicit BoardIdentity (e.g. provisioned post-flash).
+    pub fn with_identity(usb: Peri<'static, USB>, identity: BoardIdentity) -> Self {
         let driver = RpUsbDriver::new(usb, Irqs);
-        let identity = profile.identity();
 
         let mut config = UsbConfig::new(identity.vendor_id, identity.product_id);
         config.manufacturer = Some(identity.manufacturer);

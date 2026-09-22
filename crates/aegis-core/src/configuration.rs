@@ -435,24 +435,40 @@ impl DeviceConfig {
             return Err(CoreError::InvalidConfiguration);
         }
 
-        // USB identity policy: the configuration may only mirror the board's
-        // own identity. The USB descriptors are built from the board profile,
-        // so accepting a different product or VID/PID here would advertise an
-        // identity the device does not actually present.
-        if self.usb.product_string.as_str() != ctx.identity.product {
-            return Err(CoreError::Unauthorized);
-        }
-        if self.usb.vid != ctx.identity.vendor_id || self.usb.pid != ctx.identity.product_id {
-            return Err(CoreError::Unauthorized);
-        }
-        if self.usb.product_string.len() > usize::from(ctx.capabilities.usb.max_product_string_len)
-        {
-            return Err(CoreError::InvalidConfiguration);
-        }
-
         // Lifecycle gate.
         if !ctx.lifecycle.allows_config_change() {
             return Err(CoreError::Unauthorized);
+        }
+
+        // USB identity policy:
+        // During Factory state (uncommissioned device), if the hardware capability
+        // declares configurable identity, custom VID/PID and product string are accepted.
+        // Once the device is commissioned/operational, the configuration must strictly match
+        // the active board identity to prevent unauthorized tampering.
+        if ctx.capabilities.usb.configurable_identity
+            && ctx.lifecycle.allows_identity_provisioning()
+        {
+            if self.usb.vid == 0 || self.usb.pid == 0 {
+                return Err(CoreError::InvalidConfiguration);
+            }
+            if self.usb.product_string.is_empty()
+                || self.usb.product_string.len()
+                    > usize::from(ctx.capabilities.usb.max_product_string_len)
+            {
+                return Err(CoreError::InvalidConfiguration);
+            }
+        } else {
+            if self.usb.product_string.as_str() != ctx.identity.product {
+                return Err(CoreError::Unauthorized);
+            }
+            if self.usb.vid != ctx.identity.vendor_id || self.usb.pid != ctx.identity.product_id {
+                return Err(CoreError::Unauthorized);
+            }
+            if self.usb.product_string.len()
+                > usize::from(ctx.capabilities.usb.max_product_string_len)
+            {
+                return Err(CoreError::InvalidConfiguration);
+            }
         }
 
         self.led
@@ -626,6 +642,33 @@ mod tests {
         config.usb.vid = DEFAULT_VENDOR_ID;
         config.usb.product_string = FixedString::new("Evil Key").unwrap();
         assert_eq!(config.validate(&ctx()), Err(CoreError::Unauthorized));
+    }
+
+    #[test]
+    fn identity_provisioning_allowed_in_factory() {
+        let mut factory_ctx = ctx();
+        factory_ctx.lifecycle = LifecycleState::Factory;
+
+        let mut config = DeviceConfig::official_defaults();
+        config.usb.vid = 0x2E8A;
+        config.usb.pid = 0x10B0;
+        config.usb.product_string = FixedString::new("Custom Hardware Variant").unwrap();
+        assert_eq!(config.validate(&factory_ctx), Ok(()));
+
+        // Reject zero VID or PID
+        let mut invalid_vid = config.clone();
+        invalid_vid.usb.vid = 0;
+        assert_eq!(
+            invalid_vid.validate(&factory_ctx),
+            Err(CoreError::InvalidConfiguration)
+        );
+
+        let mut invalid_pid = config.clone();
+        invalid_pid.usb.pid = 0;
+        assert_eq!(
+            invalid_pid.validate(&factory_ctx),
+            Err(CoreError::InvalidConfiguration)
+        );
     }
 
     #[test]
