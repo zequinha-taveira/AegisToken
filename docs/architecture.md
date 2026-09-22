@@ -42,3 +42,73 @@ in AES-256-GCM sealed cells (one per PIV record, sharded whole-blobs with a
 commit cell for OATH/OpenPGP) over flash regions shared behind a blocking
 mutex; without a provisioned root key the firmware runs the same applets on
 volatile stores.
+
+## Firmware Universal e Provisionamento Pós-Flash
+
+O firmware é compilado uma única vez e distribuído como **binário universal** (UF2)
+para todas as variantes de hardware RP2350A/B e RP2354A/B. A identidade USB
+(VID, PID, strings de fabricante/produto) e os mapeamentos de GPIO (LED, botão
+de presença) são configurados **após o flash**, via canal de gerenciamento
+(Management HID), sem recompilar a imagem.
+
+### Fluxo de Boot
+
+```text
+┌─────────────────────────────────────────────────────┐
+│                    Power-On / Reset                  │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+              ┌────────────────┐
+              │  Lê flash para │
+              │ DeviceConfig   │
+              └───────┬────────┘
+                      │
+           ┌──────────┴──────────┐
+           │ Config válida?      │
+           └──────────┬──────────┘
+              Sim │         │ Não
+                  ▼         ▼
+        ┌─────────────┐  ┌──────────────────┐
+        │ Usa VID/PID │  │ Factory default   │
+        │ e strings   │  │ 0x1209:0x0001     │
+        │ persistidos │  │ "Uncommissioned"  │
+        └──────┬──────┘  └────────┬──────────┘
+               │                  │
+               └────────┬─────────┘
+                        ▼
+              ┌─────────────────┐
+              │ Enumera USB com │
+              │ identidade      │
+              │ efetiva         │
+              └────────┬────────┘
+                       ▼
+              ┌─────────────────┐
+              │ Loop principal  │
+              │ (FIDO, CCID,   │
+              │  Management)   │
+              └─────────────────┘
+```
+
+### Ciclo de Vida e Proteção de Identidade
+
+| Estado        | Permite Provisionamento? | Descrição                                      |
+| ------------- | :----------------------: | ---------------------------------------------- |
+| `Factory`     | ✅                        | Flash virgem; aceita SET_CONFIGURATION + COMMIT |
+| `Commissioning` | ✅                      | Configuração em andamento                       |
+| `Active`      | ❌                        | Identidade selada; alterações bloqueadas        |
+| `Recovery`    | ❌                        | Apenas diagnósticos e atualização de firmware   |
+
+A flag `configurable_identity` em `CapabilityReport` indica ao CLI/Manager se
+o dispositivo aceita provisionamento no estado atual. Ao executar
+`COMMIT_CONFIGURATION` com alteração de descritores USB, o firmware dispara
+soft-detach + reinicialização do stack USB para re-enumeração limpa pelo SO.
+
+### Princípios Arquiteturais
+
+1. **Firmware é a Autoridade Máxima** — o CLI/Manager consulta `GET_DEVICE_INFO`
+   e `GET_CAPABILITIES` e apresenta apenas opções compatíveis com o hardware real.
+2. **Separação de Responsabilidades** — o Manager orquestra gestão via Management
+   HID; nunca implementa funcionalidade criptográfica.
+3. **Lifecycle Guard** — identidade USB profunda é configurável apenas durante
+   `Factory` / `Commissioning`; em `Active` é imutável (AC-007).

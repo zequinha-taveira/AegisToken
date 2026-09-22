@@ -784,14 +784,24 @@ async fn housekeeping<const FLASH_SIZE: usize>(
                                     }
                                     // Persist and apply the now-active configuration.
                                     ManagementCommand::CommitConfiguration => {
+                                        let identity = service.identity();
                                         persist_config(&mut *storage, service.config());
                                         apply_led_config(&mut led, service.config());
+                                        if service.config().usb.vid != identity.vendor_id
+                                            || service.config().usb.pid != identity.product_id
+                                            || service.config().usb.product_string.as_str()
+                                                != identity.product
+                                        {
+                                            info!("USB identity updated; scheduling soft detach for re-enumeration");
+                                            soft_detach = true;
+                                        }
                                     }
                                     _ => {}
                                 }
                             }
-                            soft_detach =
-                                command == ManagementCommand::SoftDetach && response.status.is_ok();
+                            soft_detach = soft_detach
+                                || (command == ManagementCommand::SoftDetach
+                                    && response.status.is_ok());
                             (command.response_code(), length)
                         };
                     (response_code, body_len)

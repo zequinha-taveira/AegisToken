@@ -256,6 +256,26 @@ impl DeviceInfo {
                 .expect("board manufacturer string fits"),
         }
     }
+
+    /// Build the device identity reflecting the active configuration's provisioned product.
+    #[must_use]
+    pub fn for_service(
+        identity: &BoardIdentity,
+        config: &DeviceConfig,
+        capabilities: &DeviceCapabilities,
+    ) -> Self {
+        let (major, minor, patch) = version_tuple();
+        Self {
+            product: config.usb.product_string.clone(),
+            family: family_code(capabilities.family),
+            version_major: major,
+            version_minor: minor,
+            version_patch: patch,
+            config_version: crate::configuration::CONFIG_VERSION,
+            manufacturer: FixedString::new(identity.manufacturer)
+                .expect("board manufacturer string fits"),
+        }
+    }
 }
 
 /// Serializable view of the discovered capabilities (PRD §9).
@@ -328,6 +348,9 @@ pub struct CapabilityReport {
     /// Bitmask of GPIOs configuration may select for the LED.
     #[n(21)]
     pub led_candidate_gpio_mask: u64,
+    /// USB identity (VID, PID, product string) can be provisioned.
+    #[n(22)]
+    pub usb_configurable_identity: bool,
 }
 
 impl From<&DeviceCapabilities> for CapabilityReport {
@@ -355,6 +378,7 @@ impl From<&DeviceCapabilities> for CapabilityReport {
             presence_external_button: caps.presence.external_button,
             presence_external_button_gpio: caps.presence.external_button_gpio,
             led_candidate_gpio_mask: caps.led.candidate_gpio_mask,
+            usb_configurable_identity: caps.usb.configurable_identity,
         }
     }
 }
@@ -469,9 +493,11 @@ impl ManagementService {
     /// Execute one management operation.
     pub fn handle(&mut self, command: ManagementCommand, payload: &[u8]) -> Response {
         match command {
-            ManagementCommand::GetDeviceInfo => {
-                Response::with_payload(&DeviceInfo::current(&self.identity, &self.capabilities))
-            }
+            ManagementCommand::GetDeviceInfo => Response::with_payload(&DeviceInfo::for_service(
+                &self.identity,
+                &self.config,
+                &self.capabilities,
+            )),
             ManagementCommand::GetCapabilities => {
                 Response::with_payload(&CapabilityReport::from(&self.capabilities))
             }

@@ -140,11 +140,68 @@ impl<const FLASH_SIZE: usize> DeviceManager<FLASH_SIZE> {
     /// Initialize the board and USB from the HAL peripherals, a board profile
     /// and the build-time MCU family. Capabilities are derived automatically, so
     /// no manual board selection is required.
+    ///
+    /// If a provisioned configuration exists in flash with custom USB identity (VID/PID,
+    /// product string), it is loaded and used for USB enumeration.
     pub fn new(p: embassy_rp::Peripherals, profile: &BoardProfile, family: Rp2350Family) -> Self {
-        let usb = Usb::new(p.USB, profile);
-        let rng = Mutex::new(HardwareRng::new(p.TRNG));
+        let flash_driver = Flash::<FLASH, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
+        let mut storage = FlashStorage::new(flash_driver);
 
-        let flash = Flash::<FLASH, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
+        let layout = profile.hardware.flash.layout;
+        let mut store = aegis_core::storage::ConfigStorage::new(
+            &mut storage,
+            layout.config_offset,
+            layout.slot_size,
+        );
+        let identity = if let Ok(Some(config)) = store.load() {
+            if config.usb.vid != 0 && config.usb.pid != 0 && !config.usb.product_string.is_empty() {
+                BoardIdentity::new(
+                    profile.identity.manufacturer,
+                    crate::usb::intern_product_string(config.usb.product_string.as_str()),
+                    profile.identity.board,
+                    profile.identity.revision,
+                    config.usb.vid,
+                    config.usb.pid,
+                )
+            } else {
+                profile.identity()
+            }
+        } else {
+            profile.identity()
+        };
+
+        Self::init(
+            p.USB, p.BOOTSEL, p.TRNG, p.WATCHDOG, storage, profile, identity, family,
+        )
+    }
+
+    /// Initialize the board and USB with an explicit or provisioned BoardIdentity.
+    pub fn with_identity(
+        p: embassy_rp::Peripherals,
+        profile: &BoardProfile,
+        identity: BoardIdentity,
+        family: Rp2350Family,
+    ) -> Self {
+        let flash_driver = Flash::<FLASH, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
+        let storage = FlashStorage::new(flash_driver);
+        Self::init(
+            p.USB, p.BOOTSEL, p.TRNG, p.WATCHDOG, storage, profile, identity, family,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn init(
+        usb_peri: embassy_rp::Peri<'static, embassy_rp::peripherals::USB>,
+        bootsel_peri: embassy_rp::Peri<'static, embassy_rp::peripherals::BOOTSEL>,
+        trng_peri: embassy_rp::Peri<'static, embassy_rp::peripherals::TRNG>,
+        watchdog_peri: embassy_rp::Peri<'static, embassy_rp::peripherals::WATCHDOG>,
+        storage: FlashStorage<FLASH_SIZE>,
+        profile: &BoardProfile,
+        identity: BoardIdentity,
+        family: Rp2350Family,
+    ) -> Self {
+        let usb = Usb::with_identity(usb_peri, identity);
+        let rng = Mutex::new(HardwareRng::new(trng_peri));
         let capabilities = capabilities::discover(profile, family);
 
         // The LED pin comes from the board profile; when the profile declares
@@ -168,14 +225,11 @@ impl<const FLASH_SIZE: usize> DeviceManager<FLASH_SIZE> {
             debounce_ms: presence_profile.debounce_ms,
             timeout_ms: presence_profile.timeout_ms,
         };
-        // The presence source comes from the board profile: BOOTSEL or a
-        // dedicated external button. The external button is claimed by number
-        // because the profile decides at runtime which pad it is; see the
-        // safety note on [`GpioLed::build`] for the same reasoning.
         let presence = Mutex::new(match presence_profile.source {
-            PresenceSource::Bootsel => {
-                PresenceAdapter::Bootsel(ButtonPresence::new(BootselButton::new(p.BOOTSEL), timing))
-            }
+            PresenceSource::Bootsel => PresenceAdapter::Bootsel(ButtonPresence::new(
+                BootselButton::new(bootsel_peri),
+                timing,
+            )),
             PresenceSource::ExternalButton => match presence_profile.gpio {
                 Some(gpio) => {
                     let pin = unsafe { AnyPin::steal(gpio) };
@@ -190,17 +244,14 @@ impl<const FLASH_SIZE: usize> DeviceManager<FLASH_SIZE> {
                         timing,
                     ))
                 }
-                // A profile that names the external button but declares no pin
-                // cannot be honoured; fail safe to BOOTSEL rather than panic at
-                // boot. The board catalog const-asserts a pin for its profiles.
                 None => PresenceAdapter::Bootsel(ButtonPresence::new(
-                    BootselButton::new(p.BOOTSEL),
+                    BootselButton::new(bootsel_peri),
                     timing,
                 )),
             },
         });
-        let storage = CriticalSectionMutex::new(RefCell::new(FlashStorage::new(flash)));
-        let watchdog = WatchdogHandle::new(Watchdog::new(p.WATCHDOG));
+        let storage = CriticalSectionMutex::new(RefCell::new(storage));
+        let watchdog = WatchdogHandle::new(Watchdog::new(watchdog_peri));
 
         Self {
             board: Board {
@@ -212,7 +263,7 @@ impl<const FLASH_SIZE: usize> DeviceManager<FLASH_SIZE> {
             },
             usb,
             rng,
-            identity: profile.identity(),
+            identity,
             mcu: capabilities::discover_mcu_identity(family),
             hardware: profile.hardware(),
         }

@@ -67,6 +67,8 @@ pub struct UsbCapabilities {
     pub management_hid: bool,
     /// Maximum supported USB product string length, in bytes.
     pub max_product_string_len: u8,
+    /// USB identity (VID, PID, product string) may be provisioned post-flash.
+    pub configurable_identity: bool,
 }
 
 /// LED driver technology supported by the hardware.
@@ -185,6 +187,7 @@ impl DeviceCapabilities {
                 fido_hid: true,
                 management_hid: true,
                 max_product_string_len: 64,
+                configurable_identity: true,
             },
             led: LedCapabilities {
                 available: true,
