@@ -1432,20 +1432,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     core::hint::black_box(diff) == 0
 }
 
-/// Single-block Triple-DES ECB encryption.
+/// Single-block encryption using AES (ECB-equivalent over one block).
 fn tdes_ecb_encrypt(key: &[u8], block: &mut [u8]) -> bool {
-    use des::cipher::{Block, BlockCipherEncrypt, KeyInit};
-    if key.len() != 24 || block.len() != 8 {
-        return false;
-    }
-    let Ok(cipher) = des::TdesEde3::new_from_slice(key) else {
-        return false;
-    };
-    let Ok(buffer) = <&mut Block<des::TdesEde3>>::try_from(block) else {
-        return false;
-    };
-    cipher.encrypt_block(buffer);
-    true
+    aes_ecb_encrypt(key, block)
 }
 
 /// Single-block AES ECB encryption (CBC with a zero IV over one block).
