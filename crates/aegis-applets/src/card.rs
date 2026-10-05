@@ -177,10 +177,12 @@ fn handle_frame<const RESPONSE: usize, const MESSAGE: usize>(
 
     let encoded = match request {
         Request::IccPowerOn { sequence, .. } => {
+            router.reset();
             *powered = true;
             ccid::Response::data_block(sequence, ATR).encode_into(out)?
         }
         Request::IccPowerOff { sequence, .. } => {
+            router.reset();
             *powered = false;
             ccid::Response::slot_status(sequence, ccid::ICC_STATUS_INACTIVE).encode_into(out)?
         }
@@ -193,13 +195,20 @@ fn handle_frame<const RESPONSE: usize, const MESSAGE: usize>(
             ccid::Response::slot_status(sequence, status).encode_into(out)?
         }
         Request::SetParameters {
-            sequence, protocol, ..
+            sequence,
+            protocol,
+            data,
+            ..
         } => {
             if protocol == ccid::PROTOCOL_T0 {
-                ccid::Response::parameters(sequence, ccid::PROTOCOL_T0, &[]).encode_into(out)?
+                ccid::Response::parameters(sequence, ccid::PROTOCOL_T0, data).encode_into(out)?
             } else {
                 ccid::Response::parameters_failed(sequence).encode_into(out)?
             }
+        }
+        Request::GetParameters { sequence, .. } | Request::ResetParameters { sequence, .. } => {
+            ccid::Response::parameters(sequence, ccid::PROTOCOL_T0, &ccid::T0_PARAMETERS)
+                .encode_into(out)?
         }
         Request::XfrBlock { sequence, data, .. } => {
             if !*powered {
@@ -216,6 +225,7 @@ fn handle_frame<const RESPONSE: usize, const MESSAGE: usize>(
             ccid::Response::data_block_failed(sequence).encode_into(out)?
         }
         Request::Abort { sequence, .. } => {
+            router.reset();
             let status = if *powered {
                 ccid::ICC_STATUS_ACTIVE
             } else {
@@ -327,11 +337,12 @@ mod tests {
         with_card(&mut fixture, |card| {
             let response = poll_one(card, &frame(ccid::PC_TO_RDR_GET_SLOT_STATUS, 2, &[]));
             assert_eq!(response[0], ccid::RDR_TO_PC_SLOT_STATUS);
-            assert_eq!(response[9], ccid::ICC_STATUS_INACTIVE);
+            assert_eq!(response[7], ccid::ICC_STATUS_INACTIVE);
+            assert_eq!(response[9], 0);
 
             poll_one(card, &frame(ccid::PC_TO_RDR_ICC_POWER_ON, 3, &[]));
             let response = poll_one(card, &frame(ccid::PC_TO_RDR_GET_SLOT_STATUS, 4, &[]));
-            assert_eq!(response[9], ccid::ICC_STATUS_ACTIVE);
+            assert_eq!(response[7], ccid::ICC_STATUS_ACTIVE);
 
             poll_one(card, &frame(ccid::PC_TO_RDR_ICC_POWER_OFF, 5, &[]));
             assert!(!card.is_powered());
@@ -344,16 +355,25 @@ mod tests {
         with_card(&mut fixture, |card| {
             let response = poll_one(
                 card,
-                &frame(ccid::PC_TO_RDR_SET_PARAMETERS, 1, &[ccid::PROTOCOL_T0]),
+                &frame(ccid::PC_TO_RDR_SET_PARAMETERS, 1, &ccid::T0_PARAMETERS),
             );
             assert_eq!(response[0], ccid::RDR_TO_PC_PARAMETERS);
             assert_eq!(response[7], ccid::STATUS_OK);
             assert_eq!(response[9], ccid::PROTOCOL_T0);
+            assert_eq!(&response[10..], &ccid::T0_PARAMETERS);
 
-            let response = poll_one(
-                card,
-                &frame(ccid::PC_TO_RDR_SET_PARAMETERS, 2, &[ccid::PROTOCOL_T1]),
-            );
+            for kind in [
+                ccid::PC_TO_RDR_GET_PARAMETERS,
+                ccid::PC_TO_RDR_RESET_PARAMETERS,
+            ] {
+                let response = poll_one(card, &frame(kind, 3, &[]));
+                assert_eq!(response[0], ccid::RDR_TO_PC_PARAMETERS);
+                assert_eq!(&response[10..], &ccid::T0_PARAMETERS);
+            }
+
+            let mut t1 = frame(ccid::PC_TO_RDR_SET_PARAMETERS, 2, &ccid::T0_PARAMETERS);
+            t1[7] = ccid::PROTOCOL_T1;
+            let response = poll_one(card, &t1);
             assert_eq!(response[7], ccid::STATUS_FAILED);
         });
     }
@@ -430,7 +450,7 @@ mod tests {
         with_card(&mut fixture, |card| {
             let response = poll_one(card, &frame(ccid::PC_TO_RDR_ABORT, 8, &[]));
             assert_eq!(response[0], ccid::RDR_TO_PC_SLOT_STATUS);
-            assert_eq!(response[9], ccid::ICC_STATUS_INACTIVE);
+            assert_eq!(response[7], ccid::ICC_STATUS_INACTIVE);
         });
     }
 
@@ -441,12 +461,12 @@ mod tests {
             // Unknown message type but valid header.
             let response = poll_one(card, &frame(0x99, 9, &[]));
             assert_eq!(response[0], ccid::RDR_TO_PC_SLOT_STATUS);
-            assert_eq!(response[7], ccid::STATUS_FAILED);
+            assert_eq!(response[7], ccid::STATUS_FAILED | ccid::ICC_STATUS_INACTIVE);
             // Non-zero slot.
             let mut outside_slot = frame(ccid::PC_TO_RDR_GET_SLOT_STATUS, 10, &[]);
             outside_slot[5] = 3;
             let response = poll_one(card, &outside_slot);
-            assert_eq!(response[7], ccid::STATUS_FAILED);
+            assert_eq!(response[7], ccid::STATUS_FAILED | ccid::ICC_STATUS_INACTIVE);
         });
     }
 

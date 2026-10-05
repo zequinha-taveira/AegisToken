@@ -12,19 +12,20 @@ com **descoberta automática de hardware** — sem seleção manual de placa.
 
 ## Interfaces USB
 
-O dispositivo compõe três funções HID e uma interface CCID, com separação
-lógica estrita:
+O perfil padrão compõe **duas funções HID e uma interface CCID**. O perfil
+autorizado `yubikey5-lab` acrescenta uma terceira HID **OTP experimental**, em
+interface e endpoints independentes; nenhuma interface de teclado é exposta:
 
 | Interface | Classe | Finalidade |
 |-----------|--------|------------|
 | **FIDO HID** | usage page `0xF1D0` | Autenticação: CTAP2/FIDO2 (passkeys) e CTAP1/U2F |
 | **Management HID** | vendor-defined `0xFF00` | Gestão, configuração, diagnóstico e atualização de firmware |
-| **HID Keyboard** | padrão | Emissão de teclas; **opcional e desabilitada por padrão** |
+| **OTP Lab HID** (só `yubikey5-lab`) | vendor-defined `0xFF51` | Protocolo experimental de diagnóstico: `PING`/`INFO`; **não** Yubico OTP |
 | **CCID** | `0x0B` | Applets ISO 7816: PIV, OpenPGP e OATH (ECC + RSA-2048) |
 
-> Operações FIDO **nunca** dependem das interfaces Keyboard, Management ou
-> CCID. A interface HID Keyboard, quando habilitada, é governada pelo lifecycle
-> e por User Presence e nunca é alcançável a partir do caminho de entrada FIDO.
+> Operações FIDO **nunca** dependem de Management, OTP Lab ou CCID. A interface
+> OTP Lab não emite teclas nem manipula segredos; YKOATH/TOTP/HOTP é um applet
+> distinto sobre CCID, e a OTP física do RP2350 é outra coisa.
 
 ## Identidade e perfil de hardware
 
@@ -81,9 +82,38 @@ O perfil é selecionado em tempo de build por `AEGIS_BOARD` (ou `-BoardProfile`
 em `scripts/build-uf2.ps1`); o padrão `generic` mantém a identidade AegisToken.
 O número de série USB continua vindo da OTP do chip, não da placa.
 
-> A identidade USB YubiKey que `ykman` / Yubico Authenticator reconhecem
-> automaticamente é um build opt-in (`VIDPID=Yubikey5`), apenas para testes
-> locais — não distribuir.
+> Algumas versões de `ykman` e do Yubico Authenticator filtram dispositivos
+> por VID/PID. A compatibilidade do AegisToken é definida pelos protocolos e
+> validada com a identidade USB própria; qualquer perfil de laboratório para
+> testar filtros de identidade é separado e não distribuível.
+
+### Compatibilidade com ferramentas Yubico
+
+O objetivo de compatibilidade é baseado nos protocolos: FIDO HID para FIDO2/U2F,
+CCID/YKOATH para OATH/TOTP/HOTP e CCID/PIV para operações PIV. Esses caminhos
+são candidatos a interoperabilidade com o Yubico Authenticator e `ykman`, mas
+exigem validação em hardware e podem ser filtrados por identidade ou comandos
+de modelo. Não há suporte comercial Yubico OTP/`ykman otp`. Consulte a
+[matriz de compatibilidade e aceitação](docs/yubico-compatibility.md).
+
+O perfil padrão usa a identidade USB própria do AegisToken. Qualquer perfil de
+laboratório com VID/PID de Yubico é restrito a testes autorizados e não pode ser
+distribuído.
+
+Para gerar o UF2 universal de laboratório autorizado:
+
+```powershell
+& scripts/build-uf2.ps1 -Board universal -BoardProfile yubikey5-lab
+```
+
+Esse perfil usa `VID 0x1050`, `PID 0x0407` e product string
+`YubiKey 5 Series OTP+FIDO+CCID` em todas as variantes RP2350/RP2354.
+Enumera FIDO HID + Management HID + HID OTP Lab + CCID, sem modificar o perfil
+padrão. O PID representa a **composição de interfaces**, não compatibilidade
+funcional com comandos Yubico OTP: `ykman otp`, slot programming, Yubico OTP
+AES e challenge-response não são implementados. O protocolo mínimo é descrito
+em [docs/yubico-compatibility.md](docs/yubico-compatibility.md). Somente
+laboratório autorizado: não distribuir essa imagem em releases públicas.
 
 ## Funcionalidades
 
@@ -260,6 +290,8 @@ ou remapeamento para o driver HID genérico).
   `ssh-agent` e assinatura Git via SSH.
 - [`production.md`](production.md) — provisionamento: secure boot, OTP, chave de
   update e atestação.
+- [`docs/yubico-compatibility.md`](docs/yubico-compatibility.md) — escopo,
+  requisitos e matriz de testes para Yubico Authenticator/`ykman`.
 
 ## Segurança
 

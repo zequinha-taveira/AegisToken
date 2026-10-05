@@ -17,8 +17,9 @@ do MVP em hardware RP2350A (e depois RP2350B).
 > deve então usar `aegistoken-host --vid 0x2E8A --pid 0x10B0`. A matriz de
 > critérios abaixo foi executada no perfil genérico (`0x1209:0x0001`, id próprio
 > no pid.codes). A identidade USB YubiKey que `ykman` / Yubico Authenticator
-> reconhecem automaticamente é um build opt-in (`VIDPID=Yubikey5`), só para
-> testes locais — não distribuir.
+> podem reconhecer é um build opt-in (`AEGIS_BOARD=yubikey5-lab`, `1050:0407`),
+> só para laboratório autorizado — não distribuir. Esse PID sozinho **não**
+> comprova suporte funcional ao OTP comercial da Yubico.
 >
 > Fase 17: os applets (PIV, OATH, OpenPGP ECC + RSA-2048) estão completos em
 > firmware com 147 testes de host; o autoteste on-target cobre roteamento por
@@ -65,9 +66,73 @@ python scripts/validate_openpgp.py      # OpenPGP Card P-256/Ed25519/X25519/RSA-
 python scripts/set_pin.py               # define/altera o PIN do clientPIN
 ```
 
+## Compatibilidade Yubico Authenticator / `ykman`
+
+A compatibilidade com as ferramentas Yubico é verificada por protocolo, em
+três caminhos independentes:
+
+| Caminho | Interface | Ferramentas | Critérios |
+|---|---|---|---|
+| FIDO2/U2F | FIDO HID | `ykman fido`, navegador/WebAuthn | AC-002, AC-011, AC-013 |
+| OATH | CCID/YKOATH | Yubico Authenticator, `ykman oath` | AC-016, AC-018, YUB-003..YUB-007 |
+| PIV | CCID/PIV | `ykman piv`, `yubico-piv-tool`, OpenSC | AC-016, AC-017, YUB-008..YUB-010 |
+| OTP Lab | HID vendor-defined `0xFF51` | Cliente próprio com report interrupt de 64 B | LAB-OTP-001/002; **não** `ykman otp` |
+
+O teste deve registrar versão do firmware, versão da ferramenta, sistema
+operacional e reader PC/SC. A identidade USB padrão permanece `0x1209:0x0001`;
+um perfil que imite VID/PID de Yubico é exclusivamente de laboratório e não é
+evidência suficiente de compatibilidade nem pode ser distribuído.
+
+Procedimento mínimo, em hardware físico:
+
+```powershell
+ykman fido info
+ykman oath accounts list
+ykman oath accounts code <nome>
+ykman piv info
+python scripts/validate_oath.py
+python scripts/validate_piv.py
+```
+
+Alguns comandos de `ykman` são extensões específicas de modelos YubiKey e
+podem responder como não suportados. Isso não invalida a compatibilidade dos
+protocolos FIDO, YKOATH e PIV implementados; registre tais casos como
+limitações de extensão no relatório de validação.
+
+### Perfil OTP+FIDO+CCID somente de laboratório
+
+```powershell
+& scripts/build-uf2.ps1 -Board universal -BoardProfile yubikey5-lab
+```
+
+Identidade esperada: `1050:0407`, `YubiKey 5 Series OTP+FIDO+CCID`.
+Interfaces esperadas: FIDO HID (`0xF1D0`), Management HID (`0xFF00`),
+**OTP Lab HID** (`0xFF51`, interrupt IN/OUT de 64 B, polling de 10 ms) e CCID
+(`0x0B`). O perfil genérico continua com **duas HID + CCID**, sem OTP Lab.
+No Linux, confira `lsusb -v -d 1050:0407` e `lsusb -t`; no Windows, confira os
+`MI_00`–`MI_03` do dispositivo USB composto. Observe que enumeração/descritores
+**ainda exigem hardware físico**, não são validados só pelo build cruzado.
+
+O protocolo mínimo, cabeçalho e status constam em
+[docs/yubico-compatibility.md](docs/yubico-compatibility.md) e no módulo
+`aegis-core::otp_lab`. Para um teste interrupt HID em hardware, selecione a
+interface pela usage page `0xFF51` (não por PID apenas); envie 64 bytes
+`A5 01 02 00 00 00 00 01 00 00` seguidos de 54 zeros. INFO deve responder
+no mesmo canal com status `00`, length `0F` e ASCII `AEGIS-OTP-LAB/1`. Para
+PING, troque o comando para `01`, defina length `01` e byte 10=`42`; a resposta
+deve ecoar `42`. Framing inválido deve ser descartado. Cada chamada tem timeout:
+um frame malformado **não** tem resposta. A validação determinística de parser,
+encoder, limites e erros roda com `cargo test -p aegis-core otp_lab`.
+
+**Não** testar `ykman otp` como se estivesse implementado: não há programação
+de slots, Yubico OTP AES, challenge-response nem emissão de teclado. O applet
+YKOATH (OATH/TOTP/HOTP) usa **CCID**, não esse HID. `ykman`/Authenticator
+podem rejeitar comandos OTP no perfil lab; registrar separadamente de FIDO,
+OATH e PIV, sem inferir compatibilidade pelo VID/PID.
+
 ## CCID / applets ISO 7816 (Fase 11)
 
-O dispositivo compõe uma quarta interface, **CCID** (classe USB `0x0B`), que
+O dispositivo compõe a interface **CCID** (classe USB `0x0B`), que
 expõe os applets PIV, OpenPGP e OATH via PC/SC. O roteamento por AID, o
 enquadramento APDU/CCID e o framework de PIN vivem em `aegis-applets`
 (testáveis em host); o firmware apenas transporta bytes entre os endpoints bulk
@@ -243,8 +308,9 @@ python scripts/set_pin.py --change --old-pin 123456 --pin 654321
 
 ## Acesso cross-platform ao USB
 
-O firmware expõe **FIDO HID** e **Management HID**. A forma de acesso varia por
-sistema operacional:
+O perfil padrão expõe **FIDO HID** e **Management HID** (mais CCID); o perfil
+`yubikey5-lab` acrescenta **OTP Lab HID**, sem suporte a comandos comerciais.
+A forma de acesso varia por sistema operacional:
 
 | SO | FIDO/Management (HID) |
 |----|-----------------------|

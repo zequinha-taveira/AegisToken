@@ -124,7 +124,8 @@ impl<const FLASH_SIZE: usize> Rp2350Hardware for Board<FLASH_SIZE> {
 pub struct DeviceManager<const FLASH_SIZE: usize> {
     /// Hardware adapters and discovered capabilities.
     pub board: Board<FLASH_SIZE>,
-    /// The USB device exposing FIDO HID, Management HID and CCID.
+    /// The USB device exposing FIDO HID, Management HID and CCID (plus the
+    /// experimental OTP Lab HID only for the authorized 1050:0407 identity).
     pub usb: Usb,
     /// True random number generator for credential key generation.
     ///

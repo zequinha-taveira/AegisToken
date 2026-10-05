@@ -113,6 +113,46 @@ pub enum CtapHidError {
     Other = 0x7F,
 }
 
+/// Whether a channel was allocated by this device during the current session.
+/// `next_channel` starts at 1, and the broadcast/zero channels are never usable
+/// for CTAPHID commands other than broadcast INIT.
+#[must_use]
+pub const fn allocated_channel(channel: u32, next_channel: u32) -> bool {
+    channel != 0 && channel < next_channel && channel != BROADCAST_CHANNEL
+}
+
+/// Validate an INIT nonce and create its 17-byte reply. INIT on an existing
+/// channel resynchronizes that channel; only broadcast INIT allocates a new one.
+pub fn init_response(
+    channel: u32,
+    nonce: &[u8],
+    next_channel: &mut u32,
+    capabilities: u8,
+) -> Result<[u8; 17], CtapHidError> {
+    if nonce.len() != 8 {
+        return Err(CtapHidError::InvalidLen);
+    }
+    let assigned = if channel == BROADCAST_CHANNEL {
+        if *next_channel == 0 || *next_channel == BROADCAST_CHANNEL {
+            return Err(CtapHidError::Other);
+        }
+        let assigned = *next_channel;
+        *next_channel += 1;
+        assigned
+    } else if allocated_channel(channel, *next_channel) {
+        channel
+    } else {
+        return Err(CtapHidError::InvalidChannel);
+    };
+    let mut response = [0u8; 17];
+    response[..8].copy_from_slice(nonce);
+    response[8..12].copy_from_slice(&assigned.to_be_bytes());
+    response[12] = PROTOCOL_VERSION;
+    response[14] = 1; // firmware minor version
+    response[16] = capabilities;
+    Ok(response)
+}
+
 /// A parsed CTAPHID packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet {
@@ -329,6 +369,30 @@ impl Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_allocates_or_resynchronizes_on_the_origin_channel() {
+        let mut next = 1;
+        let nonce = b"12345678";
+        let reply = init_response(BROADCAST_CHANNEL, nonce, &mut next, 0x0D).unwrap();
+        assert_eq!(&reply[..8], nonce);
+        assert_eq!(&reply[8..12], &1u32.to_be_bytes());
+        assert_eq!(reply[16], 0x0D);
+        assert_eq!(next, 2);
+        let reply = init_response(1, nonce, &mut next, 0x0D).unwrap();
+        assert_eq!(&reply[8..12], &1u32.to_be_bytes());
+        assert_eq!(next, 2);
+        assert!(!allocated_channel(0, next));
+        assert!(!allocated_channel(BROADCAST_CHANNEL, next));
+        assert_eq!(
+            init_response(3, nonce, &mut next, 0x0D),
+            Err(CtapHidError::InvalidChannel)
+        );
+        assert_eq!(
+            init_response(BROADCAST_CHANNEL, b"short", &mut next, 0x0D),
+            Err(CtapHidError::InvalidLen)
+        );
+    }
 
     fn decode(report: [u8; REPORT_SIZE]) -> Packet {
         parse_report(&report).unwrap()

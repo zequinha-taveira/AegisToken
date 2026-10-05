@@ -89,6 +89,7 @@ fn main() {
     let board = board.as_str();
     let profile = match board {
         "" | "generic" => "GENERIC",
+        "yubikey5-lab" => "YUBIKEY5_LAB",
         "waveshare-rp2350-zero" => "WAVESHARE_RP2350_ZERO",
         "waveshare-rp2350-plus" => "WAVESHARE_RP2350_PLUS",
         "waveshare-rp2350-tiny" => "WAVESHARE_RP2350_TINY",
@@ -106,7 +107,7 @@ fn main() {
         "soldered-nula-max" => "SOLDERED_NULA_MAX",
         "invector-challenger-plus" => "INVECTOR_CHALLENGER_PLUS",
         other => panic!(
-            "unknown AEGIS_BOARD '{other}'; expected 'generic' or a third-party \
+            "unknown AEGIS_BOARD '{other}'; expected 'generic', 'yubikey5-lab' or a third-party \
              board profile declared in board-generic-rp2350::capabilities"
         ),
     };
