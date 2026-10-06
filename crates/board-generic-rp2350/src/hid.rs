@@ -1,8 +1,9 @@
 //! Minimal USB HID class with per-interface string descriptors.
 //!
 //! `embassy-usb`'s stock HID class always advertises `iInterface = 0`, but
-//! AegisToken exposes two distinct HID functions (FIDO and Management) that the
-//! host must be able to tell apart by name. This module therefore implements
+//! AegisToken exposes distinct HID functions (FIDO, Management, and optionally
+//! experimental OTP Lab) that the host must be able to tell apart by name.
+//! This module therefore implements
 //! the subset of the HID class the device actually uses:
 //!
 //! * a HID descriptor plus a caller-supplied report descriptor,
@@ -10,8 +11,7 @@
 //! * one interrupt IN and one interrupt OUT endpoint for raw reports.
 //!
 //! Report IDs and the boot protocol are intentionally not supported: every
-//! report is a fixed-size byte buffer, exactly as CTAPHID and the Management
-//! protocol expect.
+//! report is a fixed-size byte buffer, as CTAPHID, Management and OTP Lab expect.
 
 use core::mem::MaybeUninit;
 use core::ops::Range;

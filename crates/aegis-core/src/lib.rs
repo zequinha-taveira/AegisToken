@@ -22,6 +22,7 @@ pub mod identity;
 pub mod lifecycle;
 pub mod management;
 pub mod management_protocol;
+pub mod otp_lab;
 pub mod pin;
 pub mod presence;
 pub mod recovery;

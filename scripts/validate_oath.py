@@ -140,7 +140,11 @@ def main() -> int:
             [0x00, INS_CALCULATE, 0x00, 0x01, len(calculate_data), *calculate_data],
         )
         response = find_tlv(data, TAG_TRUNCATED)
-        code = int.from_bytes(response[1:], "big") if response and len(response) == 5 else None
+        code = (
+            (int.from_bytes(response[1:], "big") & 0x7FFFFFFF) % (10 ** response[0])
+            if response and len(response) == 5 and response[0] in (6, 7, 8)
+            else None
+        )
         record("AC-018 CALCULATE TOTP", sw == 0x9000 and code == 94_287_082, f"sw={sw:04X} code={code}")
     finally:
         delete_data = tlv(TAG_NAME, NAME)

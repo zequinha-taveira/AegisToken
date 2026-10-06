@@ -12,7 +12,10 @@
 # -BoardProfile selects the carrier identity and USB VID/PID (build.rs reads it
 # from AEGIS_BOARD). Defaults to `generic`; see BoardProfile in
 # board-generic-rp2350 for the supported third-party names
-# (e.g. waveshare-rp2350-zero, pimoroni-tiny-2350).
+# (e.g. waveshare-rp2350-zero, pimoroni-tiny-2350). The authorized
+# `yubikey5-lab` uses 1050:0407 (OTP+FIDO+CCID); its OTP HID protocol is an
+# experimental read-only lab transport, NOT Yubico OTP/ykman otp. Laboratory-only;
+# never distribute this identity.
 #
 # RP2354A/B share the RP2350A/B die and package and add 2 MiB in-package flash.
 # For a production image, set AEGIS_UPDATE_VENDOR_PUBKEY to the release key
@@ -24,6 +27,10 @@ param(
     [string]$Board = "universal",
     [string]$BoardProfile = "generic"
 )
+
+if ($BoardProfile -eq "yubikey5-lab") {
+    Write-Warning "yubikey5-lab uses Yubico VID 0x1050 / PID 0x0407 (OTP+FIDO+CCID). Its OTP HID is experimental, not compatible with Yubico OTP / ykman otp. Authorized lab only; do not distribute."
+}
 
 $target = "thumbv8m.main-none-eabihf"
 $bin = "firmware-universal-rp2350"
@@ -41,7 +48,11 @@ $version = $match.Matches[0].Groups[1].Value
 # detection, same QSPI flash driver with a conservative 2 MiB layout).
 # Per-variant targets keep the legacy AegisToken_<product>-<version>.uf2 names.
 if ($Board -eq "universal") {
-    $out = "AegisToken-$version.uf2"
+    if ($BoardProfile -eq "generic") {
+        $out = "AegisToken-$version.uf2"
+    } else {
+        $out = "AegisToken-$BoardProfile-$version.uf2"
+    }
 } else {
     # RP2350A maps to the Pico 2 product codename; other boards keep the board name.
     $product = if ($Board -eq "rp2350a") { "pico2" } else { $Board }

@@ -55,6 +55,8 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   Ed448 (no mature `no_std` Rust arithmetic yet); brainpoolP256r1 and
   P384r1 remain supported.
 - **USB identity.** The default is the project's own pid.codes id
-  `0x1209:0x0001`. The YubiKey USB identity that `ykman` / Yubico
-  Authenticator auto-recognize is an opt-in `VIDPID=Yubikey5` build for
-  local testing only — not for distribution.
+  `0x1209:0x0001`. Compatibility with Yubico Authenticator and `ykman` is
+  protocol-based (FIDO HID, OATH/YKOATH and PIV over CCID), not a claim that
+  the device is a YubiKey. Any VID/PID profile used to exercise tools that
+  filter by Yubico identity is laboratory-only, requires authorization, and
+  must never be distributed.

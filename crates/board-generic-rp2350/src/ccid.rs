@@ -40,13 +40,11 @@ const REQ_GET_DATA_RATES: u8 = 0x03;
 /// CCID functional descriptor (CCID rev 1.1, §5.1), 54 bytes.
 ///
 /// Advertises a single slot, T=0 only, automatic activation and voltage
-/// selection, and short-APDU exchange level with a maximum message length of
-/// 271 bytes (`aegis-applets` reassembly is larger; the host is told the
-/// standard short-APDU bound until the applets accept extended APDUs).
+/// selection, and short/extended-APDU exchange with the actual reassembly
+/// capacity of the applet transport.
 ///
-/// `dwFeatures = 0x0406_0000`: bits 17 (automatic activation on `IccPowerOn`)
-/// and 18 (automatic voltage selection) plus exchange level 1 (short APDU) in
-/// bits 26-27.
+/// `dwFeatures = 0x0806_0000`: bits 17/18 (automatic activation/voltage)
+/// plus exchange level 2 (short and extended APDUs) in bits 26-27.
 static CCID_DESCRIPTOR: [u8; 54] = [
     0x36, 0x21, // bLength, bDescriptorType
     0x10, 0x01, // bcdCCID = 1.10
@@ -62,8 +60,8 @@ static CCID_DESCRIPTOR: [u8; 54] = [
     0xFE, 0x00, 0x00, 0x00, // dwMaxIFSD = 254
     0x00, 0x00, 0x00, 0x00, // dwSynchProtocols
     0x00, 0x00, 0x00, 0x00, // dwMechanical
-    0x00, 0x00, 0x06, 0x04, // dwFeatures
-    0x0F, 0x01, 0x00, 0x00, // dwMaxCCIDMessageLength = 271
+    0x00, 0x00, 0x06, 0x08, // dwFeatures
+    0x34, 0x08, 0x00, 0x00, // dwMaxCCIDMessageLength = 2100 (core CCID buffer)
     0x00, // bClassGetResponse
     0x00, // bClassEnvelope
     0x00, 0x00, // wLcdLayout
@@ -73,6 +71,14 @@ static CCID_DESCRIPTOR: [u8; 54] = [
 
 // The functional descriptor is defined by CCID rev 1.1 §5.1 as exactly 54 bytes.
 const _: () = assert!(CCID_DESCRIPTOR.len() == 54);
+const _: () = assert!(
+    u32::from_le_bytes([
+        CCID_DESCRIPTOR[44],
+        CCID_DESCRIPTOR[45],
+        CCID_DESCRIPTOR[46],
+        CCID_DESCRIPTOR[47]
+    ]) == 2100
+);
 
 /// CCID class shared state, owned by the USB builder for the device's lifetime.
 pub struct State {
