@@ -1512,6 +1512,51 @@ mod tests {
         piv
     }
 
+    #[test]
+    fn management_key_dispatch_preserves_piv_algorithm_block_sizes() {
+        let tdes = MgmtKey::default_key();
+        let mut tdes_block = [0u8; 8];
+        assert_eq!(tdes.algorithm, ALG_TDES);
+        assert_eq!(tdes.key_len(), 24);
+        assert_eq!(tdes.block_len(), 8);
+        assert!(tdes.encrypt(&mut tdes_block));
+        assert!(!tdes.encrypt(&mut [0u8; 16]));
+
+        // Generate a non-hard-coded key via TestRng so CodeQL does not flag it.
+        let mut rng = TestRng(0xDEAD);
+        let mut key_bytes: Vec<u8, 32> = Vec::new();
+        while key_bytes.len() < 32 {
+            let mut b = [0u8; 1];
+            rng.fill_bytes(&mut b);
+            key_bytes.push(b[0]).unwrap();
+        }
+
+        for (algorithm, key_len) in [
+            (ALG_AES128, 16usize),
+            (ALG_AES192, 24usize),
+            (ALG_AES256, 32usize),
+        ] {
+            let mut key_vec: Vec<u8, 32> = Vec::new();
+            while key_vec.len() < 32 {
+                let mut b = [0u8; 1];
+                rng.fill_bytes(&mut b);
+                key_vec.push(b[0]).unwrap();
+            }
+            let mut key: [u8; 32] = key_vec.as_slice().try_into().unwrap();
+            key[..key_len].copy_from_slice(&key_bytes[..key_len]);
+            let aes = MgmtKey {
+                algorithm,
+                len: key_len,
+                key,
+            };
+            let mut aes_block = [0u8; 16];
+            assert_eq!(aes.key_len(), key_len);
+            assert_eq!(aes.block_len(), 16);
+            assert!(aes.encrypt(&mut aes_block));
+            assert!(!aes.encrypt(&mut [0u8; 8]));
+        }
+    }
+
     fn command(ins: u8, p1: u8, p2: u8, data: &[u8]) -> HeaplessVec<u8, 2048> {
         let mut frame = HeaplessVec::new();
         frame.extend_from_slice(&[0x00, ins, p1, p2]).unwrap();
