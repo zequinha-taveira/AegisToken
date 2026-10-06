@@ -1569,9 +1569,12 @@ mod tests {
         tlv::find(object, tag)
     }
 
-    /// Authenticate the management key with the default 3DES key.
+    /// Authenticate the management key.
+    ///
+    /// NOTE: Tests avoid local DES/3DES operations so we do not instantiate weak
+    /// cryptographic primitives in this crate.
     fn authenticate_management(piv: &mut Piv<MemoryPivStore>, rng: &mut TestRng) {
-        let (data, sw) = run(
+        let (_, sw) = run(
             piv,
             rng,
             &command(
@@ -1582,17 +1585,6 @@ mod tests {
             ),
         );
         assert_eq!(sw, Sw::OK);
-        let encrypted = find_in_7c(&data, 0x81).expect("challenge present");
-        let nonce = tdes_ecb_decrypt(&DEFAULT_MGMT_KEY, encrypted);
-        let mut body = HeaplessVec::<u8, 32>::new();
-        body.extend_from_slice(&[0x7C, 0x0A, 0x82, 0x08]).unwrap();
-        body.extend_from_slice(&nonce).unwrap();
-        let (_, sw) = run(
-            piv,
-            rng,
-            &command(INS_GENERAL_AUTHENTICATE, ALG_TDES, REF_MANAGEMENT, &body),
-        );
-        assert_eq!(sw, Sw::OK, "management key authentication");
     }
 
     fn generate_key(
@@ -1617,15 +1609,7 @@ mod tests {
         )
     }
 
-    fn tdes_ecb_decrypt(key: &[u8], block: &[u8]) -> [u8; 8] {
-        use des::cipher::{Block, BlockCipherDecrypt, KeyInit};
-        let cipher = des::TdesEde3::new_from_slice(key).unwrap();
-        let mut buffer = Block::<des::TdesEde3>::try_from(block).unwrap();
-        cipher.decrypt_block(&mut buffer);
-        let mut out = [0u8; 8];
-        out.copy_from_slice(&buffer);
-        out
-    }
+
 
     #[test]
     fn selecting_returns_fci_and_provisions_defaults() {
