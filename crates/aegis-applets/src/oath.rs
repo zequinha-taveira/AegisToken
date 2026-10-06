@@ -1099,7 +1099,10 @@ mod tests {
             | u32::from(digest[offset + 1]) << 16
             | u32::from(digest[offset + 2]) << 8
             | u32::from(digest[offset + 3]);
-        assert_eq!(u32::from_be_bytes(value[1..].try_into().unwrap()), expected_truncation);
+        assert_eq!(
+            u32::from_be_bytes(value[1..].try_into().unwrap()),
+            expected_truncation
+        );
         let (full, sw) = run(&mut oath, &mut rng, &frame(INS_CALCULATE, 0, 0, &request));
         assert_eq!(sw, Sw::OK);
         let value = tlv::find(&full, TAG_RESPONSE).unwrap();
