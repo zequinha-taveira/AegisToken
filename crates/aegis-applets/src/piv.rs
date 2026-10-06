@@ -1512,6 +1512,34 @@ mod tests {
         piv
     }
 
+    #[test]
+    fn management_key_dispatch_preserves_piv_algorithm_block_sizes() {
+        let tdes = MgmtKey::default_key();
+        let mut tdes_block = [0u8; 8];
+        assert_eq!(tdes.algorithm, ALG_TDES);
+        assert_eq!(tdes.key_len(), 24);
+        assert_eq!(tdes.block_len(), 8);
+        assert!(tdes.encrypt(&mut tdes_block));
+        assert!(!tdes.encrypt(&mut [0u8; 16]));
+
+        for (algorithm, key_len) in [
+            (ALG_AES128, 16usize),
+            (ALG_AES192, 24usize),
+            (ALG_AES256, 32usize),
+        ] {
+            let aes = MgmtKey {
+                algorithm,
+                len: key_len,
+                key: [0xA5; 32],
+            };
+            let mut aes_block = [0u8; 16];
+            assert_eq!(aes.key_len(), key_len);
+            assert_eq!(aes.block_len(), 16);
+            assert!(aes.encrypt(&mut aes_block));
+            assert!(!aes.encrypt(&mut [0u8; 8]));
+        }
+    }
+
     fn command(ins: u8, p1: u8, p2: u8, data: &[u8]) -> HeaplessVec<u8, 2048> {
         let mut frame = HeaplessVec::new();
         frame.extend_from_slice(&[0x00, ins, p1, p2]).unwrap();
