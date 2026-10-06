@@ -1056,5 +1056,10 @@ adiado.
 - **Ferramental de validação:** `ykman` restringe alguns comandos a VID/PID
   Yubico; a validação primária usa OpenSC/`pyscard`, com as ferramentas padrão
   como complemento.
+- **Compatibilidade Yubico:** o requisito é protocolar — FIDO HID, OATH/YKOATH
+  e PIV sobre CCID — e não uma imitação permanente da identidade comercial da
+  Yubico. A matriz YUB-001..YUB-010 está em
+  `docs/yubico-compatibility.md`; a validação física com Yubico Authenticator e
+  `ykman` permanece pendente até registrar versões de ferramenta e resultados.
 - **TOTP sem RTC:** o dispositivo não mantém relógio; o timestamp vem do host
   no `CALCULATE`, como nos tokens OATH padrão.

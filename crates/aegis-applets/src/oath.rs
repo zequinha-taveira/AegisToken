@@ -479,7 +479,7 @@ impl<S: OathStore> Oath<S> {
                 }
                 continue;
             }
-            let Some(code) = compute_credential(credential, challenge) else {
+            let Some(code) = compute_credential(credential, challenge, apdu.p2 == 0x01) else {
                 return Response::status(Sw::NO_PRECISE_DIAGNOSIS);
             };
             let tag = if apdu.p2 == 0x01 {
@@ -495,7 +495,7 @@ impl<S: OathStore> Oath<S> {
     }
 
     fn calculate_index(&mut self, index: usize, challenge: &[u8], truncated: bool) -> Response<'_> {
-        let Some(code) = compute_credential(&self.credentials[index], challenge) else {
+        let Some(code) = compute_credential(&self.credentials[index], challenge, truncated) else {
             return Response::status(Sw::NO_PRECISE_DIAGNOSIS);
         };
         if self.credentials[index].kind == TYPE_HOTP {
@@ -517,11 +517,17 @@ impl<S: OathStore> Oath<S> {
     }
 
     fn set_code(&mut self, apdu: &Apdu<'_>) -> Response<'_> {
+        if let Err(status) = self.require_auth() {
+            return Response::status(status);
+        }
         if apdu.data.is_empty() {
             self.auth_key.clear();
             self.authenticated = false;
-            self.save_state();
-            return Response::status(Sw::OK);
+            return Response::status(if self.save_state() {
+                Sw::OK
+            } else {
+                Sw::NOT_ENOUGH_MEMORY
+            });
         }
         let Some(key_data) = tlv::find(apdu.data, TAG_KEY) else {
             return Response::status(Sw::WRONG_DATA);
@@ -596,16 +602,8 @@ impl<S: OathStore> Oath<S> {
         let _ = self.save_state();
         Response::status(Sw::OK)
     }
-}
 
-impl<S: OathStore> Applet for Oath<S> {
-    fn aid(&self) -> &'static [u8] {
-        AID
-    }
-
-    fn select(&mut self) -> Response<'_> {
-        self.loaded = false;
-        self.load_state();
+    fn select_response(&mut self) -> Response<'_> {
         self.authenticated = self.auth_key.is_empty();
         self.pending = None;
         self.out.clear();
@@ -622,6 +620,27 @@ impl<S: OathStore> Applet for Oath<S> {
             return Response::status(Sw::NOT_ENOUGH_MEMORY);
         }
         Response::ok(&self.out)
+    }
+}
+
+impl<S: OathStore> Applet for Oath<S> {
+    fn aid(&self) -> &'static [u8] {
+        AID
+    }
+
+    fn select(&mut self) -> Response<'_> {
+        self.loaded = false;
+        self.load_state();
+        self.select_response()
+    }
+
+    fn select_with_rng(&mut self, rng: &mut dyn Rng) -> Response<'_> {
+        self.loaded = false;
+        self.load_state();
+        if !self.auth_key.is_empty() {
+            rng.fill_bytes(&mut self.auth_challenge);
+        }
+        self.select_response()
     }
 
     fn process(&mut self, apdu: &Apdu<'_>, _rng: &mut dyn Rng) -> Response<'_> {
@@ -723,7 +742,11 @@ fn credential_period(name: &[u8]) -> u32 {
     if period == 0 { 30 } else { period }
 }
 
-fn compute_credential(credential: &Credential, challenge: &[u8]) -> Option<[u8; 5]> {
+fn compute_credential(
+    credential: &Credential,
+    challenge: &[u8],
+    truncated: bool,
+) -> Option<Vec<u8, 65>> {
     let moving_factor = if credential.kind == TYPE_HOTP {
         u64::from(credential.counter).to_be_bytes()
     } else {
@@ -733,6 +756,12 @@ fn compute_credential(credential: &Credential, challenge: &[u8]) -> Option<[u8; 
         challenge.try_into().ok()?
     };
     let digest = hmac_digest(credential.algorithm, &credential.secret, &moving_factor)?;
+    let mut output = Vec::new();
+    output.push(credential.digits).ok()?;
+    if !truncated {
+        output.extend_from_slice(&digest).ok()?;
+        return Some(output);
+    }
     let offset = usize::from(*digest.last()? & 0x0F);
     if offset + 4 > digest.len() {
         return None;
@@ -741,11 +770,9 @@ fn compute_credential(credential: &Credential, challenge: &[u8]) -> Option<[u8; 
         | u32::from(digest[offset + 1]) << 16
         | u32::from(digest[offset + 2]) << 8
         | u32::from(digest[offset + 3]);
-    let modulo = 10u32.pow(u32::from(credential.digits));
-    let code = binary % modulo;
-    let mut output = [0u8; 5];
-    output[0] = credential.digits;
-    output[1..].copy_from_slice(&code.to_be_bytes());
+    // The wire carries the full 31-bit dynamic truncation; the host applies
+    // modulo 10^digits when displaying the decimal OTP.
+    output.extend_from_slice(&binary.to_be_bytes()).ok()?;
     Some(output)
 }
 
@@ -899,7 +926,7 @@ mod tests {
     fn code(response: &[u8], tag: u32) -> u32 {
         let value = tlv::find(response, tag).unwrap();
         assert_eq!(value.len(), 5);
-        u32::from_be_bytes(value[1..5].try_into().unwrap())
+        u32::from_be_bytes(value[1..5].try_into().unwrap()) % 10u32.pow(u32::from(value[0]))
     }
 
     #[test]
@@ -1045,6 +1072,105 @@ mod tests {
         );
         assert_eq!(
             run(&mut oath, &mut rng, &frame(INS_LIST, 0, 0, &[])).1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn ykoath_wire_returns_raw_truncation_or_full_digest() {
+        let mut oath = applet();
+        let mut rng = TestRng;
+        let mut secret = Vec::<u8, 20>::new();
+        secret.resize(20, 0).unwrap();
+        rng.fill_bytes(&mut secret);
+        let put = put_data(b"totp", TYPE_TOTP, ALGORITHM_SHA1, 8, &secret, None, 0);
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &put)).1,
+            Sw::OK
+        );
+        let challenge = 1u64.to_be_bytes();
+        let request = calculate_data(b"totp", Some(&challenge));
+        let (truncated, sw) = run(&mut oath, &mut rng, &frame(INS_CALCULATE, 0, 1, &request));
+        assert_eq!(sw, Sw::OK);
+        let value = tlv::find(&truncated, TAG_TRUNCATED).unwrap();
+        assert_eq!(value[0], 8);
+        let digest = hmac_digest(ALGORITHM_SHA1, &secret, &challenge).unwrap();
+        let offset = usize::from(*digest.last().unwrap() & 0x0F);
+        let expected_truncation = (u32::from(digest[offset]) & 0x7F) << 24
+            | u32::from(digest[offset + 1]) << 16
+            | u32::from(digest[offset + 2]) << 8
+            | u32::from(digest[offset + 3]);
+        assert_eq!(
+            u32::from_be_bytes(value[1..].try_into().unwrap()),
+            expected_truncation
+        );
+        let (full, sw) = run(&mut oath, &mut rng, &frame(INS_CALCULATE, 0, 0, &request));
+        assert_eq!(sw, Sw::OK);
+        let value = tlv::find(&full, TAG_RESPONSE).unwrap();
+        assert_eq!(value.len(), 21);
+        assert_eq!(value[0], 8);
+        assert_eq!(
+            &value[1..],
+            &hmac_digest(ALGORITHM_SHA1, &secret, &challenge).unwrap()
+        );
+        let mut all = Vec::<u8, 32>::new();
+        append_tlv(&mut all, TAG_CHALLENGE, &challenge);
+        let (list, sw) = run(&mut oath, &mut rng, &frame(INS_CALCULATE_ALL, 0, 1, &all));
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(tlv::find(&list, TAG_TRUNCATED), Some(&truncated[2..7]));
+    }
+
+    #[test]
+    fn protected_access_code_cannot_be_replaced_or_cleared_without_validation() {
+        let mut oath = applet();
+        let mut rng = TestRng;
+        let mut key_bytes = Vec::<u8, 20>::new();
+        key_bytes.resize(20, 0).unwrap();
+        rng.fill_bytes(&mut key_bytes);
+        let key = key_bytes.as_slice();
+        let challenge = b"abcdefgh";
+        let mut body = Vec::<u8, 128>::new();
+        let mut descriptor = Vec::<u8, 32>::new();
+        descriptor.push(ALGORITHM_SHA1).unwrap();
+        descriptor.extend_from_slice(key).unwrap();
+        append_tlv(&mut body, TAG_KEY, &descriptor);
+        append_tlv(&mut body, TAG_CHALLENGE, challenge);
+        append_tlv(
+            &mut body,
+            TAG_RESPONSE,
+            &hmac_digest(ALGORITHM_SHA1, key, challenge).unwrap(),
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_SET_CODE, 0, 0, &body)).1,
+            Sw::OK
+        );
+        let select = oath.select_with_rng(&mut rng);
+        assert_eq!(select.sw, Sw::OK);
+        assert_eq!(
+            tlv::find(select.data, TAG_CHALLENGE),
+            Some(&b"BBBBBBBB"[..])
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_SET_CODE, 0, 0, &[])).1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_SET_CODE, 0, 0, &body)).1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        let mut validate = Vec::<u8, 128>::new();
+        append_tlv(
+            &mut validate,
+            TAG_RESPONSE,
+            &hmac_digest(ALGORITHM_SHA1, key, b"BBBBBBBB").unwrap(),
+        );
+        append_tlv(&mut validate, TAG_CHALLENGE, b"87654321");
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_VALIDATE, 0, 0, &validate)).1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_SET_CODE, 0, 0, &[])).1,
             Sw::OK
         );
     }

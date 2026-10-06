@@ -37,6 +37,12 @@ pub trait Applet {
         Response::ok(&[])
     }
 
+    /// Select with access to entropy, for applets that issue session challenges.
+    fn select_with_rng(&mut self, rng: &mut dyn Rng) -> Response<'_> {
+        let _ = rng;
+        self.select()
+    }
+
     /// Process a command after selection.
     ///
     /// `rng` supplies entropy for commands that generate key material.
@@ -129,7 +135,7 @@ impl<'a, const RESPONSE: usize> Router<'a, RESPONSE> {
                 Some(index) => {
                     *selected = Some(index);
                     let applet: &mut dyn Applet = &mut *applets[index];
-                    applet.select()
+                    applet.select_with_rng(rng)
                 }
                 None => {
                     *selected = None;

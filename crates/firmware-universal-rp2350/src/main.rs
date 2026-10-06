@@ -25,6 +25,7 @@ use aegis_core::ctaphid::{self, Assembler, CtapHidCommand, CtapHidError};
 use aegis_core::identity::BoardIdentity;
 use aegis_core::lifecycle::LifecycleState;
 use aegis_core::management_protocol::{ManagementCommand, ManagementService};
+use aegis_core::otp_lab;
 use aegis_core::pin::{
     ClientPin, ClientPinRequest, SUB_GET_KEY_AGREEMENT, SUB_GET_PIN_TOKEN,
     SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS, SUB_GET_RETRIES, SUB_SET_PIN,
@@ -37,7 +38,7 @@ use board_generic_rp2350::flash::{FlashStorage, RegionStorage};
 use board_generic_rp2350::presence::PresenceAdapter;
 use board_generic_rp2350::rng::HardwareRng;
 use board_generic_rp2350::usb::{
-    Ccid, FidoReader, FidoWriter, KeyboardWriter, ManagementReader, ManagementWriter, RpUsb, Usb,
+    Ccid, FidoReader, FidoWriter, ManagementReader, ManagementWriter, OtpHid, RpUsb, Usb,
 };
 use board_generic_rp2350::watchdog::WatchdogHandle;
 use board_generic_rp2350::{Board, BoardParts, BoardProfile, DeviceManager, embassy_rp};
@@ -196,9 +197,9 @@ async fn main(_spawner: Spawner) {
 
     let Usb {
         device: usb_device,
-        keyboard,
         fido,
         management: management_hid,
+        otp,
         ccid,
     } = device.usb;
     let (fido_reader, fido_writer) = fido.split();
@@ -225,20 +226,35 @@ async fn main(_spawner: Spawner) {
                 led.map(|led| led as &mut dyn Led),
                 watchdog,
             ),
-            keyboard_task(keyboard),
             ccid_task(ccid, &device.rng, presence, storage, root_key),
+            otp_task(otp),
         ),
     )
     .await;
 }
 
-/// Hold the boot keyboard interface open without injecting keystrokes.
-///
-/// The interface is advertised during enumeration; this task only waits for the
-/// interrupt IN endpoint to be enabled and then stays idle.
-async fn keyboard_task(mut writer: KeyboardWriter) {
-    writer.ready().await;
-    core::future::pending::<()>().await;
+/// Drive only the 1050:0407 experimental OTP-labelled HID endpoint. Every
+/// accepted request is bounded and read-only; malformed/partial reports are
+/// ignored. No flash, FIDO, CCID, presence, or Management resource is locked.
+async fn otp_task(otp: Option<OtpHid>) {
+    let Some(otp) = otp else {
+        // Generic and third-party identities do not enumerate this interface.
+        core::future::pending::<()>().await;
+        return;
+    };
+    let (mut reader, mut writer) = otp.split();
+    let mut report = [0u8; otp_lab::REPORT_SIZE];
+    loop {
+        let Ok(len) = reader.read(&mut report).await else {
+            reader.ready().await;
+            continue;
+        };
+        if let Some(response) = otp_lab::handle_report(&report[..len]) {
+            if writer.write(&response).await.is_err() {
+                writer.ready().await;
+            }
+        }
+    }
 }
 
 /// Serve the CCID interface: reassemble host messages and answer with the
@@ -459,9 +475,12 @@ async fn fido_task(
     let mut buf = [0u8; ctaphid::REPORT_SIZE];
 
     loop {
-        let Ok(_len) = reader.read(&mut buf).await else {
+        let Ok(len) = reader.read(&mut buf).await else {
             continue;
         };
+        if len != ctaphid::REPORT_SIZE {
+            continue;
+        }
         let Ok(packet) = ctaphid::parse_report(&buf) else {
             continue;
         };
@@ -470,6 +489,18 @@ async fn fido_task(
                 *channel
             }
         };
+        let is_init = matches!(
+            &packet,
+            ctaphid::Packet::Init {
+                command: CtapHidCommand::Init,
+                ..
+            }
+        );
+        if !is_init && !ctaphid::allocated_channel(channel, next_channel) {
+            let report = ctaphid::error_report(channel, CtapHidError::InvalidChannel);
+            let _ = writer.write(&report).await;
+            continue;
+        }
 
         match assembler.accept(packet) {
             Ok(Some(message)) => {
@@ -505,29 +536,21 @@ async fn handle_ctaphid(
 ) {
     match message.command {
         CtapHidCommand::Init => {
-            // Response: nonce (8) | channel (4) | protocol (1) | version (3) | caps (1).
-            // The INIT response is sent on the broadcast channel; the newly
-            // assigned channel id is carried inside the payload.
-            let mut response = [0u8; 17];
-            let nonce_len = message.payload.len().min(8);
-            response[..nonce_len].copy_from_slice(&message.payload[..nonce_len]);
-
-            let channel = *next_channel;
-            *next_channel = (*next_channel).wrapping_add(1);
-            response[8..12].copy_from_slice(&channel.to_be_bytes());
-            response[12] = ctaphid::PROTOCOL_VERSION;
-            response[13] = 0; // major
-            response[14] = 1; // minor
-            response[15] = 0; // build
-            response[16] = CTAPHID_CAPABILITIES;
-
-            send_ctaphid(
-                writer,
-                ctaphid::BROADCAST_CHANNEL,
-                CtapHidCommand::Init,
-                &response,
-            )
-            .await;
+            match ctaphid::init_response(
+                message.channel,
+                &message.payload,
+                next_channel,
+                CTAPHID_CAPABILITIES,
+            ) {
+                Ok(response) => {
+                    send_ctaphid(writer, message.channel, CtapHidCommand::Init, &response).await
+                }
+                Err(error) => {
+                    let _ = writer
+                        .write(&ctaphid::error_report(message.channel, error))
+                        .await;
+                }
+            }
         }
         CtapHidCommand::Ping => {
             send_ctaphid(
@@ -562,7 +585,7 @@ async fn handle_ctaphid(
             send_ctaphid(writer, message.channel, CtapHidCommand::Msg, &out[..len]).await;
         }
         CtapHidCommand::Wink => {
-            // No response is defined for WINK.
+            send_ctaphid(writer, message.channel, CtapHidCommand::Wink, &[]).await;
         }
         _ => {
             let report = ctaphid::error_report(message.channel, CtapHidError::InvalidCmd);

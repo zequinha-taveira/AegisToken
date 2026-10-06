@@ -24,6 +24,10 @@ pub const MAX_PAYLOAD_BYTES: usize = MAX_MESSAGE_BYTES - HEADER_LEN;
 
 /// `PC_to_RDR_SetParameters` message type.
 pub const PC_TO_RDR_SET_PARAMETERS: u8 = 0x61;
+/// `PC_to_RDR_GetParameters` message type.
+pub const PC_TO_RDR_GET_PARAMETERS: u8 = 0x6C;
+/// `PC_to_RDR_ResetParameters` message type.
+pub const PC_TO_RDR_RESET_PARAMETERS: u8 = 0x6D;
 /// `PC_to_RDR_IccPowerOn` message type.
 pub const PC_TO_RDR_ICC_POWER_ON: u8 = 0x62;
 /// `PC_to_RDR_IccPowerOff` message type.
@@ -48,8 +52,8 @@ pub const RDR_TO_PC_ESCAPE: u8 = 0x83;
 
 /// `bStatus`: command processed without error.
 pub const STATUS_OK: u8 = 0x00;
-/// `bStatus`: command failed.
-pub const STATUS_FAILED: u8 = 0x01;
+/// `bStatus` bits 6-7: command failed (bits 0-1 carry ICC state).
+pub const STATUS_FAILED: u8 = 0x40;
 /// `bError`: no error.
 pub const ERROR_NONE: u8 = 0x00;
 /// `bError`: an error occurred.
@@ -68,6 +72,8 @@ pub const ICC_STATUS_COMM_ERROR: u8 = 0x03;
 pub const PROTOCOL_T0: u8 = 0x00;
 /// `bProtocolNum`: T=1.
 pub const PROTOCOL_T1: u8 = 0x01;
+/// Default T=0 protocol structure (Fi/Di, TCCK, guard time, WI, clock stop).
+pub const T0_PARAMETERS: [u8; 5] = [0x11, 0x00, 0x00, 0x0A, 0x00];
 
 /// Malformed or unsupported CCID traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +160,10 @@ pub enum Request<'a> {
         /// Protocol data structure.
         data: &'a [u8],
     },
+    /// `GetParameters` for the active T=0 protocol.
+    GetParameters { slot: u8, sequence: u8 },
+    /// `ResetParameters` restores default T=0 parameters.
+    ResetParameters { slot: u8, sequence: u8 },
     /// `XfrBlock`: an APDU exchange.
     XfrBlock {
         /// `bSlot`.
@@ -204,11 +214,21 @@ impl<'a> Request<'a> {
                 slot: header.slot,
                 sequence: header.sequence,
             }),
-            PC_TO_RDR_SET_PARAMETERS if !payload.is_empty() => Ok(Self::SetParameters {
+            PC_TO_RDR_SET_PARAMETERS if payload.len() == T0_PARAMETERS.len() => {
+                Ok(Self::SetParameters {
+                    slot: header.slot,
+                    sequence: header.sequence,
+                    protocol: header.specific[0],
+                    data: payload,
+                })
+            }
+            PC_TO_RDR_GET_PARAMETERS if payload.is_empty() => Ok(Self::GetParameters {
                 slot: header.slot,
                 sequence: header.sequence,
-                protocol: payload[0],
-                data: &payload[1..],
+            }),
+            PC_TO_RDR_RESET_PARAMETERS if payload.is_empty() => Ok(Self::ResetParameters {
+                slot: header.slot,
+                sequence: header.sequence,
             }),
             PC_TO_RDR_XFR_BLOCK => Ok(Self::XfrBlock {
                 slot: header.slot,
@@ -238,6 +258,8 @@ impl<'a> Request<'a> {
             | Self::IccPowerOff { sequence, .. }
             | Self::GetSlotStatus { sequence, .. }
             | Self::SetParameters { sequence, .. }
+            | Self::GetParameters { sequence, .. }
+            | Self::ResetParameters { sequence, .. }
             | Self::XfrBlock { sequence, .. }
             | Self::Escape { sequence, .. }
             | Self::Abort { sequence, .. } => *sequence,
@@ -252,6 +274,8 @@ impl<'a> Request<'a> {
             | Self::IccPowerOff { slot, .. }
             | Self::GetSlotStatus { slot, .. }
             | Self::SetParameters { slot, .. }
+            | Self::GetParameters { slot, .. }
+            | Self::ResetParameters { slot, .. }
             | Self::XfrBlock { slot, .. }
             | Self::Escape { slot, .. }
             | Self::Abort { slot, .. } => *slot,
@@ -311,9 +335,9 @@ impl<'a> Response<'a> {
         Self {
             message_type: RDR_TO_PC_SLOT_STATUS,
             sequence,
-            status: STATUS_OK,
+            status: STATUS_OK | icc_status,
             error: ERROR_NONE,
-            specific: [icc_status, 0, 0],
+            specific: [0; 3],
             data: &[],
         }
     }
@@ -324,9 +348,9 @@ impl<'a> Response<'a> {
         Self {
             message_type: RDR_TO_PC_SLOT_STATUS,
             sequence,
-            status: STATUS_FAILED,
+            status: STATUS_FAILED | ICC_STATUS_INACTIVE,
             error: ERROR_OCCURRED,
-            specific: [ICC_STATUS_COMM_ERROR, 0, 0],
+            specific: [0; 3],
             data: &[],
         }
     }
@@ -601,15 +625,32 @@ mod tests {
             PC_TO_RDR_SET_PARAMETERS,
             5,
             [0x01, 0x00, 0x00],
-            &[0x00, 0x00],
+            &T0_PARAMETERS,
         );
         assert_eq!(
             Request::parse(&bytes),
             Ok(Request::SetParameters {
                 slot: 0,
                 sequence: 5,
-                protocol: 0,
-                data: &[0x00],
+                protocol: PROTOCOL_T1,
+                data: &T0_PARAMETERS,
+            })
+        );
+
+        let get = frame(PC_TO_RDR_GET_PARAMETERS, 7, [0; 3], &[]);
+        assert_eq!(
+            Request::parse(&get),
+            Ok(Request::GetParameters {
+                slot: 0,
+                sequence: 7
+            })
+        );
+        let reset = frame(PC_TO_RDR_RESET_PARAMETERS, 8, [0; 3], &[]);
+        assert_eq!(
+            Request::parse(&reset),
+            Ok(Request::ResetParameters {
+                slot: 0,
+                sequence: 8
             })
         );
 
@@ -635,7 +676,7 @@ mod tests {
         // PowerOn must not carry a payload.
         let wrong = frame(PC_TO_RDR_ICC_POWER_ON, 1, [0; 3], &[0x00]);
         assert_eq!(Request::parse(&wrong), Err(CcidError::UnsupportedMessage));
-        // SetParameters requires at least the protocol byte.
+        // T=0 SetParameters requires the complete five-byte protocol structure.
         let wrong = frame(PC_TO_RDR_SET_PARAMETERS, 1, [0; 3], &[]);
         assert_eq!(Request::parse(&wrong), Err(CcidError::UnsupportedMessage));
     }
@@ -667,7 +708,12 @@ mod tests {
         assert_eq!(len, HEADER_LEN);
         assert_eq!(out[0], RDR_TO_PC_SLOT_STATUS);
         assert_eq!(&out[1..5], &0u32.to_le_bytes());
-        assert_eq!(out[9], ICC_STATUS_INACTIVE);
+        assert_eq!(out[7], ICC_STATUS_INACTIVE);
+        assert_eq!(out[9], 0); // bClockStatus is not the ICC status
+        assert_eq!(
+            Response::slot_status_failed(3).status,
+            STATUS_FAILED | ICC_STATUS_INACTIVE
+        );
     }
 
     #[test]
