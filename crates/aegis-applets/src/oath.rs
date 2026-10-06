@@ -1080,7 +1080,8 @@ mod tests {
     fn ykoath_wire_returns_raw_truncation_or_full_digest() {
         let mut oath = applet();
         let mut rng = TestRng;
-        let mut secret = [0u8; 20];
+        let mut secret = Vec::<u8, 20>::new();
+        secret.resize(20, 0).unwrap();
         rng.fill_bytes(&mut secret);
         let put = put_data(b"totp", TYPE_TOTP, ALGORITHM_SHA1, 8, &secret, None, 0);
         assert_eq!(
@@ -1123,9 +1124,10 @@ mod tests {
     fn protected_access_code_cannot_be_replaced_or_cleared_without_validation() {
         let mut oath = applet();
         let mut rng = TestRng;
-        let mut key_bytes = [0u8; 20];
+        let mut key_bytes = Vec::<u8, 20>::new();
+        key_bytes.resize(20, 0).unwrap();
         rng.fill_bytes(&mut key_bytes);
-        let key = &key_bytes[..];
+        let key = key_bytes.as_slice();
         let challenge = b"abcdefgh";
         let mut body = Vec::<u8, 128>::new();
         let mut descriptor = Vec::<u8, 32>::new();

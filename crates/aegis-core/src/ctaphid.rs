@@ -373,23 +373,28 @@ mod tests {
     #[test]
     fn init_allocates_or_resynchronizes_on_the_origin_channel() {
         let mut next = 1;
-        let nonce = b"12345678";
-        let reply = init_response(BROADCAST_CHANNEL, nonce, &mut next, 0x0D).unwrap();
+        let nonce: [u8; 8] = core::array::from_fn(|index| index as u8);
+        let reply = init_response(BROADCAST_CHANNEL, &nonce, &mut next, 0x0D).unwrap();
         assert_eq!(&reply[..8], nonce);
         assert_eq!(&reply[8..12], &1u32.to_be_bytes());
         assert_eq!(reply[16], 0x0D);
         assert_eq!(next, 2);
-        let reply = init_response(1, nonce, &mut next, 0x0D).unwrap();
+        let reply = init_response(1, &nonce, &mut next, 0x0D).unwrap();
         assert_eq!(&reply[8..12], &1u32.to_be_bytes());
         assert_eq!(next, 2);
         assert!(!allocated_channel(0, next));
         assert!(!allocated_channel(BROADCAST_CHANNEL, next));
         assert_eq!(
-            init_response(3, nonce, &mut next, 0x0D),
+            init_response(3, &nonce, &mut next, 0x0D),
             Err(CtapHidError::InvalidChannel)
         );
         assert_eq!(
-            init_response(BROADCAST_CHANNEL, b"short", &mut next, 0x0D),
+            init_response(
+                BROADCAST_CHANNEL,
+                &core::array::from_fn::<u8, 5, _>(|index| index as u8),
+                &mut next,
+                0x0D
+            ),
             Err(CtapHidError::InvalidLen)
         );
     }
