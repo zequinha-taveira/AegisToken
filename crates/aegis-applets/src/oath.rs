@@ -1120,7 +1120,9 @@ mod tests {
     fn protected_access_code_cannot_be_replaced_or_cleared_without_validation() {
         let mut oath = applet();
         let mut rng = TestRng;
-        let key = b"12345678901234567890";
+        let mut key_bytes = [0u8; 20];
+        rng.fill_bytes(&mut key_bytes);
+        let key = &key_bytes[..];
         let challenge = b"abcdefgh";
         let mut body = Vec::<u8, 128>::new();
         let mut descriptor = Vec::<u8, 32>::new();
