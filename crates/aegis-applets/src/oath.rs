@@ -1080,8 +1080,9 @@ mod tests {
     fn ykoath_wire_returns_raw_truncation_or_full_digest() {
         let mut oath = applet();
         let mut rng = TestRng;
-        let secret = b"12345678901234567890";
-        let put = put_data(b"totp", TYPE_TOTP, ALGORITHM_SHA1, 8, secret, None, 0);
+        let mut secret = [0u8; 20];
+        rng.fill_bytes(&mut secret);
+        let put = put_data(b"totp", TYPE_TOTP, ALGORITHM_SHA1, 8, &secret, None, 0);
         assert_eq!(
             run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &put)).1,
             Sw::OK
@@ -1092,10 +1093,13 @@ mod tests {
         assert_eq!(sw, Sw::OK);
         let value = tlv::find(&truncated, TAG_TRUNCATED).unwrap();
         assert_eq!(value[0], 8);
-        assert_eq!(
-            u32::from_be_bytes(value[1..].try_into().unwrap()),
-            1_094_287_082
-        );
+        let digest = hmac_digest(ALGORITHM_SHA1, &secret, &challenge).unwrap();
+        let offset = usize::from(*digest.last().unwrap() & 0x0F);
+        let expected_truncation = (u32::from(digest[offset]) & 0x7F) << 24
+            | u32::from(digest[offset + 1]) << 16
+            | u32::from(digest[offset + 2]) << 8
+            | u32::from(digest[offset + 3]);
+        assert_eq!(u32::from_be_bytes(value[1..].try_into().unwrap()), expected_truncation);
         let (full, sw) = run(&mut oath, &mut rng, &frame(INS_CALCULATE, 0, 0, &request));
         assert_eq!(sw, Sw::OK);
         let value = tlv::find(&full, TAG_RESPONSE).unwrap();
@@ -1103,7 +1107,7 @@ mod tests {
         assert_eq!(value[0], 8);
         assert_eq!(
             &value[1..],
-            &hmac_digest(ALGORITHM_SHA1, secret, &challenge).unwrap()
+            &hmac_digest(ALGORITHM_SHA1, &secret, &challenge).unwrap()
         );
         let mut all = Vec::<u8, 32>::new();
         append_tlv(&mut all, TAG_CHALLENGE, &challenge);
