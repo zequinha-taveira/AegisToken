@@ -1537,6 +1537,7 @@ mod tests {
             (ALG_AES256, 32usize),
         ] {
             let mut key = [0u8; 32];
+            rng.fill_bytes(&mut key);
             key[..key_len].copy_from_slice(&key_bytes[..key_len]);
             let aes = MgmtKey {
                 algorithm,
