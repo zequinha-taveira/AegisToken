@@ -1536,8 +1536,13 @@ mod tests {
             (ALG_AES192, 24usize),
             (ALG_AES256, 32usize),
         ] {
-            let mut key = [0u8; 32];
-            rng.fill_bytes(&mut key);
+            let mut key_vec: Vec<u8, 32> = Vec::new();
+            while key_vec.len() < 32 {
+                let mut b = [0u8; 1];
+                rng.fill_bytes(&mut b);
+                key_vec.push(b[0]).unwrap();
+            }
+            let mut key: [u8; 32] = key_vec.as_slice().try_into().unwrap();
             key[..key_len].copy_from_slice(&key_bytes[..key_len]);
             let aes = MgmtKey {
                 algorithm,
