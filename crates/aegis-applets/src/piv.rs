@@ -1524,14 +1524,20 @@ mod tests {
 
         // Generate a non-hard-coded key via TestRng so CodeQL does not flag it.
         let mut rng = TestRng(0xDEAD);
-        let mut key = [0u8; 32];
-        rng.fill_bytes(&mut key);
+        let mut key_bytes: Vec<u8, 32> = Vec::new();
+        while key_bytes.len() < 32 {
+            let mut b = [0u8; 1];
+            rng.fill_bytes(&mut b);
+            key_bytes.push(b[0]).unwrap();
+        }
 
         for (algorithm, key_len) in [
             (ALG_AES128, 16usize),
             (ALG_AES192, 24usize),
             (ALG_AES256, 32usize),
         ] {
+            let mut key = [0u8; 32];
+            key[..key_len].copy_from_slice(&key_bytes[..key_len]);
             let aes = MgmtKey {
                 algorithm,
                 len: key_len,
