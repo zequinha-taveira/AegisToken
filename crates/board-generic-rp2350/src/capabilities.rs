@@ -21,6 +21,13 @@ use embassy_rp::pac;
 /// identifiers to board vendors
 /// (<https://github.com/raspberrypi/usb-pid>).
 pub const RASPBERRY_PI_VENDOR_ID: u16 = 0x2E8A;
+/// Yubico VID used only by the explicitly authorized laboratory profile.
+pub const YUBICO_VENDOR_ID: u16 = 0x1050;
+/// YubiKey 5-style OTP+FIDO+CCID composition, laboratory identity only.
+///
+/// The OTP-labelled HID endpoint uses an AegisToken experimental read-only
+/// protocol; the PID does NOT imply commercial Yubico OTP compatibility.
+pub const YUBIKEY5_LAB_PRODUCT_ID: u16 = 0x0407;
 
 /// Conservative flash capacity used when the exact size is not declared.
 ///
@@ -108,6 +115,25 @@ impl BoardProfile {
             0,
             DEFAULT_VENDOR_ID,
             DEFAULT_PRODUCT_ID,
+        ),
+        hardware: BoardHardwareProfile::new(
+            LedProfile::configurable_gpio(25, false, GENERIC_LED_CANDIDATES),
+            PresenceProfile::bootsel(DEFAULT_DEBOUNCE_MS, DEFAULT_TIMEOUT_MS),
+            FlashProfile::new(CONSERVATIVE_FLASH_BYTES),
+        ),
+    };
+    /// Authorized laboratory identity profile. This keeps the same hardware
+    /// and universal-image behavior as `GENERIC`, but presents a Yubico
+    /// YubiKey 5-style VID/PID for interoperability experiments only.
+    /// Never use this profile for a distributable production image.
+    pub const YUBIKEY5_LAB: Self = Self {
+        identity: BoardIdentity::new(
+            "Yubico",
+            "YubiKey 5 Series OTP+FIDO+CCID",
+            "YubiKey 5 Lab",
+            0,
+            YUBICO_VENDOR_ID,
+            YUBIKEY5_LAB_PRODUCT_ID,
         ),
         hardware: BoardHardwareProfile::new(
             LedProfile::configurable_gpio(25, false, GENERIC_LED_CANDIDATES),
@@ -255,6 +281,7 @@ const fn assert_profile_invariants(profile: &BoardProfile) {
 
 const _: () = {
     assert_profile_invariants(&BoardProfile::GENERIC);
+    assert_profile_invariants(&BoardProfile::YUBIKEY5_LAB);
 
     let mut left = 0;
     while left < THIRD_PARTY_PROFILES.len() {
@@ -279,6 +306,8 @@ const _: () = {
 
     // The generic carrier must not collide with a sub-licensed third-party id.
     assert!(BoardProfile::GENERIC.identity.vendor_id != RASPBERRY_PI_VENDOR_ID);
+    assert!(BoardProfile::YUBIKEY5_LAB.identity.vendor_id == YUBICO_VENDOR_ID);
+    assert!(BoardProfile::YUBIKEY5_LAB.identity.product_id == YUBIKEY5_LAB_PRODUCT_ID);
 };
 
 /// Read the JEDEC JEP-106 chip identifier.
@@ -339,6 +368,14 @@ mod tests {
         assert_eq!(profile.identity.vendor_id, DEFAULT_VENDOR_ID);
         assert_eq!(profile.identity.product_id, DEFAULT_PRODUCT_ID);
         assert!(profile.hardware.led.available());
+    }
+
+    #[test]
+    fn lab_profile_identity_names_its_three_usb_interfaces() {
+        let identity = BoardProfile::YUBIKEY5_LAB.identity;
+        assert_eq!(identity.vendor_id, YUBICO_VENDOR_ID);
+        assert_eq!(identity.product_id, 0x0407);
+        assert!(identity.product.contains("OTP+FIDO+CCID"));
     }
 
     #[test]

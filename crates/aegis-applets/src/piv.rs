@@ -675,9 +675,7 @@ impl<S: PivStore> Piv<S> {
                 }
                 let result = self.pin.verify(apdu.data);
                 self.persist_pin();
-                if result.is_ok() {
-                    self.pin_verified = true;
-                }
+                self.pin_verified = result.is_ok();
                 result
             }
             REF_PUK => {
@@ -1700,6 +1698,27 @@ mod tests {
         // The empty VERIFY reports the remaining attempts.
         let (_, sw) = run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &[]));
         assert_eq!(sw, Sw::retries_left(1));
+    }
+
+    #[test]
+    fn incorrect_verify_revokes_an_earlier_pin_authorization() {
+        let mut piv = applet();
+        let mut rng = TestRng(3);
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &PIN)).1,
+            Sw::OK
+        );
+        assert!(piv.pin_verified);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN)
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        assert!(!piv.pin_verified);
     }
 
     #[test]
