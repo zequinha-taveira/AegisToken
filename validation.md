@@ -543,8 +543,26 @@ staging), não na região do store de credenciais (`0x136000`), e apenas sob a
 feature `selftest` (fora das imagens padrão de `scripts/build-uf2.ps1`). Ele
 não é via de leitura de credenciais em Recovery.
 
-### Gate de release: a chave de update de desenvolvimento nunca é distribuída (host)
+### Estado de asserção pendente é restrito ao canal CTAPHID (host)
 
+A continuação de `authenticatorGetNextAssertion` fica em
+`aegis-core::assertion` (lógica pura, testável em host): o estado é criado
+apenas para uma requisição que produziu assinatura e é indexado pelo **canal
+CTAPHID** que a iniciou. Uma segunda aplicação no mesmo host recebe
+`NoCredentials` — sem id de credencial, sem user handle e sem a assinatura de
+um `clientDataHash` que não enviou.
+
+| Verificação | Resultado |
+|-------------|-----------|
+| `cargo test -p aegis-core assertion` | 4 testes aprovados |
+| Canal diferente tenta continuar | `None` (o dono da asserção ainda consegue continuar) |
+| Credenciais servidas em ordem | primeira, segunda; depois `None` |
+| Contexto preservado (`rp_id`, `clientDataHash`, `uv`) | verificado |
+
+**Limitação:** a validação em hardware (dois canais CTAPHID contra o firmware
+flashado) permanece pendente — não há RP2350 físico nesta sessão.
+
+### Gate de release: a chave de update de desenvolvimento nunca é distribuída (host)
 Verificado por testes de host em `crates/aegis-build-support` e por execução
 real do build (a spec é `specs/release-requires-vendor-key.md`):
 

@@ -74,6 +74,12 @@ The `pinUvAuthToken` is a live proof of user verification and is scoped:
 - **The token does not outlive the PIN.** `changePIN` and
   `authenticatorReset` invalidate the active token: its secret, its
   permissions and its relying-party binding are dropped.
+- **A pending assertion belongs to the channel that started it.** The
+  `authenticatorGetNextAssertion` continuation state is keyed by the CTAPHID
+  channel: another application on the same host cannot continue an assertion it
+  never asked for, and receives no credential id or user handle. The state is
+  only created for a request that produced a signature
+  (`aegis-core::assertion`, host-tested).
 - **The scope check is pure core logic.** It lives in `aegis-core` (`pin` and
   `authenticator`), with no HAL, executor or storage dependency; the firmware
   only hands over the relying party, the credential id and the `rpIdHash` of

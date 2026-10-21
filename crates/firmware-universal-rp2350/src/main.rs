@@ -685,36 +685,6 @@ struct EnumerationState {
     credential_index: usize,
 }
 
-/// State of the last assertion, kept for `authenticatorGetNextAssertion`.
-///
-/// The CTAP2.1 flow returns one credential per command: the platform asks
-/// for the next one while the authenticator still remembers the request.
-struct AssertionState {
-    /// Credentials that matched the request, in order.
-    credentials:
-        heapless::Vec<heapless::Vec<u8, 32>, { aegis_core::authenticator::MAX_CREDENTIALS }>,
-    /// Index of the next credential to return.
-    index: usize,
-    /// Relying party of the last assertion.
-    rp_id: aegis_core::configuration::FixedString<64>,
-    /// Client data hash of the last assertion.
-    client_data_hash: [u8; 32],
-    /// Whether user verification was performed.
-    uv: bool,
-}
-
-impl Default for AssertionState {
-    fn default() -> Self {
-        Self {
-            credentials: heapless::Vec::new(),
-            index: 0,
-            rp_id: aegis_core::configuration::FixedString::new("").expect("empty string fits"),
-            client_data_hash: [0u8; 32],
-            uv: false,
-        }
-    }
-}
-
 /// State shared by the CTAP2 commands of one FIDO session.
 struct FidoSession {
     /// PIN/UV auth handler.
@@ -722,7 +692,7 @@ struct FidoSession {
     /// Credential-management enumeration cursor.
     enumeration: EnumerationState,
     /// Pending assertion, for `authenticatorGetNextAssertion`.
-    assertion: Option<AssertionState>,
+    assertion: Option<aegis_core::assertion::PendingAssertion>,
 }
 
 impl FidoSession {
@@ -990,17 +960,20 @@ where
             // A token used in an operation that tests user presence loses
             // its permissions.
             client_pin.close_user_presence_operation(uv, response.is_ok());
-            // Remember the request so `authenticatorGetNextAssertion` can
-            // serve the remaining credentials.
-            session.assertion = Some(AssertionState {
-                credentials: candidates,
-                index: 1,
-                rp_id: request.rp_id.clone(),
-                client_data_hash: request.client_data_hash,
-                uv,
-            });
             match response {
-                Ok(response) => encode_response(&response, out),
+                Ok(response) => {
+                    // The pending assertion is remembered only for a request
+                    // that produced a signature, and only for the channel
+                    // that asked for it.
+                    session.assertion = Some(aegis_core::assertion::PendingAssertion::begin(
+                        chan.channel,
+                        candidates,
+                        request.rp_id.clone(),
+                        request.client_data_hash,
+                        uv,
+                    ));
+                    encode_response(&response, out)
+                }
                 Err(status) => write_status(status, out),
             }
         }
@@ -1009,15 +982,16 @@ where
             let Some(state) = session.assertion.as_mut() else {
                 return write_status(ctap2::Ctap2Status::NoCredentials, out);
             };
-            let Some(next) = state.credentials.get(state.index).cloned() else {
+            let Some(next) = state.next(chan.channel) else {
                 return write_status(ctap2::Ctap2Status::NoCredentials, out);
             };
-            state.index += 1;
-            let rp_id = state.rp_id.clone();
-            let client_data_hash = state.client_data_hash;
-            let uv = state.uv;
-            match authenticator::sign_assertion(store, &next, rp_id.as_str(), &client_data_hash, uv)
-            {
+            match authenticator::sign_assertion(
+                store,
+                &next.credential_id,
+                next.rp_id.as_str(),
+                &next.client_data_hash,
+                next.uv,
+            ) {
                 Ok(response) => encode_response(&response, out),
                 Err(status) => write_status(status, out),
             }

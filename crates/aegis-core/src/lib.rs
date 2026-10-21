@@ -8,6 +8,7 @@
 //! integrity-protected records, contextual User Presence with replay
 //! protection, hardware-abstraction traits and the error taxonomy.
 
+pub mod assertion;
 pub mod authenticator;
 pub mod capabilities;
 pub mod codec;
