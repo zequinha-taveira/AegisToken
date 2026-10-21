@@ -107,13 +107,29 @@ ES256**. Gere a chave de release e injete a pública no build:
 python scripts/gen-update-key.py release-update-key.pem
 # copie a chave pública (hex) e:
 $env:AEGIS_UPDATE_VENDOR_PUBKEY="<hex>"
-cargo build -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf --release
-& scripts/build-uf2.ps1
+& scripts/build-uf2.ps1 -Release
 ```
 
 Sem `AEGIS_UPDATE_VENDOR_PUBKEY`, o build usa uma chave de **desenvolvimento**
 (o firmware registra `warning: development firmware-update vendor key in use`).
 Nunca libere uma imagem com a chave de desenvolvimento.
+
+### Gate de release
+
+`-Release` (ou `AEGIS_RELEASE=1`) transforma a chave de desenvolvimento em
+**erro de build**: a imagem é rejeitada antes de ser gerada se a chave estiver
+ausente, malformada ou for a chave de desenvolvimento (o ponto gerador do
+P-256, cuja chave privada é o número 1 — pública por definição). O gate está
+no `build.rs` e é exercitado por testes de host em `crates/aegis-build-support`.
+
+```powershell
+# falha esperado: sem a chave de produção
+& scripts/build-uf2.ps1 -Release
+# AEGIS_RELEASE=1 requires a production firmware-update vendor key ...
+```
+
+O CI usa `-Release` nas **tags versionadas** (o job de nightly continua em
+modo de desenvolvimento, com o aviso embutido e a nota no release).
 
 ## U2F_REGISTER (atestação)
 

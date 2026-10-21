@@ -28,6 +28,33 @@ jobs:
         run: cargo clippy -p aegis-applets --all-targets -- -D warnings
       - name: Test (applets)
         run: cargo test -p aegis-applets
+      - name: Clippy (build support)
+        run: cargo clippy -p aegis-build-support --all-targets -- -D warnings
+      - name: Test (build support)
+        run: cargo test -p aegis-build-support
+
+  release-gate:
+    name: release gate (vendor key)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install target and components
+        run: |
+          rustup target add thumbv8m.main-none-eabihf
+          rustup component add rustfmt clippy
+      - name: Gate refuses the development key
+        env:
+          AEGIS_RELEASE: "1"
+        run: |
+          if cargo check -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf; then
+            echo "::error::The release gate must fail without AEGIS_UPDATE_VENDOR_PUBKEY."
+            exit 1
+          fi
+      - name: Gate accepts a production key
+        env:
+          AEGIS_RELEASE: "1"
+          AEGIS_UPDATE_VENDOR_PUBKEY: "04a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        run: cargo check -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf
 
   host-tool:
     name: host tool (aegistoken-host)

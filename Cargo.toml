@@ -9,6 +9,7 @@ members = [
     "crates/security-key-hal",
     "crates/aegis-applets",
     "crates/aegis-core",
+    "crates/aegis-build-support",
     "crates/aegistoken-host",
     "crates/board-generic-rp2350",
     "crates/firmware-universal-rp2350",
@@ -16,7 +17,7 @@ members = [
 # Only the host-testable crates are built by default so `cargo test` / `cargo build`
 # work on the host without an embedded target. Embedded crates are built
 # explicitly with `--target thumbv8m.main-none-eabihf` (see .cargo aliases).
-default-members = ["crates/aegis-core", "crates/aegis-applets"]
+default-members = ["crates/aegis-core", "crates/aegis-applets", "crates/aegis-build-support"]
 
 [workspace.package]
 version = "0.2.1"
@@ -28,6 +29,7 @@ authors = ["AegisToken"]
 [workspace.dependencies]
 aegis-applets = { path = "crates/aegis-applets" }
 aegis-core = { path = "crates/aegis-core" }
+aegis-build-support = { path = "crates/aegis-build-support" }
 # Default features off: consumers must pick exactly one chip target
 # (`rp235xa`/`rp235xb`, or the `rp2354a`/`rp2354b` aliases).
 board-generic-rp2350 = { path = "crates/board-generic-rp2350", default-features = false }

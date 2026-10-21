@@ -9,6 +9,8 @@ test-core = "test -p aegis-core"
 clippy-core = "clippy -p aegis-core --all-targets -- -D warnings"
 test-applets = "test -p aegis-applets"
 clippy-applets = "clippy -p aegis-applets --all-targets -- -D warnings"
+test-build-support = "test -p aegis-build-support"
+clippy-build-support = "clippy -p aegis-build-support --all-targets -- -D warnings"
 
 [env]
 DEFMT_LOG = "debug"

@@ -15,6 +15,22 @@ contextual, and secrets are never exported or logged.
   power/side-channel analysis and flash decapsulation are not mitigated
   beyond the OTP/secure-boot hardening above.
 
+## Firmware update key
+
+- **The development update key is public by construction.** It is the P-256
+  generator point, so its private key is the number 1: anyone can sign a
+  package that such an image accepts. It exists only as a trap for images
+  built without a real key.
+- **A distributable image may not embed it.** The build refuses to produce a
+  release image with the development key: `-Release` (or `AEGIS_RELEASE=1`)
+  turns the "development key in use" warning into a build error, whether the
+  key was omitted or passed explicitly. The policy lives in
+  `crates/aegis-build-support` and is covered by host tests; the boot warning
+  remains the last defense for images that were already flashed.
+- **The key is public material.** It is derived from the environment at build
+  time and never committed; the message that rejects a bad key never prints
+  it.
+
 ## Backup scope
 
 - **Seed backup covers the deterministic identity only.** Restoring a seed

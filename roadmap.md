@@ -440,6 +440,31 @@ adiado.
 - Enumeração de credenciais (enumerateRPs/Credentials) e `changePIN` ficam para
   uma fatia incremental.
 
+### 7d — CTAP1/U2F (concluída)
+
+**Entregáveis**
+
+- `aegis-core::u2f`: parsing de APDU estendido, palavras de status U2F e
+  resposta `data || SW1 SW2`.
+- `U2F_VERSION` (`U2F_V2`) e `U2F_AUTHENTICATE` nos modos check-only (P1=0x07)
+  e sign (P1=0x03), este último exigindo User Presence e assinando
+  `0x00 || appParam || UP || counter || challenge` com a chave da credencial.
+- `authenticator::sign_message` compartilhado entre CTAP2 e U2F.
+- Firmware: CTAPHID `MSG` roteado para o handler U2F; presença solicitada
+  apenas no authenticate de assinatura; `getInfo` anuncia `U2F_V2`; CTAPHID
+  passa a anunciar NMSG (capabilities `0x0D`).
+
+**Critério de saída**
+
+- 134 testes de host aprovados (6 novos de U2F, com verificação de assinatura),
+  clippy limpo, build de firmware e `rp2350-universal.uf2` gerado.
+
+**Pendência**
+
+- `U2F_REGISTER` requer certificado de atestação (chave de atestação
+  provisionada) e retorna `SW_INS_NOT_SUPPORTED`; fica para a fase de
+  atestação/provisionamento.
+
 ### 7e — Credential management CTAP2.1 e `changePIN` (concluída)
 
 **Entregue**
@@ -525,56 +550,7 @@ adiado.
 - Com PIN configurado, clientes que não provem o PIN recebem `PinRequired`:
   é o comportamento esperado, mas exige que o validador use `--pin`.
 
-### 7g — Escopo do `pinUvAuthToken` (permissão por operação + vínculo por RP) (concluída)
-
-**Entregue**
-
-- **Correção de segurança:** o `pinUvAuthToken` passa a ser escopado. A
-  verificação usada em `makeCredential`/`getAssertion` combina o HMAC do
-  `clientDataHash`, a **permissão exigida pela operação** (`mc` em
-  `makeCredential`, `ga` em `getAssertion`) e a comparação do *permissions RP
-  ID* com o `rp.id` da requisição. Token sem vínculo de RP serve qualquer RP;
-  token vinculado a `R` serve apenas `R` (comparação exata e sensível a
-  caixa). Falha → `PinAuthInvalid` (0x33), **abortando a operação antes de
-  qualquer efeito**: nenhuma credencial criada, nenhuma asserção assinada,
-  nenhuma credencial removida e a flag `UV` não gravada no `authenticatorData`.
-- `aegis-core::pin`: `token_permissions`, `token_rp_id`,
-  `verify_scoped_auth_param`, `allows_enumerate_rps`,
-  `allows_enumerate_credentials` e `allows_delete_credential`. As primitivas
-  `verify_pin_uv_auth_param` (verificação pura do HMAC) e
-  `allows_credential_management` (capacidade `cm`) permanecem com a semântica
-  anterior — **substituídas na fatia 7h** pela API única `authorize`.
-- `aegis-core::authenticator`: `rp_in_scope` e `delete_credential_scoped` — a
-  credencial apagada precisa pertencer ao RP vinculado ao token; credencial de
-  outro RP é recusada e **preservada** no store.
-- `enumerateRPsBegin` passa a exigir token com capacidade `cm` **sem** RP
-  vinculado (a enumeração de RPs é global); `enumerateCredentialsBegin` exige
-  que o `rpIdHash` pedido seja o do RP vinculado.
-
-**Verificação**
-
-- 239 testes de host em `aegis-core` (11 novos: escopo por operação, escopo
-  por RP, token sem vínculo, compatibilidade do token legado, `enumerateRPs`,
-  `enumerateCredentials`, `deleteCredential`, permissões suportadas e
-  invalidação pelo `changePIN`), clippy limpo em host e alvo, build de firmware
-  e UF2 gerados.
-
-**Limitações registradas**
-
-- ~~O token do `getPinToken` legado continua sem vínculo de RP e concede
-  `mc|ga`: a proteção de escopo por RP só existe para tokens emitidos por
-  `getPinUvAuthTokenUsingPinWithPermissions` com `rpId` (compatibilidade
-  CTAP2.0).~~ **Revisto na fatia 7h:** o token sem *permissions RP ID* é
-  vinculado ao RP do **primeiro uso** (§6.5.5.7), inclusive o legado.
-- ~~O token legado continua autorizando credential management (o PIN já foi
-  provado); a CTAP2.1 estrita exigiria `cm` explícito.~~ **Entregue na fatia
-  7h:** o token legado concede apenas `mc|ga` e nunca autoriza credential
-  management.
-- A validação de ponta a ponta em dispositivo físico (token com permissão ou
-  RP errada contra o firmware flashed) está pendente: não há RP2350 físico
-  nesta sessão. `scripts/validate_fido.py` é o candidato natural.
-
-### 7h — Escopo e ciclo de vida do `pinUvAuthToken` (CTAP2.1) (concluída)
+### 7g — Escopo e ciclo de vida do `pinUvAuthToken` (CTAP2.1) (concluída)
 
 **Entregue**
 
@@ -649,30 +625,30 @@ adiado.
   primeiro uso, como manda a nota de §6.5.5.7, em vez de a emissão ser
   recusada — recusar quebraria plataformas que pedem `mc`/`ga` sem `rpId`.
 
-### 7d — CTAP1/U2F (concluída)
+### 7h — Gating por destino de boot (`BootPlan`) (concluída)
 
-**Entregáveis**
+**Entregue (mesmo conjunto de mudanças da fatia 7g)**
 
-- `aegis-core::u2f`: parsing de APDU estendido, palavras de status U2F e
-  resposta `data || SW1 SW2`.
-- `U2F_VERSION` (`U2F_V2`) e `U2F_AUTHENTICATE` nos modos check-only (P1=0x07)
-  e sign (P1=0x03), este último exigindo User Presence e assinando
-  `0x00 || appParam || UP || counter || challenge` com a chave da credencial.
-- `authenticator::sign_message` compartilhado entre CTAP2 e U2F.
-- Firmware: CTAPHID `MSG` roteado para o handler U2F; presença solicitada
-  apenas no authenticate de assinatura; `getInfo` anuncia `U2F_V2`; CTAPHID
-  passa a anunciar NMSG (capabilities `0x0D`).
+- `aegis-core::state::BootPlan`: política única do boot, derivada do destino
+  (`aegis_core::state::boot_destination`). Só `Active` habilita FIDO e CCID;
+  `Management` (diagnóstico e update) e a HID OTP de laboratório ficam
+  disponíveis em todos os destinos; qualquer estado que não seja destino de
+  boot produz o plano fechado.
+- Firmware: as tarefas `fido_task`/`ccid_task` só arrancam quando o plano
+  autoriza, e os stores selados (credenciais do FIDO e applets) só são abertos
+  no caminho habilitado — o que fecha o invariante "Recovery nega FIDO/CCID e
+  credenciais" (AGENTS.md), que antes valia só no domínio e não no *wiring*.
 
-**Critério de saída**
+**Verificação**
 
-- 134 testes de host aprovados (6 novos de U2F, com verificação de assinatura),
-  clippy limpo, build de firmware e `rp2350-universal.uf2` gerado.
+- 8 testes de host em `aegis-core::state` (`boot_plan_*`), clippy limpo em host e
+  alvo, build de firmware gerado.
 
-**Pendência**
+**Limitações registradas**
 
-- `U2F_REGISTER` requer certificado de atestação (chave de atestação
-  provisionada) e retorna `SW_INS_NOT_SUPPORTED`; fica para a fase de
-  atestação/provisionamento.
+- As interfaces FIDO/CCID **continuam enumerando** em `Recovery`/`Locked`: elas
+  não respondem, mas o host ainda as vê. Suprimir a enumeração exige mudar a
+  descritorização USB, o que fica para uma fatia própria.
 
 ## Fase 7 — requisitos
 
@@ -710,7 +686,11 @@ adiado.
   esquema de partições e do bootrom; nesta fase a imagem é validada e deixada
   em staging.
 - `VENDOR_PUBLIC_KEY` no firmware é um placeholder de desenvolvimento e deve ser
-  substituído pela chave de release.
+  substituído pela chave de release. **Endereçado por gate de build:** o
+  `build.rs` falha quando `AEGIS_RELEASE=1` (usado por
+  `scripts/build-uf2.ps1 -Release` e pelo job de release versionada do CI) e a
+  chave embutida seria a de desenvolvimento — a política vive em
+  `crates/aegis-build-support` (`specs/release-requires-vendor-key.md`).
 
 ---
 

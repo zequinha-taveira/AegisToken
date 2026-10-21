@@ -36,7 +36,7 @@ Invariants: FIDO never depends on Keyboard/Management/CCID. CCID never reachable
 - Crypto: P-256/P-384/Ed25519/X25519 + RSA-2048 (PKCS#1 v1.5 only; no RSA-3072/PSS, no OpenPGP KDF). Private keys generated on-device, never exported/imported. OATH has no RTC — host supplies timestamp/counter.
 - Flash: 2 MiB minimum; applet region 19× 8 KiB two-slot stores (PIV meta + 10 objects, OATH 2+commit, OpenPGP 4+commit); `const assert` against `FlashLayout`.
 - PIV defaults (PIN `123456`, PUK `12345678`, 3DES mgmt key `0102..08`, CCC/CHUI) are spec interop vectors, not leaks.
-- DEV update key is embedded unless `AEGIS_UPDATE_VENDOR_PUBKEY` is set — never release such builds. Real secure boot/rollback enforced by RP2350 bootrom + OTP (production step, see `production.md`).
+- DEV update key is embedded unless `AEGIS_UPDATE_VENDOR_PUBKEY` is set — never release such builds; `-Release`/`AEGIS_RELEASE=1` makes the build fail instead (policy in `crates/aegis-build-support`). Real secure boot/rollback enforced by RP2350 bootrom + OTP (production step, see `production.md`).
 
 ## Loop de melhoria (agentes)
 

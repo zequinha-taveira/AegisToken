@@ -43,3 +43,7 @@ cortex-m-rt.workspace = true
 panic-probe.workspace = true
 defmt.workspace = true
 defmt-rtt.workspace = true
+
+[build-dependencies]
+# Host-side build policy (vendor key resolution and the release gate).
+aegis-build-support.workspace = true

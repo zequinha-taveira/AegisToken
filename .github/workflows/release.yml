@@ -74,7 +74,11 @@ jobs:
         env:
           AEGIS_UPDATE_VENDOR_PUBKEY: ${{ secrets.AEGIS_UPDATE_VENDOR_PUBKEY }}
         run: |
-          pwsh -NoProfile -File scripts/build-uf2.ps1 -Board universal
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            pwsh -NoProfile -File scripts/build-uf2.ps1 -Board universal -Release
+          else
+            pwsh -NoProfile -File scripts/build-uf2.ps1 -Board universal
+          fi
 
       - name: Publish nightly
         if: github.ref_type == 'branch'

@@ -34,6 +34,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-build-support"
+version = "0.2.1"
+dependencies = [
+ "p256",
+]
+
+[[package]]
 name = "aegis-core"
 version = "0.2.1"
 dependencies = [
@@ -1052,6 +1059,7 @@ name = "firmware-universal-rp2350"
 version = "0.2.1"
 dependencies = [
  "aegis-applets",
+ "aegis-build-support",
  "aegis-core",
  "board-generic-rp2350",
  "cortex-m",

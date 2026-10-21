@@ -61,7 +61,7 @@ Improvement loop (security hardening): `sec-audit` → `spec` → `impl` → `ga
 - FIDO path independent of Management/Keyboard/CCID. CCID never reachable from FIDO. Recovery denies FIDO/CCID/credentials (diagnostics + update only).
 - No new `unsafe` without justification. Readable first, no premature optimization.
 - `AnyPin::steal` for runtime LED GPIO is the single justified exception (one owner per pin); GPIO 0-5 (QSPI) never a candidate (compile-time enforced).
-- Never commit or log secrets (`*.pem`, `*.key`, PINs, seeds, OTP dumps — gitignored). Without `AEGIS_UPDATE_VENDOR_PUBKEY` build uses DEV update key: warn, never release.
+- Never commit or log secrets (`*.pem`, `*.key`, PINs, seeds, OTP dumps — gitignored). Without `AEGIS_UPDATE_VENDOR_PUBKEY` build uses DEV update key: warn, never release. A distributable image must be built with `& scripts/build-uf2.ps1 -Release` (or `AEGIS_RELEASE=1`), which fails the build instead of embedding the DEV key; the policy lives in `crates/aegis-build-support` and is covered by host tests.
 - PIV defaults in `crates/aegis-applets/src/piv.rs` (`DEFAULT_MGMT_KEY`, `DEFAULT_PIN`, `DEFAULT_PUK`, CCC/CHUI) are NIST SP 800-73-4 interop values. Do not flag as leaks, do not randomize.
 - No private-key import in applets (on-device generation only); only public material (certs) importable.
 - Tests mandatory for new/changed logic. Check existing test layout first (`cargo test -p aegis-core`, `-p aegis-applets`).

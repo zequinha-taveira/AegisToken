@@ -318,7 +318,9 @@ ou remapeamento para o driver HID genérico).
 - Chaves privadas e material sensível são ignorados pelo `.gitignore`
   (`*.pem`, `*.key`, etc.). Nunca faça commit de chaves.
 - Sem `AEGIS_UPDATE_VENDOR_PUBKEY`, o build embute uma chave de
-  **desenvolvimento** e registra um aviso — não libere imagens assim.
+  **desenvolvimento** e registra um aviso — não libere imagens assim. Para
+  uma imagem distribuível use `& scripts/build-uf2.ps1 -Release`: o build
+  **falha** se a chave de update for a chave de desenvolvimento.
 
 ## Licença
 

@@ -61,8 +61,10 @@ O artefato de release é publicado automaticamente pelo workflow
 2. Garanta os checks verdes: `cargo fmt --all --check`,
    `cargo clippy -p aegis-core --all-targets -- -D warnings`,
    `cargo test -p aegis-core`.
-3. (Opcional) Defina o segredo `AEGIS_UPDATE_VENDOR_PUBKEY` com a chave de
-   update de release.
+3. Defina o segredo `AEGIS_UPDATE_VENDOR_PUBKEY` com a chave de update de
+   release. É **obrigatório** para uma release versionada: o workflow compila
+   o artefato com `scripts/build-uf2.ps1 -Release`, que falha o build em vez de
+   embutir a chave de desenvolvimento.
 4. Crie e empurre a tag, por exemplo:
    ```powershell
    git tag v0.2.0

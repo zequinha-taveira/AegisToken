@@ -62,8 +62,10 @@ da vulnerabilidade. Crédito será atribuído mediante autorização do pesquisa
 - O workflow de release é acionado por tags `v*`; a tag precisa apontar para o
   commit atual de `main` e os artefatos UF2 são publicados no GitHub.
 - Imagens de produção devem ser construídas com
-  `AEGIS_UPDATE_VENDOR_PUBKEY`. Sem essa variável, o build usa uma chave de
-  desenvolvimento e não deve ser distribuído como release.
+  `AEGIS_UPDATE_VENDOR_PUBKEY` e `& scripts/build-uf2.ps1 -Release`. Sem a
+  chave, o build usa uma chave de desenvolvimento e não deve ser distribuído
+  como release; com o gate de release ativo, o build **falha** em vez de
+  embutir a chave de desenvolvimento.
 
 ## Observações de segurança do projeto
 
