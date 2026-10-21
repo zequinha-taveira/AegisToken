@@ -1,0 +1,2 @@
+cargo fmt --all --check &&
+cargo clippy -p aegis-core -p aegis-applets -p aegis-build-support -p aegistoken-host --all-targets -- -D warnings
