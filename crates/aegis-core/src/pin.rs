@@ -3,6 +3,12 @@
 //! Implements ECDH key agreement on P-256, AES-256-CBC payload encryption and
 //! HMAC-SHA-256 authentication, plus the PIN hash and retry accounting. PIN
 //! state is provided by a [`PinState`] implementation (in-memory or sealed).
+//!
+//! The issued `pinUvAuthToken` is scoped: [`ClientPin::authorize`] decides an
+//! operation from the HMAC of the message, the permission the operation needs
+//! (`mc`, `ga` or `cm`) and the relying party the token is bound to. A token
+//! used in an operation that tests user presence loses its permissions
+//! ([`ClientPin::close_user_presence_operation`]).
 
 use cbc::cipher::block_padding::NoPadding;
 use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
@@ -892,7 +898,7 @@ impl ClientPin {
                 .map_err(|_| Ctap2Status::Other)?;
             // The key agreement is dropped: the platform must renegotiate.
             self.agreement_private = None;
-            self.pin_uv_auth_token = None;
+            self.invalidate_token();
             return Err(if retries == 0 {
                 Ctap2Status::PinBlocked
             } else {

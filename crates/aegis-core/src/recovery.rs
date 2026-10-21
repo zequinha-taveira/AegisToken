@@ -8,7 +8,7 @@
 use crate::capabilities::DeviceCapabilities;
 use crate::error::CoreError;
 use crate::lifecycle::LifecycleState;
-use crate::state::{ExecutionState, fido_allowed};
+use crate::state::{BootPlan, ExecutionState, fido_allowed};
 
 /// Operations permitted in recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +60,15 @@ pub struct DiagnosticsReport {
     /// Flash capacity in bytes.
     #[n(7)]
     pub flash_size_bytes: u32,
+    /// Boot destination code ([`crate::state::ExecutionState`]).
+    #[n(8)]
+    pub boot_destination: u8,
+    /// Whether the FIDO path is served.
+    #[n(9)]
+    pub fido_enabled: bool,
+    /// Whether the CCID path is served.
+    #[n(10)]
+    pub ccid_enabled: bool,
 }
 
 impl DiagnosticsReport {
@@ -70,6 +79,7 @@ impl DiagnosticsReport {
         config_version: u16,
         staged: bool,
         capabilities: &DeviceCapabilities,
+        plan: BootPlan,
     ) -> Self {
         let mut parts = crate::VERSION.split('.');
         let mut next = || parts.next().and_then(|p| p.parse::<u8>().ok()).unwrap_or(0);
@@ -82,6 +92,9 @@ impl DiagnosticsReport {
             staged,
             gpio_count: capabilities.gpio_count,
             flash_size_bytes: capabilities.flash.size_bytes,
+            boot_destination: plan.destination() as u8,
+            fido_enabled: plan.fido(),
+            ccid_enabled: plan.ccid(),
         }
     }
 }
@@ -204,11 +217,28 @@ mod tests {
             1,
             false,
             &DeviceCapabilities::rp2350a(),
+            BootPlan::for_destination(ExecutionState::Active),
         );
         let mut buf = [0u8; 128];
         let length = crate::codec::encode_into(&report, &mut buf).unwrap();
         assert!(length > 0);
         assert_eq!(report.gpio_count, 30);
         assert_eq!(report.flash_size_bytes, 2 * 1024 * 1024);
+        assert!(report.fido_enabled);
+        assert!(report.ccid_enabled);
+    }
+
+    #[test]
+    fn diagnostics_report_shows_the_denied_paths_in_recovery() {
+        let report = DiagnosticsReport::current(
+            LifecycleState::Factory,
+            1,
+            false,
+            &DeviceCapabilities::rp2350a(),
+            BootPlan::for_destination(ExecutionState::Recovery),
+        );
+        assert!(!report.fido_enabled);
+        assert!(!report.ccid_enabled);
+        assert_eq!(report.boot_destination, ExecutionState::Recovery as u8);
     }
 }

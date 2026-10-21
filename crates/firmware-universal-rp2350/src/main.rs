@@ -48,7 +48,7 @@ use board_generic_rp2350::usb::{
 use board_generic_rp2350::watchdog::WatchdogHandle;
 use board_generic_rp2350::{Board, BoardParts, BoardProfile, DeviceManager, embassy_rp};
 use core::cell::RefCell;
-use defmt::{error, info};
+use defmt::{error, info, warn};
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_futures::join::join3;
@@ -180,7 +180,7 @@ async fn main(_spawner: Spawner) {
     if VENDOR_KEY_IS_DEV {
         info!("warning: development firmware-update vendor key in use");
     }
-    let bootsel_held = device.board.bootsel_pressed();
+    let bootsel_held = read_bootsel_stable(&mut device.board).await;
     let destination = aegis_core::state::boot_destination(bootsel_held);
     let plan = BootPlan::for_destination(destination);
     if aegis_core::ExecutionState::Boot
@@ -205,6 +205,9 @@ async fn main(_spawner: Spawner) {
     let initial_config = load_config(&mut device.board, &caps, identity);
     let mut management =
         ManagementService::new(caps, identity, initial_config, LifecycleState::Factory);
+    // The diagnostics report shows the boot plan, so a device muted by the
+    // plan can be told apart from a broken one.
+    management.set_boot_plan(plan);
 
     // Apply the persisted LED configuration so the status LED reflects the
     // stored behavior from the moment the device boots.
@@ -281,6 +284,32 @@ async fn main(_spawner: Spawner) {
         ),
     )
     .await;
+}
+
+/// Number of BOOTSEL samples read at boot.
+const BOOTSEL_SAMPLES: u32 = 3;
+
+/// Read the BOOTSEL button at boot, requiring a stable level.
+///
+/// The button decides the boot destination, and a destination of `Recovery`
+/// mutes the FIDO and CCID paths: a single glitch on the pad would leave a
+/// device that enumerates but never answers. The pad is therefore sampled a
+/// few times; an unstable reading is treated as "not pressed" and logged.
+async fn read_bootsel_stable<const FLASH_SIZE: usize>(board: &mut Board<FLASH_SIZE>) -> bool {
+    let pressed = board.bootsel_pressed();
+    let mut stable = true;
+    for _ in 1..BOOTSEL_SAMPLES {
+        Timer::after_millis(1).await;
+        let sample = board.bootsel_pressed();
+        if sample != pressed {
+            stable = false;
+        }
+    }
+    if !stable {
+        warn!("BOOTSEL reading unstable at boot; treating it as released");
+        return false;
+    }
+    pressed
 }
 
 /// Short label of a boot destination, for the boot log.
