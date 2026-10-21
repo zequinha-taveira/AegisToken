@@ -1131,7 +1131,9 @@ linha de comando (`aegistoken-host`) e estruturando a base tecnológica do futur
 
 **Pendências e próximos passos**
 
-- **Etapa 2.4:** Subcomando OATH/TOTP no CLI.
+- **Etapa 2.4 entregue:** subcomando OATH/TOTP no CLI (`oath list|code|add|delete|reset`
+  em `crates/aegistoken-host/src/oath_cmd.rs`, com parsing de `otpauth://` e testes de
+  host).
 - **Etapa 2.5:** Avaliação do `nusb`.
 - **Eixo 3:** Protótipo do Desktop Manager em Rust (`tauri` v2).
 

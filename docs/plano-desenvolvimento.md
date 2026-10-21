@@ -54,11 +54,13 @@ O foco deste plano é guiar a transição de um firmware validado em bancada par
     - `piv-set-mgmt-key <NEW_KEY_HEX> [READER]`: substituição da chave de gestão com suporte a 3DES (24B), AES-128 (16B), AES-192 (24B) e AES-256 (32B) via protocolo Yubico extension `SET MANAGEMENT KEY`.
     - Autenticação de Management Key (`authenticate_mgmt`) implementada via desafio e decifragem de nonce ECB (3DES e AES).
   - 4 novos testes unitários adicionados cobrindo resolução de slots PIV, extração de TLV de certificado, decifragem TDES/AES e parsing de certificados PEM/DER. Total de 15 testes aprovados no `aegistoken-host`.
-- **Etapa 2.4: Gestão de Contas OATH/TOTP**
-  - Implementar subcomando `aegistoken-host oath`:
-    - `list`: listar contas configuradas.
-    - `code <nome>`: calcular código TOTP (injetando o timestamp atual do host via relógio do sistema).
-    - `add <uri>`: cadastrar novas credenciais TOTP/HOTP a partir de URIs `otpauth://`.
+- **Etapa 2.4: Gestão de Contas OATH/TOTP — [CONCLUÍDA]**
+  - Subcomando `aegistoken-host oath` implementado em `crates/aegistoken-host/src/oath_cmd.rs`:
+    - `oath list`: listar contas configuradas.
+    - `oath code <nome>`: calcular código TOTP (timestamp do host).
+    - `oath add <uri>`: cadastrar novas credenciais TOTP/HOTP a partir de URIs `otpauth://`.
+    - `oath delete <nome>` e `oath reset`: remover credencial / reiniciar o applet.
+  - Parsing de `otpauth://` coberto por testes de host no crate `aegistoken-host`.
 - **Etapa 2.5: Avaliação do `nusb` para eliminação de dependências C**
   - Avaliar a substituição do `rusb` (que compila a `libusb` C) pelo **`nusb`** (Rust puro, MIT OR Apache-2.0), simplificando cross-compilação e empacotamento em Windows/Linux/macOS sem toolchains C adicionais.
 

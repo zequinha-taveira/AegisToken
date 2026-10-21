@@ -41,7 +41,19 @@ Firmware (default rp2350a, board profiles via `AEGIS_BOARD` or `-BoardProfile`):
 
 Python validators: `validate_management.py` (AC-003..009), `validate_fido.py` (AC-002/011/013/020), `validate_ccid.py` (AC-016), `validate_piv.py` (AC-017/021), `validate_oath.py` (AC-018), `validate_openpgp.py` (AC-019/021).
 
-Workflows (on demand): `/gates` runs the gates, `/spec <slice>` implements a roadmap slice spec-first; skills `aegis-gates` and `aegis-spec`, subagents `gates` and `review`.
+Workflows (on demand): `/gates` runs the gates, `/spec <slice>` writes a slice spec spec-first. Both delegate to the subagents in `.opencode/agents/`:
+
+| Agent | Role |
+|-------|------|
+| `sec-audit` | Finds invariant violations, secret leakage and path-isolation breaks (read-only) |
+| `spec` | Writes `specs/<slice>.md` (threat, invariants, acceptance criteria, test plan) |
+| `impl` | Implements one approved slice plus mandatory host tests |
+| `gates` | Runs the validation gates and reports real pass/fail evidence |
+| `review` | Adversarial review of the change against the spec and the security model |
+
+Skills: `aegis-spec` (`.opencode/skills/aegis-spec`) and `aegis-gates` (`.opencode/skills/aegis-gates`).
+
+Improvement loop (security hardening): `sec-audit` → `spec` → `impl` → `gates` → `review` → commit on `development` (one logical change per commit), updating `roadmap.md` / `validation.md` / `docs/security-model.md` in the same change.
 
 ## Rules
 

@@ -37,6 +37,13 @@ Invariants: FIDO never depends on Keyboard/Management/CCID. CCID never reachable
 - PIV defaults (PIN `123456`, PUK `12345678`, 3DES mgmt key `0102..08`, CCC/CHUI) are spec interop vectors, not leaks.
 - DEV update key is embedded unless `AEGIS_UPDATE_VENDOR_PUBKEY` is set — never release such builds. Real secure boot/rollback enforced by RP2350 bootrom + OTP (production step, see `production.md`).
 
+## Loop de melhoria (agentes)
+
+- `.opencode/agents/`: `sec-audit` → `spec` → `impl` → `gates` → `review`; skills
+  `aegis-spec` / `aegis-gates`; comandos `/spec` e `/gates`.
+- Uma fatia por commit na branch `development`; cada fatia tem spec em `specs/`,
+  teste de host e gates verdes.
+
 ## Validation pointers
 
 - Host gates: `cargo fmt --check`, `clippy -D warnings`, `cargo test` for `aegis-core` (~193 tests), `aegis-applets` (~147), `aegistoken-host` (5).
