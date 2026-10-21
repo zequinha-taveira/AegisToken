@@ -12,7 +12,32 @@ como única autoridade de decifra. **Escopo:** `crates/aegis-applets`
 
 ## 1. Ameaça
 
-### 1.1 Estado atual (verificado no código)
+### 1.1 O que o achado original afirmava (e o que a especificação diz)
+
+O achado do `sec-audit` afirmava que devolver o segredo ECDH ao host é um
+vazamento: *"o host aprende `Z` e passa a decifrar sem o cartão, e o cartão
+deixa de ser uma barreira"*.
+
+A leitura da **OpenPGP Smart Card Application 3.4.1** (§4.4.3.8, PSO:DECIPHER)
+corrige a premissa:
+
+> *"In case of ECDH the card supports a **partial decrypt only** […] With its own
+> private key and the given public key the card calculates a shared secret […]
+> **The shared secret is returned in the response, all other calculation for
+> deciphering are done outside of the card.**"*
+
+E a RFC 6637 §8 explica por que isso **não** é um vazamento: a chave efêmera do
+mensagem é escolhida pelo **remetente**, não pelo host que decifra. Logo, o host
+**não consegue** calcular `Z = r·V` — ele precisa do cartão. O segredo que o
+cartão protege é a **chave privada** `r`, que nunca sai; `Z` é o valor derivado
+que o software do destinatário precisa para decifrar a própria mensagem, e a
+sua liberação é condicionada à **verificação de PW1 no modo 82** (e, quando
+habilitada, à *touch policy*).
+
+Ou seja: devolver `Z` é o **modelo definido pela especificação**, e o papel do
+cartão como autoridade continua íntegro.
+
+### 1.2 Estado atual (verificado no código)
 
 | Fato | Onde |
 |---|---|
@@ -22,48 +47,42 @@ como única autoridade de decifra. **Escopo:** `crates/aegis-applets`
 | O teste existente **fixa** esse comportamento como esperado: `pso_decipher_returns_the_p256_shared_secret` | `crates/aegis-applets/src/openpgp.rs:1640` |
 | A documentação registra que o ECDH "não tem o KDF+AES RFC 6637 completo" e devolve o segredo bruto "para testes de transporte" | `roadmap.md` (Fase 14, "Cripto fora desta slice") |
 
-### 1.2 O que o atacante (ou o host) consecgue
+### 1.3 O que de fato é um risco (e o que não é)
 
-Um smartcard de decifra existe para ser a **única** autoridade que decifra: o
-host entrega texto cifrado, o cartão devolve texto claro e **nunca** entrega
-material que permita decifrar fora dele. O modelo atual quebra exatamente
-essa propriedade:
+**Não é risco:** o cartão devolver `Z` ao host que decifra. É o modelo da
+especificação (§1.1) e o host não consegue calculá-lo sozinho, porque a
+chave efêmera foi escolhida pelo remetente. O que protege é a chave privada
+`r`, que nunca sai.
 
-1. **O segredo compartilhado sai do cartão.** O host que fez o ECDH aprende
-   `Z` e, com ele, deriva a chave de sessão; passa a decifrar **sem** o
-   cartão, e o cartão deixa de ser uma barreira. Qualquer processo com acesso
-   USB (ou um host comprometido) obtém material equivalente à chave privada
-   de decifra.
-2. **O cartão deixa de ser a única autoridade de decifra.** O host escolhe o
-   ponto efêmero `V` e recebe `Z = r·V`. Isso **não** quebra o ECDH (quem tem
-   `Z` e `V` não obtém `r`), mas entrega ao host material equivalente ao da
-   chave de sessão e transfere para fora do cartão a autoridade de decifra —
-   que é exatamente a propriedade que o cartão de smartcard deve ter.
-3. **Não há vínculo com a identidade do cartão.** Nada no fluxo associa a
-   decifra ao par de chaves do slot: o host escolhe o ponto efêmero e recebe o
-   segredo. Um intermediário pode pedir a decifra com um `V` próprio e obter
-   um segredo que *não* corresponde ao material do cartão — o cartão deixa de
-   ser o titular da chave.
+**É risco (e é o que a etapa S2 fecha):** o **software no host** que pediu a
+decifra fica com `Z` e passa a poder decifrar a mensagem **sem** o cartão. Um
+processo comprometido no mesmo host — ou qualquer software que obtenha a
+resposta do APDU — herda essa capacidade. O cartão continua sendo a
+autoridade *no momento da operação* (PW1 modo 82, *touch policy*), mas deixa
+de ser a autoridade *depois* dela.
 
-O efeito líquido é o mesmo dos três casos: **o material que deveria ficar no
-cartão chega ao host**.
+**Também é risco:** a decifra ECDH não tinha, no modelo entregue, a
+material da RFC 6637 (KDF da §7 + AES Key Wrap da RFC 3394). O host recebia
+`Z` cru, sem a chave de sessão embrulhada — o que não interoperava com o
+GnuPG e não seguia a §8.
 
-### 1.3 Por que a RFC 6637 resolve
+### 1.4 Por que a RFC 6637 §8 importa
 
-A RFC 6637 §8 define o modelo de decifra no cartão:
+A §8 define o modelo em que **o cartão desembrulha a chave de sessão**:
 
 - o remetente gera um par efêmero `{v, V}`, calcula `S = v·R` e deriva
   `Z = KDF(S, Z_len, Param)`;
 - `Z` é usado como **KEK** no key wrap (RFC 3394) da chave de sessão: o valor
   `m = symm_alg_ID || session key || checksum || PKCS#5 padding` é embrulhado
   em `C = AESKeyWrap(Z, m)`;
-- o host envia ao cartão `MPI(V)` e `C`; o cartão calcula `S = r·V` com a
-  **sua** chave privada `r`, deriva o mesmo `Z`, **desembrulha** `C` e
-  decifra a mensagem.
+- o cartão calcula `S = r·V` com a **sua** chave privada `r`, deriva o mesmo
+  `Z`, **desembrulha** `C` e decifra a mensagem.
 
-Nesse modelo o segredo compartilhado **nunca** sai do cartão: o host conhece
-apenas `V` (efêmero, público) e `C` (cifrado sob `Z`, que ele não consegue
-derivar sem `r`).
+Nesse modelo o cartão nunca libera `Z`: o software do host tem `V` e `C`, mas
+**não** consegue decifrar sem o cartão. É o que a etapa S2 implementa, como um
+modo **opt-in** (ativado quando o host provisiona a chave de sessão
+embrulhada), ao lado do *partial decrypt* da especificação, que continua o
+padrão para a interoperabilidade com o GnuPG.
 
 ## 2. Invariantes em risco
 
@@ -88,7 +107,7 @@ derivar sem `r`).
 A fatia é **dividida em duas etapas**, porque a etapa 2 depende de
 provisionamento e de interop que não podem ser validados sem placa:
 
-### 3.1 Etapa S1 (esta fatia) — primitivas e falha fechada
+### 3.1 Etapa S1 — primitivas da RFC 6637
 
 1. **Novo módulo `aegis-applets::ecdh`** (`crates/aegis-applets/src/ecdh.rs`),
    sem dependências novas (`sha2`, `aes`, `cbc` já estão no crate):
@@ -107,12 +126,12 @@ provisionamento e de interop que não podem ser validados sem placa:
      KDF_hash_ID || KEK_alg_ID || "Anonymous Sender    " (20) ||
      fingerprint (20)`.
    - `curve_oid_p256()` — `2A 86 48 CE 3D 03 01 07` (RFC 6637 §11).
-2. **O segredo compartilhado deixa de sair do cartão.** `PSO:DECIPHER` para um
-   slot ECDH **sem** material RFC 6637 provisionado responde **erro**
-   (`6A81` — comando não suportado para este slot — ou `6D00`), e **não**
-   devolve `Z`. O mesmo vale para a variante X25519, que **não** é coberta
-   pela RFC 6637 (pertence ao draft "Curve25519" do GnuPG) e, por isso, não
-   tem `Param` normado: ela também falha fechada.
+2. **O *partial decrypt* da especificação é preservado.** `PSO:DECIPHER` num
+   slot ECDH **sem** material RFC 6637 provisionado devolve o segredo
+   compartilhado, como define a OpenPGP Card 3.4.1 §4.4.3.8 (a liberação é
+   condicionada à verificação de PW1 no modo 82). A variante X25519 segue o
+   mesmo modelo (é o *partial decrypt* do draft "Curve25519" do GnuPG, que
+   também não tem `Param` normado).
 3. **Nenhuma regressão** em assinatura, `READ PUBLIC`, `GENERATE`,
    `INTERNAL AUTHENTICATE` e no caminho RSA de `PSO:DECIPHER` (que continua
    devolvendo o bloco decifrado por operação privada, como manda a Yubico).
@@ -141,14 +160,23 @@ provisionamento e de interop que não podem ser validados sem placa:
   (§5.14). Validada contra uma implementação de referência independente
   (`tests/openpgp_sym_reference.py`), que produz o mesmo texto cifrado e o
   mesmo texto claro.
-- **Curve25519:** continua falhando fechado — a RFC 6637 não define os
-  parâmetros de KDF para essa curva.
+- **Dois modos convivem:** sem material provisionado, o cartão faz o
+  *partial decrypt* da especificação (devolve `Z`); com material provisionado,
+  o cartão decifra sozinho (nunca libera `Z`). O modo mais forte é **opt-in**
+  porque não é o que o GnuPG fala.
+- **Curve25519:** segue o *partial decrypt* da especificação; a RFC 6637 não
+  define os parâmetros de KDF para essa curva, então o cartão não decifra
+  sozinho nesse caso.
 
 **O que falta para a interoperabilidade (S3):**
 
-1. O *key import* no formato do OpenPGP Card 3.4 (e o procedimento do GnuPG
-   correspondente), que é o que permite ao GnuPG importar a chave de sessão
-   embrulhada no cartão.
+1. O *key import* no formato do OpenPGP Card 3.4 (que importa a **chave
+   privada**, e não a chave de sessão embrulhada): o modelo do cartão que
+   decifra sozinho precisa de um caminho de provisionamento próprio, porque o
+   *key import* da especificação traz a chave privada — e importar a chave
+   privada do slot contraria a regra de "sem importação de chave privada" do
+   projeto. O formato provisório (`PUT DATA 0xD2`, chave de sessão embrulhada)
+   é a alternativa coerente com essa regra, e continua **provisório**.
 2. A validação em hardware: `gpg -d` contra o cartão, o que exige um RP2350
    físico e um GnuPG instalado.
 
@@ -168,9 +196,9 @@ provisionamento e de interop que não podem ser validados sem placa:
 | Slot | Algoritmo | Material provisionado | Resposta de `PSO:DECIPHER` |
 |---|---|---|---|
 | decifra | RSA-2048 | — | bloco decifrado (inalterado) |
-| decifra | ECDH P-256 | nenhum (estado atual) | **erro** `6A81` — o segredo não sai |
-| decifra | ECDH P-256 | material RFC 6637 (etapa S2) | texto claro decifrado |
-| decifra | ECDH X25519 | qualquer | **erro** `6A81` (sem `Param` normado) |
+| decifra | ECDH P-256 | nenhum (estado atual) | segredo compartilhado (*partial decrypt* da especificação) |
+| decifra | ECDH P-256 | material RFC 6637 (etapa S2) | texto claro decifrado (o segredo não sai) |
+| decifra | ECDH X25519 | qualquer | segredo compartilhado (*partial decrypt*) |
 | assinatura | qualquer | — | inalterado |
 
 ## 5. Critérios de aceitação

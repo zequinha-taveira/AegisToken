@@ -1095,18 +1095,20 @@ adiado.
   precisam de validação externa.
 - **Cripto fora desta slice:** RSA, Ed25519/EdDSA e X25519/KDF OpenPGP ficam
   para as Fases 15–16.
-- **ECDH OpenPGP (S1 e S2 entregues, interop pendente):** o applet **não devolve
-  mais o shared secret** ao host. As primitivas da RFC 6637 (KDF de concatenação
-  NIST SP 800-56A com SHA-256, AES Key Wrap da RFC 3394 e o bloco de
-  parâmetros do §8) estão em `aegis-applets::ecdh`, com os vetores da RFC
-  3394 e um vetor de referência da KDF. Na etapa S2 o cartão executa o fluxo
-  completo: `S = r·V` → KEK → desembrulho da chave de sessão → decifra dos
-  dados com a camada simétrica do OpenPGP (`aegis-applets::pgp_sym`, CFB da
-  RFC 4880 §13.9 com *resync*, *quick check* e MDC), validada contra uma
-  implementação de referência independente. O material importado é cifrado
-  (`PUT DATA 0xD2`, formato **provisório**); a chave privada do slot nunca é
-  importada. **Pendente:** alinhar o *key import* ao OpenPGP Card 3.4 e
-  validar `gpg -d` em hardware. Spec: `specs/openpgp-rfc6637-ecdh.md`.
+- **ECDH OpenPGP (S1 e S2 entregues, interop pendente):** o *partial decrypt*
+  da OpenPGP Card 3.4.1 §4.4.3.8 foi **mantido** (o cartão devolve o segredo
+  compartilhado, como a especificação define — a chave efêmera foi escolhida
+  pelo remetente, e a liberação é condicionada a PW1 modo 82), e o cartão
+  **ganhou** o modo em que decifra sozinho pela RFC 6637 §8, ativado quando o
+  host provisiona a chave de sessão embrulhada. As primitivas (KDF da §7, AES
+  Key Wrap da RFC 3394, camada simétrica da RFC 4880 §13.9 com *resync*,
+  *quick check* e MDC) estão em `aegis-applets::ecdh` e
+  `aegis-applets::pgp_sym`, com os vetores da RFC 3394, um vetor de referência
+  da KDF e uma implementação de referência independente da camada simétrica
+  (`tests/openpgp_sym_reference.py`). O material importado é cifrado; a chave
+  privada do slot nunca é importada. **Pendente:** o formato do
+  provisionamento é **provisório** (`PUT DATA 0xD2`) e a validação `gpg -d`
+  exige hardware. Spec: `specs/openpgp-rfc6637-ecdh.md`.
 
 ## Persistência selada dos applets (entregue)
 

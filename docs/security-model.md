@@ -140,19 +140,22 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
 - **Secrets are sealed at rest.** Credential keys, OATH secrets, PIN-derived
   values and data objects are stored in sealed records (AES-256-GCM under the
   OTP root key); no applet response can export them.
-- **The ECDH shared secret never leaves the card.** The OpenPGP decryption
-  path follows RFC 6637: the card derives the key-encryption key from the
-  shared point (KDF of RFC 6637 §7), unwraps the session key (AES key wrap
-  of RFC 3394) and decrypts the data itself (the OpenPGP symmetric layer of
-  RFC 4880 §13.9, with the resynchronization, the quick check and the
-  modification detection code). While that material is not provisioned,
-  `PSO:DECIPHER` fails closed with `6A81` instead of returning the shared
-  secret — a decryption card must be the only authority that can decrypt. The
-  primitives live in `aegis-applets::ecdh` and `aegis-applets::pgp_sym`,
-  covered by the RFC 3394 test vectors and by an independent reference
-  implementation of the symmetric layer (`tests/openpgp_sym_reference.py`).
-  Only ciphertext (the wrapped session key) is importable; the private key of
-  the slot is generated on the device and never leaves it.
+- **The card's private key never leaves it, and the ECDH model is the one the
+  specification defines.** The OpenPGP Card 3.4.1 §4.4.3.8 defines the ECDH
+  `PSO:DECIPHER` as a *partial decrypt*: the card calculates the shared secret
+  with its own private key and returns it, because the ephemeral key of the
+  message was chosen by the **sender** — the host cannot compute it by
+  itself. The release of that derived value is gated by the verification of PW1
+  in mode 82 (and by the touch policy, when enabled). The card can also
+  decrypt on its own, following RFC 6637 §8 (KDF of §7, AES key wrap of
+  RFC 3394, the OpenPGP symmetric layer of RFC 4880 §13.9 with the
+  resynchronization, the quick check and the modification detection code); in
+  that mode the shared secret never leaves the card. Only ciphertext (the
+  wrapped session key) is importable; the private key of the slot is generated
+  on the device and never imported. The primitives live in
+  `aegis-applets::ecdh` and `aegis-applets::pgp_sym`, covered by the RFC 3394
+  test vectors and by an independent reference implementation of the symmetric
+  layer (`tests/openpgp_sym_reference.py`).
 - **Each signing operation honours its touch policy.** When a slot or
   credential requires touch, the applet arms the contextual presence machine
   and fails with the applet's standard error on absence or timeout.

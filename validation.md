@@ -595,29 +595,32 @@ depende de hardware e de provisionamento.
 
 ### OpenPGP ECDH: decifra no cartão pela RFC 6637 (etapa S2, interop pendente)
 
-O cartão agora executa o fluxo completo da RFC 6637 §8: calcula `S = r·V` com a
-chave privada que **nunca** sai, deriva a KEK com a KDF da §7, desembrulha a
-chave de sessão embrulhada pelo remetente (RFC 3394) e decifra os dados com a
-camada simétrica do OpenPGP, verificando o *modification detection code*. O
-material importado é **cifrado**; a chave privada do slot continua gerada
-on-device.
+**Correção de premissa:** a OpenPGP Card 3.4.1 §4.4.3.8 define o ECDH do
+`PSO:DECIPHER` como um ***partial decrypt*** — o cartão calcula o segredo
+compartilhado e o **devolve**, porque a chave efêmera da mensagem foi escolhida
+pelo *remetente* e o host não consegue calculá-la. O que o cartão protege é a
+chave privada, que nunca sai; a liberação do segredo derivado é condicionada à
+verificação de PW1 no modo 82. O cartão **mantém** esse comportamento (para a
+interoperabilidade com o GnuPG) e **acrescenta** o modo em que decifra sozinho
+(RFC 6637 §8), ativado quando o host provisiona a chave de sessão embrulhada.
 
 | AC | Verificação | Resultado |
 |----|-------------|-----------|
 | AC-1 | A KDF da §7 reproduz o vetor de referência e o `Param` tem o layout da §8 (54 bytes para P-256) | **Verificado** (`the_kdf_matches_the_reference_value`, `the_parameters_follow_the_rfc_layout`) |
 | AC-2 | O *key wrap* da RFC 3394 reproduz os quatro vetores da RFC, nos dois sentidos | **Verificado** (`unwraps_the_rfc3394_vectors`, `wraps_to_the_rfc3394_vectors`) |
 | AC-3 | A camada simétrica reproduz o vetor de referência da RFC 4880 §13.9 nos dois sentidos, com *quick check* e MDC | **Verificado** (`decrypts_the_reference_vector`, `encrypts_to_the_reference_ciphertext`, `a_wrong_key_fails_the_quick_check`, `a_tampered_ciphertext_fails_the_modification_code`) |
-| AC-4 | O cartão decifra uma mensagem real: o teste faz o papel do remetente (chave efêmera, segredo compartilhado, chave de sessão embrulhada, mensagem cifrada) e o cartão devolve o texto claro | **Verificado** (`pso_decipher_unwraps_the_session_key_and_decrypts`) |
-| AC-5 | Sem material provisionado, `PSO:DECIPHER` falha fechada (`6A81`) e não devolve segredo | **Verificado** (`pso_decipher_refuses_to_leak_the_shared_secret`) |
-| AC-6 | Curve25519 (sem `Param` normado) falha fechada | **Verificado** (`x25519_decipher_fails_closed_without_rfc6637_material`) |
+| AC-4 | Com material provisionado, o cartão decifra uma mensagem real: o teste faz o papel do remetente (chave efêmera, segredo compartilhado, chave de sessão embrulhada, mensagem cifrada) e o cartão devolve o texto claro | **Verificado** (`pso_decipher_unwraps_the_session_key_and_decrypts`) |
+| AC-5 | Sem material provisionado, o cartão devolve o segredo compartilhado (*partial decrypt* da especificação), com PW1 modo 82 exigido | **Verificado** (`pso_decipher_returns_the_shared_secret_per_the_card_spec`) |
+| AC-6 | O mesmo para X25519, com a simetria DH conferida | **Verificado** (`x25519_decipher_returns_the_shared_secret`) |
 | AC-7 | O caminho RSA de `PSO:DECIPHER` e o resto da suíte do applet seguem verdes | **Verificado** (169 testes) |
 
-**Limitação (interop pendente):** o formato do *key import* é **provisório**
-(`PUT DATA 0x00D2`) e ainda precisa ser alinhado ao OpenPGP Card 3.4, o que
-exige um host que fale o protocolo; a validação `gpg -d` contra o cartão
-continua pendente de hardware (não há RP2350 físico nem GnuPG neste ambiente).
-A referência independente da camada simétrica está em
-`tests/openpgp_sym_reference.py`.
+**Limitação (interop pendente):** o formato do provisionamento da chave de
+sessão embrulhada é **provisório** (`PUT DATA 0xD2`); o *key import* da
+OpenPGP Card 3.4 importa a **chave privada**, o que contraria a regra do
+projeto de não importar chave privada — daí o caminho próprio. A validação
+`gpg -d` contra o cartão continua pendente de hardware (não há RP2350 físico
+nem GnuPG neste ambiente). A referência independente da camada simétrica está
+em `tests/openpgp_sym_reference.py`.
 
 ### Contagem de credenciais conforme a CTAP 2.1 (host)
 

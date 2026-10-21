@@ -234,6 +234,22 @@ impl EcdhMaterial {
     }
 }
 
+/// The external public key of a PSO:DECIPHER command.
+///
+/// The OpenPGP card specification wraps it in a cipher DO (`A6`) with a public
+/// key DO (`7F49`); the tag is also accepted at the top level.
+fn external_public_key(input: &[u8]) -> Option<&[u8]> {
+    if let Some(point) = tlv::find(input, 0x86) {
+        return Some(point);
+    }
+    let cipher = tlv::find(input, 0xA6)?;
+    if let Some(point) = tlv::find(cipher, 0x86) {
+        return Some(point);
+    }
+    let public_template = tlv::find(cipher, 0x7F49)?;
+    tlv::find(public_template, 0x86)
+}
+
 /// The session key of a wrapped OpenPGP session key.
 ///
 /// RFC 6637 ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§8 wraps `m = symm_alg_ID || session key || checksum ||
@@ -727,7 +743,13 @@ impl<S: OpenPgpStore> OpenPgp<S> {
         if let Some(algo) = Self::parse_rsa_attrs(value) {
             return Some(algo);
         }
+        // The import format byte (00 or FF) is optional in the algorithm
+        // attributes of the OpenPGP card specification.
         let (&id, oid) = value.split_first()?;
+        let oid = match oid {
+            [rest @ .., 0x00] | [rest @ .., 0xFF] => rest,
+            other => other,
+        };
         if id == ALGO_ECDSA && oid == OID_P256 {
             Some(KEY_ALGO_ECDSA_P256)
         } else if id == ALGO_ECDH && oid == OID_P256 {
@@ -1343,27 +1365,35 @@ impl<S: OpenPgpStore> OpenPgp<S> {
             return self.decipher_ecdh(input);
         }
         // Curve25519 is not covered by RFC 6637 and has no normalised KDF
-        // parameters: the card refuses instead of handing the shared secret
-        // to the host.
+        // parameters: the card performs the key agreement and returns the
+        // shared secret, as the OpenPGP card specification defines for the
+        // partial decrypt.
+        if algo == KEY_ALGO_ECDH_X25519 {
+            return self.decipher_ecdh_x25519(input);
+        }
         Response::status(Sw::FUNCTION_NOT_SUPPORTED)
     }
 
-    /// Decrypt with the card-side ECDH flow of RFC 6637 ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§8.
+    /// Decrypt with the card-side ECDH flow of RFC 6637 §8.
     ///
     /// The command carries the ephemeral public key of the sender (`86`) and
     /// the encrypted data (`80`). The card computes the shared point with its
-    /// own private key, derives the key encryption key with the KDF of ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§7,
+    /// own private key, derives the key encryption key with the KDF of §7,
     /// unwraps the session key wrapped by the sender (RFC 3394) and decrypts
     /// the data with the OpenPGP symmetric layer.
+    ///
+    /// When the slot has no RFC 6637 material, the card falls back to the
+    /// partial decrypt of the OpenPGP card specification (§4.4.3.8): the
+    /// shared secret is returned and the host does the rest. The release of
+    /// the shared secret is gated by the verification of PW1 in mode 82.
     fn decipher_ecdh(&mut self, input: &[u8]) -> Response<'_> {
+        if self.ecdh_material().is_none() {
+            return self.decipher_ecdh_shared_secret(input);
+        }
         let Some(material) = self.ecdh_material() else {
-            // No RFC 6637 material was provisioned: the card fails closed.
             return Response::status(Sw::FUNCTION_NOT_SUPPORTED);
         };
-        let Some(point) = tlv::find(input, 0x86).or_else(|| {
-            let cipher = tlv::find(input, 0xA6)?;
-            tlv::find(cipher, 0x86)
-        }) else {
+        let Some(point) = external_public_key(input) else {
             return Response::status(Sw::WRONG_DATA);
         };
         if point.len() != 65 {
@@ -1430,6 +1460,56 @@ impl<S: OpenPgpStore> OpenPgp<S> {
             return None;
         }
         EcdhMaterial::from_slot(&self.keys[1])
+    }
+
+    /// The partial decrypt of the OpenPGP card specification (§4.4.3.8).
+    ///
+    /// The card calculates the shared secret with its own private key and the
+    /// external public key of the command, and returns it: the host derives
+    /// the session key and decrypts the message. The host cannot compute the
+    /// shared secret by itself, because the ephemeral key of the message was
+    /// chosen by the sender.
+    fn decipher_ecdh_shared_secret(&mut self, input: &[u8]) -> Response<'_> {
+        let Some(point) = external_public_key(input) else {
+            return Response::status(Sw::WRONG_DATA);
+        };
+        let Ok(public) = p256::PublicKey::from_sec1_bytes(point) else {
+            return Response::status(Sw::WRONG_DATA);
+        };
+        let Ok(secret) = p256::SecretKey::from_slice(&self.keys[1].material[..32]) else {
+            return Response::status(Sw::NO_PRECISE_DIAGNOSIS);
+        };
+        let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
+        self.out.clear();
+        if self
+            .out
+            .extend_from_slice(shared.raw_secret_bytes().as_slice())
+            .is_err()
+        {
+            return Response::status(Sw::NOT_ENOUGH_MEMORY);
+        }
+        Response::ok(&self.out)
+    }
+
+    /// The partial decrypt of the OpenPGP card specification for Curve25519.
+    fn decipher_ecdh_x25519(&mut self, input: &[u8]) -> Response<'_> {
+        let Some(point) = external_public_key(input) else {
+            return Response::status(Sw::WRONG_DATA);
+        };
+        if point.len() != 32 {
+            return Response::status(Sw::WRONG_DATA);
+        }
+        let mut peer = [0u8; 32];
+        peer.copy_from_slice(point);
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&self.keys[1].material[..32]);
+        let secret = x25519_dalek::StaticSecret::from(seed);
+        let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(peer));
+        self.out.clear();
+        if self.out.extend_from_slice(&shared.to_bytes()).is_err() {
+            return Response::status(Sw::NOT_ENOUGH_MEMORY);
+        }
+        Response::ok(&self.out)
     }
 
     fn verify_change(&mut self, apdu: &Apdu<'_>) -> Response<'_> {
@@ -1929,7 +2009,7 @@ mod tests {
     }
 
     #[test]
-    fn pso_decipher_refuses_to_leak_the_shared_secret() {
+    fn pso_decipher_returns_the_shared_secret_per_the_card_spec() {
         let mut applet = applet();
         let mut rng = TestRng(5);
         verify_pw3(&mut applet, &mut rng);
@@ -1954,10 +2034,12 @@ mod tests {
         let mut cipher = Vec::<u8, 192>::new();
         append_tlv(&mut cipher, 0xA6, &public_template);
         let (shared, status) = run(&mut applet, &mut rng, &frame(INS_PSO, 0x80, 0x86, &cipher));
-        // The ECDH decryption follows RFC 6637 and is not provisioned yet: the
-        // card fails closed instead of handing the shared secret to the host.
-        assert_eq!(status, Sw::FUNCTION_NOT_SUPPORTED);
-        assert!(shared.is_empty());
+        // The OpenPGP card specification defines the ECDH decipher as a
+        // partial decrypt: the card returns the shared secret and the host
+        // does the rest. The host cannot compute it by itself, because the
+        // ephemeral key of the message was chosen by the sender.
+        assert_eq!(status, Sw::OK);
+        assert_eq!(shared.len(), 32);
     }
 
     #[test]
@@ -2336,7 +2418,7 @@ mod tests {
     }
 
     #[test]
-    fn x25519_decipher_fails_closed_without_rfc6637_material() {
+    fn x25519_decipher_returns_the_shared_secret() {
         let mut applet = applet();
         let mut rng = TestRng(11);
         verify_pw3(&mut applet, &mut rng);
@@ -2363,11 +2445,13 @@ mod tests {
         let mut cipher = Vec::<u8, 128>::new();
         append_tlv(&mut cipher, 0xA6, &public_template);
         let (shared, status) = run(&mut applet, &mut rng, &frame(INS_PSO, 0x80, 0x86, &cipher));
-        // Curve25519 is not covered by RFC 6637 and has no normalised KDF
-        // parameters: the card refuses instead of handing the shared secret
-        // to the host.
-        assert_eq!(status, Sw::FUNCTION_NOT_SUPPORTED);
-        assert!(shared.is_empty());
+        assert_eq!(status, Sw::OK);
+        assert_eq!(shared.len(), 32);
+
+        // DH symmetry: peer(card_pub) must equal card(peer_pub).
+        let card_public = x25519_dalek::PublicKey::from(<[u8; 32]>::try_from(card_point).unwrap());
+        let expected = peer_secret.diffie_hellman(&card_public);
+        assert_eq!(&shared[..], &expected.to_bytes());
     }
 
     #[test]
