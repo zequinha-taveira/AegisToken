@@ -142,12 +142,17 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   OTP root key); no applet response can export them.
 - **The ECDH shared secret never leaves the card.** The OpenPGP decryption
   path follows RFC 6637: the card derives the key-encryption key from the
-  shared point (KDF of RFC 6637 §7) and unwraps the session key (AES key wrap
-  of RFC 3394) itself. While that material is not provisioned, `PSO:DECIPHER`
-  fails closed with `6A81` instead of returning the shared secret — a
-  decryption card must be the only authority that can decrypt. The primitives
-  live in `aegis-applets::ecdh`, covered by the RFC 3394 test vectors and a
-  reference value of the KDF.
+  shared point (KDF of RFC 6637 §7), unwraps the session key (AES key wrap
+  of RFC 3394) and decrypts the data itself (the OpenPGP symmetric layer of
+  RFC 4880 §13.9, with the resynchronization, the quick check and the
+  modification detection code). While that material is not provisioned,
+  `PSO:DECIPHER` fails closed with `6A81` instead of returning the shared
+  secret — a decryption card must be the only authority that can decrypt. The
+  primitives live in `aegis-applets::ecdh` and `aegis-applets::pgp_sym`,
+  covered by the RFC 3394 test vectors and by an independent reference
+  implementation of the symmetric layer (`tests/openpgp_sym_reference.py`).
+  Only ciphertext (the wrapped session key) is importable; the private key of
+  the slot is generated on the device and never leaves it.
 - **Each signing operation honours its touch policy.** When a slot or
   credential requires touch, the applet arms the contextual presence machine
   and fails with the applet's standard error on absence or timeout.
