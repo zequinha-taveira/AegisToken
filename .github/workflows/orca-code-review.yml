@@ -1,0 +1,24 @@
+name: Orca-Code-Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Orca-Code-Review
+        # The review is a convenience: without ORCAROUTER_API_KEY the action
+        # cannot start its proxy and would fail the job, so the step is
+        # tolerant. The review is not a required check.
+        continue-on-error: true
+        uses: Continuum-AI-Corp/Orca-Code-Review@v1.4.0
+        with:
+          orcarouter-api-key: ${{ secrets.ORCAROUTER_API_KEY }}

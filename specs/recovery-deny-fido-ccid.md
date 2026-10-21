@@ -176,6 +176,8 @@ Cada AC é observável em teste de host, exceto quando marcado como
 | **AC-8** | O Management HID **não é afetado** pelo gating: continua habilitado no plano de todos os destinos, e os testes existentes de `GET_STATUS` (`0x09`) e `GET_DIAGNOSTICS` (`0x0A`) continuam verdes (diagnóstico e firmware update permanecem disponíveis em Recovery) | teste de host: suíte existente de `crates/aegis-core/src/management_protocol.rs` + flags do plano |
 | **AC-9** | *(firmware/estático)* O boot do firmware com BOOTSEL mantido **não inicia** `fido_task` nem `ccid_task`, **mantém** `housekeeping` e `otp_task`, e registra no log de boot o destino e o plano aplicado; nenhum caminho de store selado é alcançado. O boot normal (sem BOOTSEL) é **inalterado** — FIDO e CCID seguem ativos | `cargo clippy-fw` + `cargo build-fw` + grep documentado dos pontos de abertura + log de boot |
 | **AC-10** | *(hardware pendente)* Com BOOTSEL mantido no boot: as interfaces FIDO e CCID **enumeram mas não respondem**; o Management HID responde `GET_STATUS` e `GET_DIAGNOSTICS`; após um power cycle normal, FIDO volta a responder normalmente | procedimento em `validation.md` (pendente de RP2350 físico) |
+| **AC-11** | **Diagnóstico do plano**: `GET_DIAGNOSTICS` (0x0A) informa o destino do boot e os caminhos servidos — `boot_destination` (chave CBOR 0x08, código de `ExecutionState`), `fido_enabled` (0x09) e `ccid_enabled` (0x0A) — para que um dispositivo silenciado pelo plano seja distinguível de um dispositivo quebrado. Sem plano registrado, o relatório é **fechado** (`fido_enabled`/`ccid_enabled` falsos) | teste de host em `crates/aegis-core/src/management_protocol.rs` (`diagnostics_report_shows_the_boot_plan`) e em `crates/aegis-core/src/recovery.rs` (`diagnostics_report_shows_the_denied_paths_in_recovery`) |
+| **AC-12** | **Leitura estável do BOOTSEL**: o destino do boot é decidido por 3 amostras do pad (1 ms de intervalo); uma leitura instável é tratada como "solto" e registrada em log, para que um falso positivo não coloque o dispositivo em `Recovery` e o deixe mudo. A escolha é *fail-open* deliberada em direção a `Active` — o Recovery continua acessível pelo bootrom (BOOTSEL mantido no reset) | *(firmware/estático)*: `read_bootsel_stable` em `crates/firmware-universal-rp2350/src/main.rs` + `cargo clippy-fw` + `cargo build-fw` |
 
 ---
 
@@ -186,8 +188,11 @@ Cada AC é observável em teste de host, exceto quando marcado como
 Todos os testes de host desta fatia ficam em **`crates/aegis-core/src/state.rs`**
 (módulo `#[cfg(test)] mod tests`), ao lado dos testes existentes de
 `boot_destination` / `fido_allowed` — é o mesmo tipo de dado e o mesmo
-módulo. Nenhum teste novo é obrigatório em `aegis-core::recovery.rs` (fora de
-escopo) nem no firmware (não é host-testável).
+módulo. Os AC-11 acrescenta dois testes de host: um em
+`crates/aegis-core/src/management_protocol.rs` (o serviço publica o plano) e um
+em `crates/aegis-core/src/recovery.rs` (o relatório carrega o plano). O AC-12 é
+estático: a rotina de leitura estável vive no firmware, que não é
+host-testável.
 
 ### 6.2 Como os casos são montados
 
@@ -250,16 +255,17 @@ ocorre quando o caminho está negado.
 | Arquivo | Motivo |
 |---------|--------|
 | `crates/aegis-core/src/state.rs` | **Novo** tipo de plano de boot (decisão de política) + flags de autorização de store selado + testes de host dos AC-1..AC-6 |
-| `crates/firmware-universal-rp2350/src/main.rs` | **Região de boot** (`main()`): calcular destino → plano, logar, e **não iniciar** `fido_task`/`ccid_task` quando negados; condicionar a abertura dos stores selados. Não tocar nas regiões de caminho FIDO (outra sessão) |
+| `crates/aegis-core/src/recovery.rs` | **Relatório de diagnóstico**: novos campos `boot_destination` (0x08), `fido_enabled` (0x09) e `ccid_enabled` (0x0A) + o plano no construtor do relatório (AC-11) |
+| `crates/aegis-core/src/management_protocol.rs` | O serviço de Management recebe o plano do boot (`set_boot_plan`) e o publica no diagnóstico; o plano padrão é **fechado** (AC-11) |
+| `crates/firmware-universal-rp2350/src/main.rs` | **Região de boot** (`main()`): calcular destino → plano, logar, e **não iniciar** `fido_task`/`ccid_task` quando negados; condicionar a abertura dos stores selados; leitura estável do BOOTSEL (AC-12); registrar o plano no serviço de Management (AC-11). Não tocar nas regiões de caminho FIDO (outra sessão) |
 | `roadmap.md` | Fase 9 "Pendências": registrar que o gating por destino de boot foi entregue; registrar o que permanece (execução on-device da `RecoverySession`, limpeza de credenciais no factory reset) |
 | `validation.md` | Nova linha na matriz de AC + subseção da fatia com o AC de hardware e o procedimento; registrar a limitação "interfaces enumeram mas não respondem" |
 | `docs/security-model.md` | Confirmar/reforçar a invariante de Recovery: "Recovery nega FIDO/CCID/credenciais"; declarar que a deny-list é aplicada no boot pelo plano e que Management (diagnóstico + update) permanece |
 | `CONTEXT.md` | Known gaps: o gap "Recovery nega FIDO/CCID" **fecha no nível de boot**; permanecem abertos a execução on-device da `RecoverySession`, a limpeza de credenciais no factory reset e a supressão da enumeração USB |
 | `docs/architecture.md` | Opcional: alinhar o diagrama/tabela de caminhos com o gating de boot (somente se o implementador já estiver na área) |
 
-Nada é alterado em `crates/aegis-core/src/recovery.rs`,
-`crates/aegis-core/src/authenticator.rs`, `crates/aegis-applets/**` ou
-`crates/board-generic-rp2350/**`.
+Nada é alterado em `crates/aegis-core/src/authenticator.rs`,
+`crates/aegis-applets/**` ou `crates/board-generic-rp2350/**`.
 
 ---
 

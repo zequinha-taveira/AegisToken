@@ -31,6 +31,7 @@ pub mod ccid;
 pub mod ecdh;
 pub mod oath;
 pub mod openpgp;
+pub mod pgp_sym;
 pub mod pin;
 pub mod piv;
 pub mod placeholder;

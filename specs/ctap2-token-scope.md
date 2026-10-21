@@ -1,10 +1,15 @@
 # Spec — Escopo e ciclo de vida do `pinUvAuthToken` (CTAP2.1)
 
-**Origem:** roadmap.md, fatia 7e — "Limitações registradas" (roadmap.md:481-487) e validation.md, seção "Limitações conhecidas" (validation.md:524) · **Risco:** ALTO
+**Origem:** roadmap.md, fatia 7e — "Limitações registradas" (roadmap.md, seção "7e — Credential management CTAP2.1 e `changePIN`") e validation.md, seção "Limitações conhecidas" · **Risco:** ALTO
 
 Referência normativa: **CTAP 2.1 — Client to Authenticator Protocol**, FIDO Alliance, *Proposed Standard, June 15, 2021* (`fido-v2.1-ps-20210615`). Todas as citações textuais abaixo são dessa versão.
 
 ## Ameaça
+
+> A seção descreve o **estado antes** da fatia (a spec é o registro do
+> achado); as referências `arquivo:linha` da ameaça apontam para a árvore
+> anterior à implementação. O estado atual está em `roadmap.md` (fatia 7g) e
+> `validation.md` (Fase 7g).
 
 O `pinUvAuthToken` é a credencial que a plataforma apresenta para provar PIN/UV. Hoje o
 firmware trata o token como um segredo opaco: ele é verificado por HMAC
@@ -50,7 +55,7 @@ nunca o solicitou. O impacto é integridade e confidencialidade de credenciais
 - **Isolamento de caminhos.** O caminho FIDO permanece independente de Management/CCID
   (AGENTS.md, "Rules"); esta fatia não toca nessas rotas.
 - **Segredos selados em repouso.** O estado do token vive em RAM (`FidoSession.client_pin`,
-  `crates/firmware-universal-rp2350/src/main.rs:609-616`); o banco de credenciais segue
+  `crates/firmware-universal-rp2350/src/main.rs:689-696`); o banco de credenciais segue
   selado em AES-256-GCM sob a chave de OTP
   (`crates/aegis-core/src/credential_store.rs:43-77`) — esta fatia não altera o formato
   do store.
@@ -93,7 +98,7 @@ nunca o solicitou. O impacto é integridade e confidencialidade de credenciais
    of the permissions. It will be set on first use of the pinUvAuthToken with an RP ID (for
    mc and ga only)."
 6. **Ciclo de vida do token:** `changePIN` já invalida o token
-   (`crates/aegis-core/src/pin.rs:740-744`) e passa a continuar invalidando **permissões e
+   (`crates/aegis-core/src/pin.rs:901`) e passa a continuar invalidando **permissões e
    `permissions RP ID`**; `authenticatorReset` passa a invalidar o token ativo (hoje o
    `authenticatorReset` limpa o store e o estado de PIN — `authenticator::reset`,
    `crates/aegis-core/src/authenticator.rs:653-663` — mas o token em RAM sobrevive).
@@ -125,7 +130,8 @@ Consequência prática: `getPinToken` (0x05) seguido de credential management re
 ## Não-objetivos
 
 - `updateUserInformation` (0x07) e `largeBlobKey` (0x0B) continuam **fora** (não
-  implementados; ver roadmap.md:483-485).
+  implementados; ver `roadmap.md`, seção "7e — Credential management CTAP2.1 e
+  `changePIN`", limitações registradas).
 - O firmware continua **não anunciando `FIDO_2_1`**: nenhuma opção nova de `getInfo`,
   nenhum `bioEnroll`, `largeBlobs`, `authenticatorConfig` ou `authenticatorSelection`.
 - `getPinUvAuthTokenUsingUvWithPermissions` (0x06) continua fora (não há UV embutida);
@@ -142,67 +148,67 @@ Consequência prática: `getPinToken` (0x05) seguido de credential management re
 
 ## Critérios de aceitação
 
-- [ ] **AC1:** `getPinUvAuthTokenUsingPinWithPermissions` (0x09) com `permissions`
+- [x] **AC1:** `getPinUvAuthTokenUsingPinWithPermissions` (0x09) com `permissions`
   contendo `mc` **ou** `ga` e **sem** `rpId` (chave 0x0A) é **aceito**: o token
   sai sem `permissions RP ID` e o RP do primeiro uso passa a ser vinculado
   (nota de §6.5.5.7). As rejeições que continuam valendo: `permissions = 0` →
   `CTAP1_ERR_INVALID_PARAMETER` (0x02); permissão não suportada (`be`, `lbw`,
   `acfg`) → `CTAP2_ERR_UNAUTHORIZED_PERMISSION` (0x40).
-- [ ] **AC2:** 0x09 com `permissions = cm` e **sem** `rpId` emite token com a
+- [x] **AC2:** 0x09 com `permissions = cm` e **sem** `rpId` emite token com a
   permissão `cm` e **sem** `permissions RP ID` associado; nesse caso
   `getCredsMetadata` (0x01) e `enumerateRPsBegin` (0x02) — que exigem `cm` **e**
   ausência de `permissions RP ID` (§6.8.2/§6.8.3) — são aceitos. 0x09 com
   `permissions = cm` e **com** `rpId` emite token com `cm` e com o `rpId`
   associado; nesse caso os mesmos subcomandos são recusados (ver AC9).
-- [ ] **AC3:** `getPinToken` (0x05) emite token com `mc|ga` (0x03) e **sem**
+- [x] **AC3:** `getPinToken` (0x05) emite token com `mc|ga` (0x03) e **sem**
   `permissions RP ID`; esse token **não** autoriza credential management em nenhuma
   hipótese (ver AC8).
-- [ ] **AC4:** `makeCredential` com `pinUvAuthParam` válido, mas token **sem** a
+- [x] **AC4:** `makeCredential` com `pinUvAuthParam` válido, mas token **sem** a
   permissão `mc` (ex.: token só com `cm` ou `ga`), é rejeitado com
   `CTAP2_ERR_PIN_AUTH_INVALID` (0x33) — hoje é aceito.
-- [ ] **AC5:** `getAssertion` com `pinUvAuthParam` válido, mas token **sem** a permissão
+- [x] **AC5:** `getAssertion` com `pinUvAuthParam` válido, mas token **sem** a permissão
   `ga`, é rejeitado com 0x33.
-- [ ] **AC6:** `makeCredential`/`getAssertion` com token cujo `permissions RP ID` é
+- [x] **AC6:** `makeCredential`/`getAssertion` com token cujo `permissions RP ID` é
   **diferente** do `rp.id`/`rpId` da requisição são rejeitados com 0x33 (nenhum RP
   cruzado).
-- [ ] **AC7:** `makeCredential`/`getAssertion` com token **sem** `permissions RP ID`
+- [x] **AC7:** `makeCredential`/`getAssertion` com token **sem** `permissions RP ID`
   associado (token legado, AC3) vincula o `rp.id`/`rpId` da primeira operação como
   `permissions RP ID` do token; uma segunda operação para **outro** RP com o mesmo token
   é rejeitada com 0x33.
-- [ ] **AC8:** Todo subcomando de credential management (`getCredsMetadata` 0x01,
+- [x] **AC8:** Todo subcomando de credential management (`getCredsMetadata` 0x01,
   `enumerateRPsBegin` 0x02, `enumerateCredentialsBegin` 0x04, `deleteCredential` 0x06)
   exige token com a permissão `cm`: token sem `cm` — **inclusive o token legado** — é
   rejeitado com 0x33; ausência de `pinUvAuthParam` responde
   `CTAP2_ERR_PUAT_REQUIRED` (0x36).
-- [ ] **AC9:** `getCredsMetadata` (0x01) e `enumerateRPsBegin` (0x02) com token que **tem**
+- [x] **AC9:** `getCredsMetadata` (0x01) e `enumerateRPsBegin` (0x02) com token que **tem**
   `permissions RP ID` associado são rejeitados com 0x33 (esses subcomandos listam todos
   os RPs e não podem ser escopados).
-- [ ] **AC10:** `enumerateCredentialsBegin` (0x04) com token que **tem** `permissions RP ID`
+- [x] **AC10:** `enumerateCredentialsBegin` (0x04) com token que **tem** `permissions RP ID`
   associado é aceito **somente** se o `rpIDHash` da requisição
   (`CredentialManagementRequest::rp_id_hash`,
   `crates/aegis-core/src/authenticator.rs:687`) for o SHA-256 do `permissions RP ID` do
-  token (via `authenticator::rp_id_hash`, `crates/aegis-core/src/authenticator.rs:944`);
+  token (via `authenticator::rp_id_hash`, `crates/aegis-core/src/authenticator.rs:949`);
   caso contrário → 0x33.
-- [ ] **AC11:** `deleteCredential` (0x06) com token que **tem** `permissions RP ID`
+- [x] **AC11:** `deleteCredential` (0x06) com token que **tem** `permissions RP ID`
   associado é aceito **somente** se a credencial alvo (`CredentialManagementRequest::credential_id`,
   `crates/aegis-core/src/authenticator.rs:685`) pertencer ao mesmo RP (o RP vem do store,
   `Credential::rp_id`, `crates/aegis-core/src/authenticator.rs:53`); caso contrário → 0x33
   e **nenhuma** credencial é removida.
-- [ ] **AC12:** Após uma `makeCredential` ou `getAssertion` **bem-sucedida** que testou
+- [x] **AC12:** Após uma `makeCredential` ou `getAssertion` **bem-sucedida** que testou
   User Presence usando o token, o token fica **sem permissões** (`mc`, `ga` e `cm`
   removidos; `lbw` nunca foi concedido) e o `permissions RP ID` deixa de valer. Qualquer
   uso posterior do mesmo token (em `makeCredential`, `getAssertion` ou credential
   management) é rejeitado com 0x33.
-- [ ] **AC13:** A redução de permissões (AC12) ocorre **somente** quando a operação que
+- [x] **AC13:** A redução de permissões (AC12) ocorre **somente** quando a operação que
   testou presença conclui com sucesso e **usou** o token; uma operação que termina em
   erro (`NoCredentials`, `CredentialExcluded`, `UpRequired`) ou que não usa
   `pinUvAuthParam` mantém as permissões do token intactas.
-- [ ] **AC14:** `changePIN` bem-sucedido continua invalidando o token: o token anterior
+- [x] **AC14:** `changePIN` bem-sucedido continua invalidando o token: o token anterior
   é rejeitado com 0x33 e nenhum `permissions RP ID` permanece associado
-  (regressão de `crates/aegis-core/src/pin.rs:740-744`).
-- [ ] **AC15:** `authenticatorReset` invalida o token ativo: após o reset, o token
+  (regressão de `crates/aegis-core/src/pin.rs:901`).
+- [x] **AC15:** `authenticatorReset` invalida o token ativo: após o reset, o token
   anterior é rejeitado com 0x33 (hoje sobrevive em RAM, porque `FidoSession.client_pin`
-  — `crates/firmware-universal-rp2350/src/main.rs:609-616` — não é limpo no caminho de
+  — `crates/firmware-universal-rp2350/src/main.rs:689-696` — não é limpo no caminho de
   reset).
 
 ## Plano de teste
@@ -211,21 +217,21 @@ Todos os AC são verificáveis em host, no crate `aegis-core` (`no_std`/`no_allo
 testável), sem HAL:
 
 - `crates/aegis-core/src/pin.rs` (módulo `tests`, a partir de
-  `crates/aegis-core/src/pin.rs:749`): estado do token, emissão e escopo.
+  `crates/aegis-core/src/pin.rs:1110`): estado do token, emissão e escopo.
   - AC1/AC2/AC3: emissão com/sem `rpId`, com `mc`, `ga`, `cm`; rejeição de `mc`/`ga` sem
     `rpId`.
   - AC12/AC13/AC14/AC15: redução de permissões após operação com UP, manutenção em
     operação com erro, invalidação por `changePIN` e por reset.
 - `crates/aegis-core/src/authenticator.rs` (módulo `tests`, a partir de
-  `crates/aegis-core/src/authenticator.rs:1035`) + `crates/aegis-core/src/pin.rs`:
+  `crates/aegis-core/src/authenticator.rs:1091`) + `crates/aegis-core/src/pin.rs`:
   autorização por operação e por escopo de RP (AC4–AC11), combinando `ClientPin` com
   `MemoryCredentialStore` (`crates/aegis-core/src/authenticator.rs:167`) para resolver o
   RP da credencial alvo no `deleteCredential`.
 - Testes existentes que **precisam** ser atualizados (a mudança é intencional):
   `token_permissions_follow_the_requested_subcommand`
-  (`crates/aegis-core/src/pin.rs:1273`) — hoje afirma que o token legado autoriza
+  (`crates/aegis-core/src/pin.rs:1590`) — hoje afirma que o token legado autoriza
   credential management; e `token_requests_validate_the_permissions`
-  (`crates/aegis-core/src/pin.rs:1340`) — deve ganhar o caso `mc`/`ga` sem `rpId`.
+  (`crates/aegis-core/src/pin.rs:1658`) — deve ganhar o caso `mc`/`ga` sem `rpId`.
 - **Gates:**
   ```powershell
   cargo fmt --all --check
@@ -237,7 +243,7 @@ testável), sem HAL:
 - **Gate de hardware (procedimento, pendente de dispositivo físico):**
   `python scripts/validate_fido.py --pin <PIN>` — o validador já cobre
   `getPinUvAuthTokenUsingPinWithPermissions` com `cm` e a enumeração
-  (`scripts/validate_fido.py:196-227`); deve ser estendido com os casos negativos
+  (`scripts/validate_fido.py:259-305`); deve ser estendido com os casos negativos
   (token com `cm` + `rpId` → `enumerateRPs` recusado; token `mc` usado em `getAssertion`
   de outro RP → 0x33).
 
@@ -247,36 +253,37 @@ testável), sem HAL:
   `pin_uv_auth_rp_id`, `legacy_token`, `crates/aegis-core/src/pin.rs:390-399`),
   validação da emissão (`requested_permissions`, `crates/aegis-core/src/pin.rs:624-645`),
   verificação do `pinUvAuthParam` com permissão + RP
-  (`verify_pin_uv_auth_param`, `crates/aegis-core/src/pin.rs:422-431`), autorização de
-  credential management (`allows_credential_management` /
-  `verify_credential_management_param`, `crates/aegis-core/src/pin.rs:440-452`) e a
-  redução de permissões após User Presence. Toda a decisão de autorização fica **em
-  `aegis-core`**; o firmware só despacha.
+  (`verify_pin_uv_auth_param`, a ser mantida), autorização por operação
+  (`ClientPin::authorize`, `TokenRequest`/`TokenOperation`/`ManagementScope`),
+  o vínculo de RP no primeiro uso, a redução de permissões após User Presence
+  (`close_user_presence_operation`) e a invalidação (`invalidate_token`). As
+  primitivas dispersas que existiam antes (`allows_credential_management`,
+  `verify_credential_management_param`) foram **substituídas** pela API única.
+  Toda a decisão de autorização fica **em `aegis-core`**; o firmware só despacha.
 - `crates/firmware-universal-rp2350/src/main.rs`: despacho —
-  `check_user_verification` (`crates/firmware-universal-rp2350/src/main.rs:963-988`) passa a
-  informar a permissão exigida (`mc`/`ga`) e o RP da requisição; `handle_credential_management`
-  (`crates/firmware-universal-rp2350/src/main.rs:1002-1107`) passa a informar o RP
-  efetivo (`rpIDHash` do pedido ou RP da credencial alvo) e a exigir `cm`; o caminho de
-  `authenticatorReset` passa a limpar o token da `FidoSession`
-  (`crates/firmware-universal-rp2350/src/main.rs:609-616`).
+  `check_user_verification` passa a informar a permissão exigida (`mc`/`ga`) e o
+  RP da requisição; `handle_credential_management` passa a informar o RP
+  efetivo (`rpIDHash` do pedido ou RP da credencial alvo) e a exigir `cm`; o
+  caminho de `authenticatorReset` passa a limpar o token da `FidoSession`.
 - `crates/aegis-core/src/authenticator.rs`: sem mudança de API obrigatória — a resolução do
   RP da credencial reutiliza `CredentialStore::get`
   (`crates/aegis-core/src/authenticator.rs:148`), `Credential::rp_id`
   (`crates/aegis-core/src/authenticator.rs:53`) e `rp_id_hash`
-  (`crates/aegis-core/src/authenticator.rs:944`).
+  (`crates/aegis-core/src/authenticator.rs:949`).
 - `crates/aegis-core/src/credential_store.rs`: **sem alteração** (o estado do token não é
   persistido; o banco continua selado em AES-256-GCM).
-- `scripts/validate_fido.py`: extensão opcional dos casos negativos (gate de hardware).
+- `scripts/validate_fido.py`: os casos negativos já foram acrescentados
+  (`check_token_scope`); falta apenas a execução em hardware.
 
 ## Documentação
 
-- `roadmap.md`: atualizar a fatia 7e, "Limitações registradas" (roadmap.md:481-487) —
+- `roadmap.md`: atualizar a fatia 7e, "Limitações registradas" —
   a nota "O par RP/credencial da plataforma é verificado pela permissão `cm` e, para
   tokens com `rpId` associado, apenas o escopo do RP é considerado" deixa de ser
-  limitação e passa a ser comportamento verificado.
+  limitação e passa a ser comportamento verificado (fatia 7g).
 - `validation.md`: registrar a evidência (testes de host novos + gate
   `validate_fido.py` em hardware, quando houver dispositivo) na seção das fases 7e
-  (validation.md:430) e em "Limitações conhecidas" (validation.md:524).
+  e em "Limitações conhecidas".
 - `docs/security-model.md`: acrescentar o invariante "o `pinUvAuthToken` autoriza apenas
   as permissões concedidas e apenas o RP vinculado" na seção de invariantes.
 - `README.md`: apenas se a descrição do fluxo `clientPIN` mudar (hoje não detalha
@@ -311,7 +318,7 @@ testável), sem HAL:
 - **Ordem entre verificação e operação.** A verificação de permissão/RP deve ocorrer
   **antes** de esperar User Presence, para não gastar a presença do usuário em uma
   requisição que será rejeitada (o despacho atual já verifica UV antes de
-  `wait_presence_notifying`, `crates/firmware-universal-rp2350/src/main.rs:824-838`).
+  `wait_presence_notifying`, `crates/firmware-universal-rp2350/src/main.rs:904-918`).
 - **Estado do token em RAM.** O token vive no `FidoSession`; um `CTAPHID_INIT`/reabertura
   de sessão ou um power cycle zera o estado — comportamento aceito (o estado do token
   não é persistido por definição).

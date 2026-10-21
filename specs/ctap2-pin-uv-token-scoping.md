@@ -1,5 +1,15 @@
 # Spec — Escopo do `pinUvAuthToken` (permissão por operação + vínculo por RP)
 
+> **SUPERADA.** Esta especificação foi escrita durante a implementação e
+> diverge da que foi implementada: ela prevê que um token sem vínculo de RP
+> sirva qualquer RP e que o token legado (de `getPinToken`) autorize
+> credential management. A versão aprovada e implementada é
+> [`specs/ctap2-token-scope.md`](ctap2-token-scope.md) (fatia 7g do
+> `roadmap.md`), que adota a nota de §6.5.5.7 da CTAP2.1 (o token sem
+> *permissions RP ID* é vinculado no primeiro uso) e exige a permissão `cm`
+> explícita para credential management. O arquivo fica como registro do
+> caminho de análise; **não** usar como referência de implementação.
+
 **Origem:** achado do `sec-audit` (severidade ALTO) — o token `pinUvAuthToken` não é
 escopado: a prova de UV não está vinculada nem à operação nem ao *relying party*.
 **Escopo:** `crates/aegis-core` (núcleo testável em host) + wiring em
@@ -517,13 +527,13 @@ A decisão do orquestrador foi: **implementar esta spec como fatia fechada e
 auditável** (9 ACs, testes de host + wiring de firmware) e tratar a spec
 paralela como fonte de itens para as próximas fatias do loop.
 
-**Atualização:** a fatia **7h** (implementada em paralelo, a partir de
+**Atualização:** a fatia **7g** (implementada a partir de
 `specs/ctap2-token-scope.md`) entregou os itens acima com uma política **mais
 estrita** que a desta spec: o token legado deixou de autorizar credential
 management, o primeiro uso vincula o token ao RP, uma operação com presença
 bem-sucedida descarta as permissões do token, `authenticatorReset` o invalida e
 `getCredsMetadata` passa a exigir token com `cm`. O código de `aegis-core`
-reflete hoje a política da 7h; esta spec (7g) permanece no histórico como o
+reflete hoje a política da 7g; esta spec permanece no histórico como o
 registro do escopo mínimo originalmente implementado, e as diferenças
-deliberadas estão descritas em `validation.md` (Fase 7h) e em
+deliberadas estão descritas em `validation.md` (Fase 7g) e em
 `docs/security-model.md`.

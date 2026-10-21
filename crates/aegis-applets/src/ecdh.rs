@@ -1,7 +1,7 @@
 //! Elliptic-curve Diffie-Hellman for the OpenPGP card (RFC 6637).
 //!
 //! The card never hands the shared secret to the host: it derives the key
-//! encryption key itself (RFC 6637 §7) and unwraps the session key that the
+//! encryption key itself (RFC 6637 Ã‚Â§7) and unwraps the session key that the
 //! sender wrapped for it (RFC 3394). This module holds those primitives so
 //! they can be tested on the host.
 
@@ -17,22 +17,22 @@ const MAX_PARAM: usize = 64;
 /// Maximum size of an unwrapped key.
 const MAX_UNWRAPPED: usize = 64;
 
-/// The NIST P-256 curve OID (RFC 6637 §11), truncated as the RFC requires.
+/// The NIST P-256 curve OID (RFC 6637 Ã‚Â§11), truncated as the RFC requires.
 pub const CURVE_OID_P256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
 
-/// The ECDH public key algorithm ID (RFC 6637 §5).
+/// The ECDH public key algorithm ID (RFC 6637 Ã‚Â§5).
 pub const ALG_ECDH: u8 = 18;
 
-/// The SHA-256 hash ID used with the KDF (RFC 4880 §9.4).
+/// The SHA-256 hash ID used with the KDF (RFC 4880 Ã‚Â§9.4).
 pub const HASH_SHA256: u8 = 8;
 
-/// The AES-128 key wrap algorithm ID (RFC 4880 §9.2).
+/// The AES-128 key wrap algorithm ID (RFC 4880 Ã‚Â§9.2).
 pub const KEK_AES128: u8 = 7;
 
-/// The default initial value of the AES key wrap (RFC 3394 §2.2.3.1).
+/// The default initial value of the AES key wrap (RFC 3394 Ã‚Â§2.2.3.1).
 const KEY_WRAP_IV: [u8; 8] = [0xA6; 8];
 
-/// The KDF parameters of RFC 6637 §8.
+/// The KDF parameters of RFC 6637 Ã‚Â§8.
 ///
 /// The layout is `len(curve_oid) || curve_oid || public_key_alg_ID ||
 /// 0x03 || 0x01 || KDF_hash_ID || KEK_alg_ID || "Anonymous Sender    " ||
@@ -63,7 +63,7 @@ pub fn param(
     Some(out)
 }
 
-/// The key derivation function of RFC 6637 §7.
+/// The key derivation function of RFC 6637 Ã‚Â§7.
 ///
 /// It is the concatenation KDF of NIST SP 800-56A (alternative 1) with
 /// SHA-256: `SHA-256(00 00 00 01 || ZB || Param)`, where `ZB` is the `x`
@@ -112,6 +112,85 @@ fn decrypt_block(kek: &[u8], block: &mut [u8; 16]) -> bool {
     matches!(result, Some(Ok(_)))
 }
 
+/// Encrypt one block with the key-encryption key.
+pub(crate) fn encrypt_block(kek: &[u8], block: &mut [u8; 16]) -> bool {
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
+
+    let mut buf = aes::Block::from(*block);
+    match kek.len() {
+        16 => {
+            let Ok(cipher) = aes::Aes128::new_from_slice(kek) else {
+                return false;
+            };
+            cipher.encrypt_block(&mut buf);
+        }
+        24 => {
+            let Ok(cipher) = aes::Aes192::new_from_slice(kek) else {
+                return false;
+            };
+            cipher.encrypt_block(&mut buf);
+        }
+        32 => {
+            let Ok(cipher) = aes::Aes256::new_from_slice(kek) else {
+                return false;
+            };
+            cipher.encrypt_block(&mut buf);
+        }
+        _ => return false,
+    }
+    block.copy_from_slice(&buf);
+    true
+}
+
+/// Wrap a key with the AES key wrap algorithm (RFC 3394).
+///
+/// This is the sender side: the card only unwraps. The function exists so the
+/// tests can act as the sender of an OpenPGP message and so the wrapping can
+/// be checked against the vectors of the RFC.
+#[must_use]
+pub fn aes_key_wrap(kek: &[u8], data: &[u8]) -> Option<Vec<u8, MAX_UNWRAPPED>> {
+    if kek.len() != 16 && kek.len() != 24 && kek.len() != 32 {
+        return None;
+    }
+    if data.len() < 16 || data.len() % 8 != 0 {
+        return None;
+    }
+    let n = data.len() / 8;
+    let mut a = KEY_WRAP_IV;
+    let mut r: Vec<[u8; 8], 8> = Vec::new();
+    for index in 0..n {
+        let mut block = [0u8; 8];
+        block.copy_from_slice(&data[8 * index..8 * (index + 1)]);
+        r.push(block).ok()?;
+    }
+
+    for round in 0..6 {
+        for index in 0..n {
+            let mut block = [0u8; 16];
+            block[..8].copy_from_slice(&a);
+            block[8..].copy_from_slice(&r[index]);
+            if !encrypt_block(kek, &mut block) {
+                return None;
+            }
+            a.copy_from_slice(&block[..8]);
+            r[index].copy_from_slice(&block[8..]);
+            // A = MSB(64, B) XOR t, with t = n * j + i.
+            let mut t = (n * round + index + 1) as u32;
+            for byte in a.iter_mut().rev() {
+                *byte ^= (t & 0xff) as u8;
+                t >>= 8;
+            }
+        }
+    }
+
+    let mut out: Vec<u8, MAX_UNWRAPPED> = Vec::new();
+    out.extend_from_slice(&a).ok()?;
+    for block in &r {
+        out.extend_from_slice(block).ok()?;
+    }
+    Some(out)
+}
+
 /// Unwrap a key with the AES key wrap algorithm (RFC 3394).
 ///
 /// The wrapped key is a multiple of eight octets; the last block carries the
@@ -137,7 +216,7 @@ pub fn aes_key_unwrap(kek: &[u8], wrapped: &[u8]) -> Option<Vec<u8, MAX_UNWRAPPE
     for round in (0..6).rev() {
         for index in (0..n).rev() {
             // B = AES-1(K, (A ^ t) | R[i]), with t = n * j + i: the counter
-            // is XORed into A before the decryption (RFC 3394 §2.2.2).
+            // is XORed into A before the decryption (RFC 3394 Ã‚Â§2.2.2).
             let mut t = (n * round + index + 1) as u32;
             let mut a_xor = a;
             for byte in a_xor.iter_mut().rev() {
@@ -171,7 +250,7 @@ pub fn aes_key_unwrap(kek: &[u8], wrapped: &[u8]) -> Option<Vec<u8, MAX_UNWRAPPE
 mod tests {
     use super::*;
 
-    /// RFC 3394 §4.1: 128 bits of key data with a 128-bit KEK.
+    /// RFC 3394 Ã‚Â§4.1: 128 bits of key data with a 128-bit KEK.
     const RFC3394_128: (&[u8; 16], &[u8; 16], &[u8; 24]) = (
         &[
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
@@ -187,7 +266,7 @@ mod tests {
         ],
     );
 
-    /// RFC 3394 §4.2: 128 bits of key data with a 192-bit KEK.
+    /// RFC 3394 Ã‚Â§4.2: 128 bits of key data with a 192-bit KEK.
     const RFC3394_192_KEK: (&[u8; 24], &[u8; 16], &[u8; 24]) = (
         &[
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
@@ -202,7 +281,7 @@ mod tests {
             0xAE, 0xD2, 0x46, 0x8A, 0xB8, 0xA1, 0x7A, 0xD8, 0x4E, 0x5D,
         ],
     );
-    /// RFC 3394 §4.3: 128 bits of key data with a 256-bit KEK.
+    /// RFC 3394 Ã‚Â§4.3: 128 bits of key data with a 256-bit KEK.
     const RFC3394_256_KEK: (&[u8; 32], &[u8; 16], &[u8; 24]) = (
         &[
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
@@ -218,7 +297,7 @@ mod tests {
             0x8A, 0x2A, 0x93, 0xC8, 0x19, 0x1E, 0x7D, 0x6E, 0x8A, 0xE7,
         ],
     );
-    /// RFC 3394 §4.4: 192 bits of key data with a 192-bit KEK.
+    /// RFC 3394 Ã‚Â§4.4: 192 bits of key data with a 192-bit KEK.
     const RFC3394_192: (&[u8; 24], &[u8; 24], &[u8; 32]) = (
         &[
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
@@ -248,6 +327,19 @@ mod tests {
     }
 
     #[test]
+    fn wraps_to_the_rfc3394_vectors() {
+        // The sender side must produce the ciphertexts of the RFC.
+        let (kek, data, wrapped) = RFC3394_128;
+        assert_eq!(aes_key_wrap(kek, data).unwrap().as_slice(), wrapped);
+        let (kek, data, wrapped) = RFC3394_192_KEK;
+        assert_eq!(aes_key_wrap(kek, data).unwrap().as_slice(), wrapped);
+        let (kek, data, wrapped) = RFC3394_256_KEK;
+        assert_eq!(aes_key_wrap(kek, data).unwrap().as_slice(), wrapped);
+        let (kek, data, wrapped) = RFC3394_192;
+        assert_eq!(aes_key_wrap(kek, data).unwrap().as_slice(), wrapped);
+    }
+
+    #[test]
     fn rejects_a_tampered_wrapping() {
         let (kek, _, wrapped) = RFC3394_128;
         let mut tampered = *wrapped;
@@ -272,7 +364,7 @@ mod tests {
     #[test]
     fn the_kdf_matches_the_reference_value() {
         // Reference: SHA-256(00 00 00 01 || ZB || Param) with the parameters
-        // of RFC 6637 §8 for P-256, SHA-256 and AES-128, computed by an
+        // of RFC 6637 Ã‚Â§8 for P-256, SHA-256 and AES-128, computed by an
         // independent implementation of the RFC text.
         let fingerprint = [
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,

@@ -6,6 +6,7 @@ __pycache__/
 *.elf
 *.bin
 .embuild
+node_modules/
 # Secrets: never commit keys or certificates.
 *.pem
 *.key

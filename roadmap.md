@@ -1095,15 +1095,18 @@ adiado.
   precisam de validação externa.
 - **Cripto fora desta slice:** RSA, Ed25519/EdDSA e X25519/KDF OpenPGP ficam
   para as Fases 15–16.
-- **ECDH OpenPGP (S1 entregue, S2 pendente):** o applet **não devolve mais o
-  shared secret** ao host. As primitivas da RFC 6637 (KDF de concatenação
+- **ECDH OpenPGP (S1 e S2 entregues, interop pendente):** o applet **não devolve
+  mais o shared secret** ao host. As primitivas da RFC 6637 (KDF de concatenação
   NIST SP 800-56A com SHA-256, AES Key Wrap da RFC 3394 e o bloco de
   parâmetros do §8) estão em `aegis-applets::ecdh`, com os vetores da RFC
-  3394 e um vetor de referência da KDF; enquanto o material RFC 6637 não está
-  provisionado, `PSO:DECIPHER` responde `6A81` em vez de vazar o segredo.
-  A etapa S2 (material provisionado, desembrulho da chave de sessão e
-  decifra do texto no cartão) depende de hardware e de interop com o GnuPG.
-  Spec: `specs/openpgp-rfc6637-ecdh.md`.
+  3394 e um vetor de referência da KDF. Na etapa S2 o cartão executa o fluxo
+  completo: `S = r·V` → KEK → desembrulho da chave de sessão → decifra dos
+  dados com a camada simétrica do OpenPGP (`aegis-applets::pgp_sym`, CFB da
+  RFC 4880 §13.9 com *resync*, *quick check* e MDC), validada contra uma
+  implementação de referência independente. O material importado é cifrado
+  (`PUT DATA 0xD2`, formato **provisório**); a chave privada do slot nunca é
+  importada. **Pendente:** alinhar o *key import* ao OpenPGP Card 3.4 e
+  validar `gpg -d` em hardware. Spec: `specs/openpgp-rfc6637-ecdh.md`.
 
 ## Persistência selada dos applets (entregue)
 

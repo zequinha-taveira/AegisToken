@@ -117,18 +117,40 @@ provisionamento e de interop que não podem ser validados sem placa:
    `INTERNAL AUTHENTICATE` e no caminho RSA de `PSO:DECIPHER` (que continua
    devolvendo o bloco decifrado por operação privada, como manda a Yubico).
 
-### 3.2 Etapa S2 (fatia seguinte, não implementada aqui) — decifra completa no cartão
+### 3.2 Etapa S2 — decifra completa no cartão (implementada; interop pendente)
 
-- O slot de decifra passa a guardar o material RFC 6637: chave privada `r` +
-  chave de sessão **embrulhada** `C` + impressão digital do destinatário (20
-  bytes) + IDs de algoritmo (hash da KDF, KEK, simétrica). Isso é um **novo
-  formato de slot** → **migração de estado** (hoje `STATE_VERSION = 3`).
-- Provisionamento de `C` por `PUT DATA` (material **cifrado**, não chave
-  privada) e por `GENERATE` (o cartão gera a chave de sessão e a embrulha
-  para si mesmo, se possível).
-- `PSO:DECIPHER` completo: `S = r·V` → `Z = KDF(...)` → desembrulho de `C` →
-  decifra do texto cifrado (OpenPGP Tag 18: CFB + MDC).
-- Interop com o GnuPG (`gpg -d`), que exige **placa**.
+- **Material no slot de decifra:** a chave privada `r` continua no dispositivo
+  (gerada on-device) e passa a ser acompanhada do material RFC 6637: a chave de
+  sessão **embrulhada** `C` (cifrado), o hash id da KDF e o id do algoritmo da
+  KEK. O layout vive dentro do array de material que o slot já tinha (1156
+  bytes), então **não há migração de formato de estado**: um slot ECDH antigo
+  (material de 32 bytes) é simplesmente "não provisionado" e continua falhando
+  fechado.
+- **Provisionamento:** `PUT DATA` com a tag `0x00D2` (o DO de chave privada da
+  chave 2) e o corpo `len || C || hash id da KDF || id da KEK`. O material
+  importado é **cifrado**; a chave privada nunca é importada. O formato é
+  **provisório**: ainda precisa ser alinhado ao *key import* do OpenPGP Card
+  3.4, o que só pode ser conferido contra um host que fale o protocolo.
+- **`PSO:DECIPHER`:** o comando traz a chave pública efêmera do remetente
+  (`86`) e os dados cifrados (`80`); o cartão calcula `S = r·V`, deriva a KEK
+  com a KDF da §7, desembrulha `C` (RFC 3394), confere o *checksum* da chave de
+  sessão e decifra os dados com a camada simétrica do OpenPGP, verificando o
+  *modification detection code*.
+- **Camada simétrica (`aegis-applets::pgp_sym`):** o CFB da RFC 4880 §13.9 com
+  o *resync* após o prefixo, o *quick check* da chave e a verificação do MDC
+  (§5.14). Validada contra uma implementação de referência independente
+  (`tests/openpgp_sym_reference.py`), que produz o mesmo texto cifrado e o
+  mesmo texto claro.
+- **Curve25519:** continua falhando fechado — a RFC 6637 não define os
+  parâmetros de KDF para essa curva.
+
+**O que falta para a interoperabilidade (S3):**
+
+1. O *key import* no formato do OpenPGP Card 3.4 (e o procedimento do GnuPG
+   correspondente), que é o que permite ao GnuPG importar a chave de sessão
+   embrulhada no cartão.
+2. A validação em hardware: `gpg -d` contra o cartão, o que exige um RP2350
+   físico e um GnuPG instalado.
 
 ### 3.3 Não-objetivos
 
