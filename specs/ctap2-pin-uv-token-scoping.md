@@ -516,3 +516,14 @@ fatias futuras, a serem executadas pelo loop com spec e gates próprios:
 A decisão do orquestrador foi: **implementar esta spec como fatia fechada e
 auditável** (9 ACs, testes de host + wiring de firmware) e tratar a spec
 paralela como fonte de itens para as próximas fatias do loop.
+
+**Atualização:** a fatia **7h** (implementada em paralelo, a partir de
+`specs/ctap2-token-scope.md`) entregou os itens acima com uma política **mais
+estrita** que a desta spec: o token legado deixou de autorizar credential
+management, o primeiro uso vincula o token ao RP, uma operação com presença
+bem-sucedida descarta as permissões do token, `authenticatorReset` o invalida e
+`getCredsMetadata` passa a exigir token com `cm`. O código de `aegis-core`
+reflete hoje a política da 7h; esta spec (7g) permanece no histórico como o
+registro do escopo mínimo originalmente implementado, e as diferenças
+deliberadas estão descritas em `validation.md` (Fase 7h) e em
+`docs/security-model.md`.

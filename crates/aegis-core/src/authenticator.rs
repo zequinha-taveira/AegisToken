@@ -650,8 +650,12 @@ pub fn sign_assertion<S: CredentialStore>(
 }
 
 /// CTAP2 `authenticatorReset`.
+///
+/// The reset drops every credential, the PIN state and the active PIN/UV
+/// auth token: the platform has to fetch a new token.
 pub fn reset<S: CredentialStore + crate::pin::PinState>(
     store: &mut S,
+    client_pin: &mut crate::pin::ClientPin,
     up_confirmed: bool,
 ) -> Result<(), Ctap2Status> {
     if !up_confirmed {
@@ -659,6 +663,7 @@ pub fn reset<S: CredentialStore + crate::pin::PinState>(
     }
     store.clear();
     store.clear_pin_state().map_err(|_| Ctap2Status::Other)?;
+    client_pin.invalidate_token();
     Ok(())
 }
 
@@ -1047,22 +1052,39 @@ pub fn rp_in_scope(rp_id: &str, bound_rp_id: Option<&str>) -> bool {
 /// Delete a credential, honouring the relying-party scope of the active
 /// PIN/UV token.
 ///
-/// The token must carry the `cm` capability and, when it is bound to a
-/// relying party, the credential must belong to that relying party. A
-/// credential of another relying party is refused and preserved.
-pub fn delete_credential_scoped<S: CredentialStore>(
+/// The token is verified against the message the platform authenticates and
+/// must carry the `cm` permission. When it is bound to a relying party, the
+/// credential must belong to that relying party: a credential of another
+/// relying party is refused and preserved.
+pub fn delete_credential_scoped<S: CredentialStore + crate::pin::PinState>(
     store: &mut S,
-    client_pin: &crate::pin::ClientPin,
+    client_pin: &mut crate::pin::ClientPin,
+    param: Option<&[u8]>,
+    message: &[u8],
     credential_id: &[u8],
 ) -> Result<(), Ctap2Status> {
-    if !client_pin.allows_credential_management() {
-        return Err(Ctap2Status::PinAuthInvalid);
-    }
-    let credential = store.get(credential_id).ok_or(Ctap2Status::NoCredentials)?;
-    if !client_pin.allows_delete_credential(credential.rp_id.as_str()) {
-        return Err(Ctap2Status::PinAuthInvalid);
-    }
-    store.remove(credential_id).map_err(|_| Ctap2Status::Other)
+    // The relying party that owns the credential comes from the store, not
+    // from the request: it is what the scope of a bound token is checked
+    // against.
+    let credential = store.get(credential_id);
+    let owner = credential
+        .as_ref()
+        .map(|credential| credential.rp_id.as_str());
+    client_pin.authorize(
+        store,
+        crate::pin::TokenRequest {
+            param,
+            message,
+            uv_requested: false,
+            operation: crate::pin::TokenOperation::CredentialManagement {
+                scope: crate::pin::ManagementScope::CredentialRelyingParty(owner),
+            },
+        },
+    )?;
+    let Some(credential) = credential else {
+        return Err(Ctap2Status::NoCredentials);
+    };
+    store.remove(&credential.id).map_err(|_| Ctap2Status::Other)
 }
 
 #[cfg(test)]
@@ -1705,8 +1727,8 @@ mod tests {
 
     #[test]
     fn delete_credential_is_restricted_to_the_bound_rp() {
-        use crate::pin::PERMISSION_CM;
-        use crate::pin::test_support::issue_token;
+        use crate::pin::test_support::{auth_param, issue_token};
+        use crate::pin::{ManagementScope, PERMISSION_CM, TokenOperation, TokenRequest};
 
         let mut store = MemoryCredentialStore::new();
         let mut rng = TestRng(51);
@@ -1733,28 +1755,57 @@ mod tests {
             .auth_data,
         );
 
-        let issued = issue_token(Some(PERMISSION_CM), Some("a.test"));
-        let client_pin = &issued.client_pin;
+        let mut issued = issue_token(Some(PERMISSION_CM), Some("a.test"));
+        let message = [CRED_MGMT_DELETE];
+        let param = auth_param(&issued.token, &message);
 
         // A credential of another relying party is refused and preserved.
         assert_eq!(
-            delete_credential_scoped(&mut store, client_pin, &other),
+            delete_credential_scoped(
+                &mut store,
+                &mut issued.client_pin,
+                Some(&param),
+                &message,
+                &other,
+            ),
             Err(Ctap2Status::PinAuthInvalid)
         );
         assert!(store.get(&other).is_some());
 
         // The credential of the bound relying party is removed.
         assert_eq!(
-            delete_credential_scoped(&mut store, client_pin, &bound),
+            delete_credential_scoped(
+                &mut store,
+                &mut issued.client_pin,
+                Some(&param),
+                &message,
+                &bound,
+            ),
             Ok(())
         );
         assert!(store.get(&bound).is_none());
+
+        // The scope of the token is the relying party of the credential, not
+        // the one of the request.
+        let scope = ManagementScope::CredentialRelyingParty(Some("b.test"));
+        assert_eq!(
+            issued.client_pin.authorize(
+                &store,
+                TokenRequest {
+                    param: Some(&param),
+                    message: &message,
+                    uv_requested: false,
+                    operation: TokenOperation::CredentialManagement { scope },
+                },
+            ),
+            Err(Ctap2Status::PinAuthInvalid)
+        );
     }
 
     #[test]
     fn a_token_without_rp_binding_deletes_any_credential() {
         use crate::pin::PERMISSION_CM;
-        use crate::pin::test_support::issue_token;
+        use crate::pin::test_support::{auth_param, issue_token};
 
         let mut store = MemoryCredentialStore::new();
         let mut rng = TestRng(52);
@@ -1770,11 +1821,52 @@ mod tests {
             .auth_data,
         );
 
-        let issued = issue_token(Some(PERMISSION_CM), None);
+        let mut issued = issue_token(Some(PERMISSION_CM), None);
+        let message = [CRED_MGMT_DELETE];
+        let param = auth_param(&issued.token, &message);
         assert_eq!(
-            delete_credential_scoped(&mut store, &issued.client_pin, &id),
+            delete_credential_scoped(
+                &mut store,
+                &mut issued.client_pin,
+                Some(&param),
+                &message,
+                &id,
+            ),
             Ok(())
         );
         assert!(store.get(&id).is_none());
+    }
+
+    #[test]
+    fn reset_invalidates_the_pin_uv_auth_token() {
+        use crate::pin::test_support::{auth_param, issue_token};
+        use crate::pin::{PERMISSION_CM, PERMISSION_MC, TokenOperation, TokenRequest};
+
+        let mut store = MemoryCredentialStore::new();
+        let mut issued = issue_token(Some(PERMISSION_MC | PERMISSION_CM), Some("a.test"));
+        let message = [0x7Bu8; 32];
+        let param = auth_param(&issued.token, &message);
+        let request = TokenRequest {
+            param: Some(&param),
+            message: &message,
+            uv_requested: false,
+            operation: TokenOperation::MakeCredential { rp_id: "a.test" },
+        };
+        assert_eq!(issued.client_pin.authorize(&store, request), Ok(true));
+
+        // The reset drops the token: it cannot authorise anything anymore.
+        assert_eq!(reset(&mut store, &mut issued.client_pin, true), Ok(()));
+        assert_eq!(issued.client_pin.token_permissions(), 0);
+        assert_eq!(issued.client_pin.token_rp_id(), None);
+        let request = TokenRequest {
+            param: Some(&param),
+            message: &message,
+            uv_requested: false,
+            operation: TokenOperation::MakeCredential { rp_id: "a.test" },
+        };
+        assert_eq!(
+            issued.client_pin.authorize(&store, request),
+            Err(Ctap2Status::PinAuthInvalid)
+        );
     }
 }

@@ -14,7 +14,7 @@ Documento vivo: cada fase é marcada conforme concluída e verificada.
 | 4 | Protocolo Management HID | Concluída |
 | 5 | Storage persistente + armazenamento seguro | Concluída |
 | 6 | User Presence contextual (BOOTSEL) | Concluída |
-| 7 | FIDO (CTAP1/U2F + CTAP2) | Concluída (7a–7g) |
+| 7 | FIDO (CTAP1/U2F + CTAP2) | Concluída (7a–7h) |
 | 8 | Atualização segura de firmware | Concluída |
 | 9 | Recovery + lifecycle completo | Concluída |
 | 10 | Validação de hardware (AC-001..AC-015) | Concluída (bootrom/OTP pendentes) |
@@ -465,7 +465,8 @@ adiado.
 - **Correção de segurança:** todo subcomando de credential management (exceto
   `getCredsMetadata`) exige token com permissão `cm`; antes, `deleteCredential`
   não exigia autenticação alguma. Tokens do `getPinToken` legado também são
-  aceitos (o PIN já foi provado).
+  aceitos (o PIN já foi provado) — **revisto na fatia 7h**: o token legado
+  concede apenas `mc|ga` e nunca autoriza credential management.
 - `getInfo` anuncia `pinUvAuthToken: true` e `credMgmt` apenas quando há PIN
   configurado (o token é obrigatório para enumerar).
 - `setPIN`/`getPINToken` aceitam o `pinUvAuthParam` truncado em 16 bytes
@@ -488,6 +489,10 @@ adiado.
   **Entregue na fatia 7g:** o token passa a ser escopado por operação e por
   RP (`enumerateRPsBegin` exige token sem vínculo; `deleteCredential` e
   `enumerateCredentialsBegin` ficam restritos ao RP vinculado).
+- ~~`getCredsMetadata` (0x01) responde sem qualquer autenticação.~~
+  **Entregue na fatia 7h:** todo subcomando de credential management exige
+  token com a permissão `cm`; a ausência de `pinUvAuthParam` responde
+  `PinRequired` (0x36).
 
 ### 7f — `getNextAssertion` e regra de User Verification (concluída)
 
@@ -538,7 +543,7 @@ adiado.
   `allows_enumerate_credentials` e `allows_delete_credential`. As primitivas
   `verify_pin_uv_auth_param` (verificação pura do HMAC) e
   `allows_credential_management` (capacidade `cm`) permanecem com a semântica
-  anterior.
+  anterior — **substituídas na fatia 7h** pela API única `authorize`.
 - `aegis-core::authenticator`: `rp_in_scope` e `delete_credential_scoped` — a
   credencial apagada precisa pertencer ao RP vinculado ao token; credencial de
   outro RP é recusada e **preservada** no store.
@@ -556,16 +561,93 @@ adiado.
 
 **Limitações registradas**
 
-- O token do `getPinToken` legado continua sem vínculo de RP e concede
+- ~~O token do `getPinToken` legado continua sem vínculo de RP e concede
   `mc|ga`: a proteção de escopo por RP só existe para tokens emitidos por
   `getPinUvAuthTokenUsingPinWithPermissions` com `rpId` (compatibilidade
-  CTAP2.0). Desvio documentado em `docs/security-model.md`.
-- O token legado continua autorizando credential management (o PIN já foi
-  provado); a CTAP2.1 estrita exigiria `cm` explícito — slice própria, com
-  impacto de compatibilidade.
+  CTAP2.0).~~ **Revisto na fatia 7h:** o token sem *permissions RP ID* é
+  vinculado ao RP do **primeiro uso** (§6.5.5.7), inclusive o legado.
+- ~~O token legado continua autorizando credential management (o PIN já foi
+  provado); a CTAP2.1 estrita exigiria `cm` explícito.~~ **Entregue na fatia
+  7h:** o token legado concede apenas `mc|ga` e nunca autoriza credential
+  management.
 - A validação de ponta a ponta em dispositivo físico (token com permissão ou
   RP errada contra o firmware flashed) está pendente: não há RP2350 físico
   nesta sessão. `scripts/validate_fido.py` é o candidato natural.
+
+### 7h — Escopo e ciclo de vida do `pinUvAuthToken` (CTAP2.1) (concluída)
+
+**Entregue**
+
+- **Correção de segurança:** o token deixa de ser um segredo opaco. A
+  verificação de HMAC, a **permissão exigida pela operação** e o **escopo de
+  RP** passam a ser decididos em um único lugar —
+  `aegis-core::pin::ClientPin::authorize` — com o resultado
+  `Result<bool, Ctap2Status>`: `Ok(true)` (verificado), `Ok(false)` (sem
+  token/parâmetro: a operação segue só com User Presence) e `Err` com o status
+  CTAP2 correto (`PinAuthInvalid` 0x33, `PinRequired` 0x36).
+- **Escopo de RP no primeiro uso** (§6.5.5.7): token emitido sem *permissions
+  RP ID* é vinculado ao RP da **primeira** operação `mc`/`ga`; a partir daí,
+  outro RP é recusado com 0x33. Token com `cm` e sem `rpId` permanece sem
+  vínculo (opera no dispositivo inteiro) — token com `cm` e `rpId` é recusado
+  em `getCredsMetadata`/`enumerateRPsBegin` (0x33).
+- **Regra única para o token legado:** `getPinToken` (0x05) concede `mc|ga` e
+  **nunca** autoriza credential management; a permissão `cm` explícita
+  (0x09) é o caminho suportado.
+- **Redução das permissões** (§6.5.5.7): após uma `makeCredential` ou
+  `getAssertion` **bem-sucedida** que testou User Presence usando o token, o
+  token fica **sem permissões** e sem vínculo de RP; qualquer uso posterior é
+  recusado com 0x33. Operação que falhou (`NoCredentials`,
+  `CredentialExcluded`, `UpRequired`) ou que não usou `pinUvAuthParam` mantém
+  as permissões.
+- **Ciclo de vida:** `changePIN` e `authenticatorReset` invalidam o token
+  ativo (segredo, permissões e vínculo de RP); o `authenticatorReset` deixa
+  de deixar o token sobreviver em RAM.
+- `getCredsMetadata` (0x01) passa a exigir token com `cm`: sem
+  `pinUvAuthParam` → `PinRequired` (0x36).
+- `aegis-core::pin`: `TokenOperation`, `ManagementScope`, `TokenRequest`,
+  `authorize`, `close_user_presence_operation` e `invalidate_token`. As
+  primitivas dispersas (`verify_scoped_auth_param`,
+  `allows_credential_management`, `verify_credential_management_param`,
+  `allows_enumerate_rps`, `allows_enumerate_credentials`,
+  `allows_delete_credential`) foram **substituídas** pela API única; o estado
+  `legacy_token` saiu do `ClientPin` (as permissões concedidas passam a ser
+  o estado real do token).
+- `aegis-core::authenticator`: `delete_credential_scoped` resolve o RP da
+  credencial alvo **no store** e autoriza a operação; `reset` invalida o
+  token.
+
+**Verificação**
+
+- 252 testes de host em `aegis-core` (11 novos nesta fatia — emissão sem
+  `rpId`, token legado, escopo por operação, escopo por RP, vínculo no
+  primeiro uso, `cm` por subcomando, redução de permissões, manutenção em
+  operação com erro, invalidação por `changePIN` e por reset — e 6 testes
+  obsoletos substituídos), clippy limpo em host e alvo, build de firmware
+  gerado.
+- Gate de hardware (`scripts/validate_fido.py --pin <PIN>`) **pendente**:
+  não há RP2350 físico nesta sessão. O validador precisa ser estendido com os
+  casos negativos (token com `cm` + `rpId` → `enumerateRPs` recusado; token
+  `mc` usado em `getAssertion` de outro RP → 0x33).
+
+**Limitações registradas**
+
+- **Interoperabilidade CTAP2.0:** o token de `getPinToken` (0x05) não
+  autoriza mais credential management. O comando de credential management
+  (0x0A) é CTAP2.1 e o dispositivo anuncia `FIDO_2_0`, então o risco prático
+  é baixo — mas é a mudança de comportamento mais visível desta fatia.
+- **`getCredsMetadata` passou a exigir autenticação:** a contagem de
+  credenciais residentes era informação sem autenticação. Clientes que não
+  enviam `pinUvAuthParam` para 0x01 recebem 0x36 (o `python-fido2` sempre
+  envia).
+- **Sem expiração por tempo:** o *usage timer* (§6.5.2.1) continua não
+  implementado; o token vive enquanto a sessão CTAPHID viver, desde que não
+  seja usado numa operação com presença.
+- **Redução só em caso de sucesso:** a CTAP2.1 não diz se a redução ocorre
+  quando a operação com presença falha; reduzir só no sucesso evita punir
+  retentativas legítimas da plataforma (ex.: `excludeList`).
+- **Divergência documentada:** o token sem *permissions RP ID* é vinculado no
+  primeiro uso, como manda a nota de §6.5.5.7, em vez de a emissão ser
+  recusada — recusar quebraria plataformas que pedem `mc`/`ga` sem `rpId`.
 
 ### 7d — CTAP1/U2F (concluída)
 
@@ -649,6 +731,14 @@ adiado.
   `LifecycleManager`.
 - Firmware: registra o destino de boot (Active vs Recovery) via
   `boot_destination`.
+- `aegis-core::state::BootPlan`: plano de boot derivado do destino
+  (`Active`/`Recovery`/`Locked`) que diz, por caminho, o que o firmware pode
+  servir (FIDO, CCID, Management, HID OTP de laboratório) e quais stores
+  selados podem ser abertos. Falha fechada: só `Active` habilita FIDO/CCID.
+- Firmware: o boot consulta o plano e **não inicia** as tarefas FIDO/CCID
+  quando o caminho é negado; os pontos de abertura dos stores selados também
+  são condicionados ao plano. Management (diagnóstico e firmware update)
+  permanece em todos os destinos.
 
 **Requisitos/AC:** FR-010, FR-014, §20–§22.
 
@@ -662,6 +752,11 @@ adiado.
 - O firmware entra em Recovery pelo bootrom (BOOTSEL); a execução de
   `RecoverySession` on-device e a limpeza de credenciais no factory reset
   dependem do refactor de compartilhamento de storage.
+- O *gating* por destino de boot está entregue: em `Recovery`/`Locked` o
+  firmware não serve FIDO nem CCID e não abre stores selados. Permanecem
+  pendentes a execução on-device da `RecoverySession`, a limpeza de
+  credenciais no factory reset e a supressão da enumeração USB (hoje as
+  interfaces FIDO/CCID continuam enumerando, mas não respondem).
 
 ---
 

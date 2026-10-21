@@ -11,8 +11,13 @@ within the 15 second presence timeout.
 
 Covers AC-002/AC-011/AC-013 (ES256) and AC-020 (Ed25519 `ed25519-sk` flows).
 With ``--pin`` the script also exercises the clientPIN rotation
-(``changePIN``) and the CTAP2.1 credential management commands
-(``enumerateRPs``/``enumerateCredentials``).
+(``changePIN``), the CTAP2.1 credential management commands
+(``enumerateRPs``/``enumerateCredentials``) and the negative cases of the
+PIN/UV auth token scope (legacy token in credential management, ``cm`` token
+bound to a relying party, cross-relying-party assertion).
+
+A token is spent by an operation that tests user presence, so the script
+fetches a fresh token for every operation that needs one.
 
 Exit code is 0 when every check passes, 1 otherwise.
 """
@@ -64,6 +69,26 @@ def pin_uv_params(token: bytes | None, client_data_hash: bytes) -> dict:
     }
 
 
+def issue_token(
+    device,
+    pin_value: str | None,
+    permissions=None,
+    permissions_rpid: str | None = None,
+) -> bytes | None:
+    """Fetch a PIN/UV auth token.
+
+    A token is spent by an operation that tests user presence (CTAP2.1
+    §6.5.5.7), so every operation that needs one fetches its own. Without a
+    PIN there is no token and the operation runs on user presence alone.
+    """
+    if pin_value is None:
+        return None
+    pin = ClientPin(Ctap2(device))
+    return pin.get_pin_token(
+        pin_value, permissions=permissions, permissions_rpid=permissions_rpid
+    )
+
+
 def check_fido(device) -> bool:
     ctap2 = Ctap2(device)
     try:
@@ -92,10 +117,11 @@ def check_u2f(device) -> None:
         record("U2F VERSION", False, str(exc))
 
 
-def check_make_credential(device, token: bytes | None = None) -> bool:
+def check_make_credential(device, pin_value: str | None = None) -> bool:
     print(">>> Press BOOTSEL within 15s to approve makeCredential")
     try:
         client_data_hash = hashlib.sha256(os.urandom(32)).digest()
+        token = issue_token(device, pin_value)
         attestation = Ctap2(device).make_credential(
             client_data_hash,
             {"id": "example.com", "name": "Example"},
@@ -110,10 +136,11 @@ def check_make_credential(device, token: bytes | None = None) -> bool:
         return False
 
 
-def check_make_credential_eddsa(device, token: bytes | None = None) -> bool:
+def check_make_credential_eddsa(device, pin_value: str | None = None) -> bool:
     print(">>> Press BOOTSEL within 15s to approve makeCredential (EdDSA)")
     try:
         client_data_hash = hashlib.sha256(os.urandom(32)).digest()
+        token = issue_token(device, pin_value)
         attestation = Ctap2(device).make_credential(
             client_data_hash,
             {"id": "example.com", "name": "Example"},
@@ -130,10 +157,11 @@ def check_make_credential_eddsa(device, token: bytes | None = None) -> bool:
         return False
 
 
-def check_get_assertion_eddsa(device, token: bytes | None = None) -> None:
+def check_get_assertion_eddsa(device, pin_value: str | None = None) -> None:
     print(">>> Press BOOTSEL within 15s to approve getAssertion (EdDSA)")
     try:
         client_data_hash = hashlib.sha256(os.urandom(32)).digest()
+        token = issue_token(device, pin_value)
         assertion = Ctap2(device).get_assertion(
             "example.com",
             client_data_hash,
@@ -148,10 +176,11 @@ def check_get_assertion_eddsa(device, token: bytes | None = None) -> None:
         record("AC-020 getAssertion Ed25519 (UP)", False, str(exc))
 
 
-def check_get_assertion(device, token: bytes | None = None) -> None:
+def check_get_assertion(device, pin_value: str | None = None) -> None:
     print(">>> Press BOOTSEL within 15s to approve getAssertion")
     try:
         client_data_hash = hashlib.sha256(os.urandom(32)).digest()
+        token = issue_token(device, pin_value)
         assertion = Ctap2(device).get_assertion(
             "example.com",
             client_data_hash,
@@ -227,11 +256,61 @@ def check_credential_management(device, pin_value: str) -> None:
         record("CTAP2 credMgmt enumerateCredentials", False, str(exc))
 
 
-def check_resident_credential(device, token: bytes | None = None) -> None:
+def check_token_scope(device, pin_value: str) -> None:
+    """Negative cases of the PIN/UV auth token scope (CTAP2.1)."""
+    ctap2 = Ctap2(device)
+    pin = ClientPin(ctap2)
+
+    # The legacy token grants `mc|ga` only: it never drives credential
+    # management.
+    try:
+        token = pin.get_pin_token(pin_value)
+        CredentialManagement(ctap2, pin.protocol, token).enumerate_rps()
+        record("token scope: legacy token refused in credMgmt", False, "enumerateRPs accepted")
+    except Exception as exc:  # noqa: BLE001
+        record("token scope: legacy token refused in credMgmt", True, str(exc))
+
+    # A `cm` token bound to a relying party cannot enumerate the device.
+    try:
+        token = pin.get_pin_token(
+            pin_value,
+            permissions=ClientPin.PERMISSION.CREDENTIAL_MGMT,
+            permissions_rpid="example.com",
+        )
+        CredentialManagement(ctap2, pin.protocol, token).enumerate_rps()
+        record(
+            "token scope: bound cm token refused in enumerateRPs",
+            False,
+            "enumerateRPs accepted",
+        )
+    except Exception as exc:  # noqa: BLE001
+        record("token scope: bound cm token refused in enumerateRPs", True, str(exc))
+
+    # A token bound to `example.com` cannot sign an assertion for another
+    # relying party.
+    try:
+        token = pin.get_pin_token(
+            pin_value,
+            permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL,
+            permissions_rpid="example.com",
+        )
+        client_data_hash = hashlib.sha256(os.urandom(32)).digest()
+        ctap2.get_assertion(
+            "other.example",
+            client_data_hash,
+            **pin_uv_params(token, client_data_hash),
+        )
+        record("token scope: cross-RP assertion refused", False, "getAssertion accepted")
+    except Exception as exc:  # noqa: BLE001
+        record("token scope: cross-RP assertion refused", True, str(exc))
+
+
+def check_resident_credential(device, pin_value: str | None = None) -> None:
     """Create a discoverable credential so the enumeration has content."""
     print(">>> Press BOOTSEL within 15s to approve makeCredential (resident)")
     try:
         client_data_hash = hashlib.sha256(os.urandom(32)).digest()
+        token = issue_token(device, pin_value)
         Ctap2(device).make_credential(
             client_data_hash,
             {"id": "example.com", "name": "Example"},
@@ -289,24 +368,23 @@ def main() -> int:
         return summarize()
 
     # A PIN on the device means every FIDO operation must prove it.
-    token = None
     if pin_value is not None:
         try:
-            token = ClientPin(Ctap2(device)).get_pin_token(pin_value)
+            issue_token(device, pin_value)
             record("clientPIN getPinToken", True)
         except Exception as exc:  # noqa: BLE001
             record("clientPIN getPinToken", False, str(exc))
-            token = None
 
-    if check_make_credential(device, token):
-        check_get_assertion(device, token)
-    if check_make_credential_eddsa(device, token):
-        check_get_assertion_eddsa(device, token)
+    if check_make_credential(device, pin_value):
+        check_get_assertion(device, pin_value)
+    if check_make_credential_eddsa(device, pin_value):
+        check_get_assertion_eddsa(device, pin_value)
     check_client_pin(device)
 
     if pin_value is not None:
-        check_resident_credential(device, token)
+        check_resident_credential(device, pin_value)
         check_credential_management(device, pin_value)
+        check_token_scope(device, pin_value)
         # The rotation invalidates every issued token, so it runs last.
         check_change_pin(device, pin_value)
 

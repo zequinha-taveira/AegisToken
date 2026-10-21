@@ -30,9 +30,11 @@ use aegis_core::lifecycle::LifecycleState;
 use aegis_core::management_protocol::{ManagementCommand, ManagementService};
 use aegis_core::otp_lab;
 use aegis_core::pin::{
-    ClientPin, ClientPinRequest, SUB_CHANGE_PIN, SUB_GET_KEY_AGREEMENT, SUB_GET_PIN_TOKEN,
-    SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS, SUB_GET_RETRIES, SUB_SET_PIN,
+    ClientPin, ClientPinRequest, ManagementScope, SUB_CHANGE_PIN, SUB_GET_KEY_AGREEMENT,
+    SUB_GET_PIN_TOKEN, SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS, SUB_GET_RETRIES, SUB_SET_PIN,
+    TokenOperation, TokenRequest,
 };
+use aegis_core::state::BootPlan;
 use aegis_core::storage::ConfigStorage;
 use aegis_core::traits::{Led, Rp2350Hardware, Storage};
 use aegis_core::u2f;
@@ -46,7 +48,7 @@ use board_generic_rp2350::usb::{
 use board_generic_rp2350::watchdog::WatchdogHandle;
 use board_generic_rp2350::{Board, BoardParts, BoardProfile, DeviceManager, embassy_rp};
 use core::cell::RefCell;
-use defmt::info;
+use defmt::{error, info};
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_futures::join::join3;
@@ -179,10 +181,24 @@ async fn main(_spawner: Spawner) {
         info!("warning: development firmware-update vendor key in use");
     }
     let bootsel_held = device.board.bootsel_pressed();
+    let destination = aegis_core::state::boot_destination(bootsel_held);
+    let plan = BootPlan::for_destination(destination);
+    if aegis_core::ExecutionState::Boot
+        .transition(destination)
+        .is_err()
+    {
+        error!("illegal boot destination transition");
+    }
     info!(
-        "boot destination recovery={} (bootsel held: {})",
-        aegis_core::state::boot_destination(bootsel_held) == aegis_core::ExecutionState::Recovery,
-        bootsel_held
+        "boot destination {} (bootsel held: {}) plan: fido={} ccid={} management={} otp_lab={} sealed_credentials={} sealed_applets={}",
+        destination_label(destination),
+        bootsel_held,
+        plan.fido(),
+        plan.ccid(),
+        plan.management(),
+        plan.otp_lab(),
+        plan.sealed_credential_store(),
+        plan.sealed_applet_stores(),
     );
     // Load the persisted configuration, falling back to factory defaults when
     // none exists or it no longer matches this device.
@@ -220,14 +236,23 @@ async fn main(_spawner: Spawner) {
 
     join3(
         usb_supervisor(usb_device),
-        fido_task(
-            fido_reader,
-            fido_writer,
-            &device.rng,
-            presence,
-            storage,
-            root_key,
-        ),
+        async {
+            if plan.fido() {
+                fido_task(
+                    fido_reader,
+                    fido_writer,
+                    &device.rng,
+                    presence,
+                    storage,
+                    root_key,
+                    plan,
+                )
+                .await;
+            } else {
+                info!("FIDO path denied by the boot plan");
+                core::future::pending::<()>().await;
+            }
+        },
         join3(
             housekeeping(
                 management_reader,
@@ -237,11 +262,35 @@ async fn main(_spawner: Spawner) {
                 led.map(|led| led as &mut dyn Led),
                 watchdog,
             ),
-            ccid_task(ccid, &device.rng, presence, storage, root_key),
-            otp_task(otp),
+            async {
+                if plan.ccid() {
+                    ccid_task(ccid, &device.rng, presence, storage, root_key, plan).await;
+                } else {
+                    info!("CCID path denied by the boot plan");
+                    core::future::pending::<()>().await;
+                }
+            },
+            async {
+                if plan.otp_lab() {
+                    otp_task(otp).await;
+                } else {
+                    info!("laboratory OTP HID denied by the boot plan");
+                    core::future::pending::<()>().await;
+                }
+            },
         ),
     )
     .await;
+}
+
+/// Short label of a boot destination, for the boot log.
+fn destination_label(destination: aegis_core::ExecutionState) -> &'static str {
+    match destination {
+        aegis_core::ExecutionState::Active => "active",
+        aegis_core::ExecutionState::Recovery => "recovery",
+        aegis_core::ExecutionState::Locked => "locked",
+        _ => "other",
+    }
 }
 
 /// Drive only the 1050:0407 experimental OTP-labelled HID endpoint. Every
@@ -274,16 +323,32 @@ async fn otp_task(otp: Option<OtpHid>) {
 /// PIV, OATH and the P-256 OpenPGP slice are live applets. Applet state is
 /// sealed to flash when the device root key is provisioned, and falls back to
 /// volatile stores otherwise.
+///
+/// The boot plan gates the path: a denied plan neither serves CCID nor opens
+/// the sealed applet stores.
 async fn ccid_task<const FLASH_SIZE: usize>(
     mut ccid: Ccid,
     rng: &Mutex<CriticalSectionRawMutex, HardwareRng>,
     presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter>,
     storage: &CriticalSectionMutex<RefCell<FlashStorage<FLASH_SIZE>>>,
     root_key: Option<[u8; aegis_core::secret::KEY_LEN]>,
+    plan: BootPlan,
 ) {
+    if !plan.ccid() {
+        info!("CCID path denied by the boot plan");
+        core::future::pending::<()>().await;
+        return;
+    }
+
     let layout = BOARD_PROFILE.hardware.flash.layout;
     let region = RegionStorage::new(storage, layout.applet_offset);
     let base = |store: u32| layout.applet_store_offset(store);
+
+    if !plan.sealed_applet_stores() {
+        info!("applet stores not authorized by the boot plan");
+        core::future::pending::<()>().await;
+        return;
+    }
 
     if let Some(key) = root_key {
         let piv_layout = PivLayout {
@@ -507,6 +572,9 @@ fn apply_led_config(led: &mut Option<&mut dyn Led>, config: &DeviceConfig) {
 ///
 /// Credentials and PIN state are sealed to flash when the device root key is
 /// provisioned; otherwise they live in a volatile store as before.
+///
+/// The boot plan gates the path: a denied plan neither serves FIDO nor opens
+/// the sealed credential store.
 async fn fido_task<const FLASH_SIZE: usize>(
     reader: FidoReader,
     writer: FidoWriter,
@@ -514,7 +582,20 @@ async fn fido_task<const FLASH_SIZE: usize>(
     presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter>,
     storage: &CriticalSectionMutex<RefCell<FlashStorage<FLASH_SIZE>>>,
     root_key: Option<[u8; aegis_core::secret::KEY_LEN]>,
+    plan: BootPlan,
 ) {
+    if !plan.fido() {
+        info!("FIDO path denied by the boot plan");
+        core::future::pending::<()>().await;
+        return;
+    }
+
+    if !plan.sealed_credential_store() {
+        info!("FIDO credential store not authorized by the boot plan");
+        core::future::pending::<()>().await;
+        return;
+    }
+
     if let Some(key) = root_key {
         let layout = BOARD_PROFILE.hardware.flash.layout;
         let region = RegionStorage::new(storage, layout.applet_offset);
@@ -822,34 +903,42 @@ where
             encode_response(&info, out)
         }
         Ok(Ctap2Request::MakeCredential(request)) => {
-            let uv = match check_user_verification(
-                client_pin,
+            let uv = match client_pin.authorize(
                 store,
-                request.pin_uv_auth_param.as_ref(),
-                request.uv,
-                &request.client_data_hash,
-                aegis_core::pin::PERMISSION_MC,
-                request.rp_id.as_str(),
+                TokenRequest {
+                    param: request.pin_uv_auth_param.as_deref(),
+                    message: &request.client_data_hash,
+                    uv_requested: request.uv,
+                    operation: TokenOperation::MakeCredential {
+                        rp_id: request.rp_id.as_str(),
+                    },
+                },
             ) {
                 Ok(uv) => uv,
                 Err(status) => return write_status(status, out),
             };
             let up = wait_presence_notifying(chan, ctaphid::KEEPALIVE_PROCESSING, presence).await;
             let mut rng = rng.lock().await;
-            match authenticator::make_credential(store, &mut *rng, &request, up, uv) {
+            let result = authenticator::make_credential(store, &mut *rng, &request, up, uv);
+            // A token used in an operation that tests user presence loses
+            // its permissions.
+            client_pin.close_user_presence_operation(uv, result.is_ok());
+            match result {
                 Ok(response) => encode_response(&response, out),
                 Err(status) => write_status(status, out),
             }
         }
         Ok(Ctap2Request::GetAssertion(request)) => {
-            let uv = match check_user_verification(
-                client_pin,
+            let uv = match client_pin.authorize(
                 store,
-                request.pin_uv_auth_param.as_ref(),
-                request.uv,
-                &request.client_data_hash,
-                aegis_core::pin::PERMISSION_GA,
-                request.rp_id.as_str(),
+                TokenRequest {
+                    param: request.pin_uv_auth_param.as_deref(),
+                    message: &request.client_data_hash,
+                    uv_requested: request.uv,
+                    operation: TokenOperation::GetAssertion {
+                        rp_id: request.rp_id.as_str(),
+                    },
+                },
             ) {
                 Ok(uv) => uv,
                 Err(status) => return write_status(status, out),
@@ -869,6 +958,9 @@ where
                 &request.client_data_hash,
                 uv,
             );
+            // A token used in an operation that tests user presence loses
+            // its permissions.
+            client_pin.close_user_presence_operation(uv, response.is_ok());
             // Remember the request so `authenticatorGetNextAssertion` can
             // serve the remaining credentials.
             session.assertion = Some(AssertionState {
@@ -932,7 +1024,7 @@ where
         },
         Ok(Ctap2Request::Reset) => {
             let up = wait_presence_notifying(chan, ctaphid::KEEPALIVE_PROCESSING, presence).await;
-            match authenticator::reset(store, up) {
+            match authenticator::reset(store, client_pin, up) {
                 Ok(()) => write_status(ctap2::Ctap2Status::Ok, out),
                 Err(status) => write_status(status, out),
             }
@@ -948,57 +1040,39 @@ where
     }
 }
 
-/// Validate the user-verification state of a FIDO request.
+/// Authorise a credential-management subcommand with the active token.
 ///
-/// Returns whether the operation is user verified. A PIN/UV auth parameter
-/// that does not verify against the active token is rejected
-/// (`PinAuthInvalid`); with a PIN configured the platform must prove it
-/// (`PinRequired`), as a real authenticator does. Without a PIN the
-/// operation runs user-presence only.
-///
-/// The token is also checked against the scope of the request: it must carry
-/// the permission the operation needs (`mc` for `authenticatorMakeCredential`,
-/// `ga` for `authenticatorGetAssertion`) and, when it is bound to a relying
-/// party, the request must come from that same relying party.
-fn check_user_verification<S>(
-    client_pin: &ClientPin,
+/// The decision — permission, relying-party scope and HMAC — belongs to
+/// `aegis-core::pin`; the firmware only hands over the context of the
+/// subcommand.
+fn authorize_management<S>(
+    client_pin: &mut ClientPin,
     store: &S,
-    pin_uv_auth_param: Option<&heapless::Vec<u8, 64>>,
-    uv_requested: bool,
-    client_data_hash: &[u8; 32],
-    required_permission: u8,
-    request_rp_id: &str,
-) -> Result<bool, ctap2::Ctap2Status>
+    param: &[u8],
+    message: &[u8],
+    scope: ManagementScope<'_>,
+) -> Result<(), ctap2::Ctap2Status>
 where
     S: CredentialStore + aegis_core::pin::PinState,
 {
-    match pin_uv_auth_param {
-        Some(param) => {
-            if !client_pin.verify_scoped_auth_param(
-                param,
-                client_data_hash,
-                required_permission,
-                request_rp_id,
-            ) {
-                return Err(ctap2::Ctap2Status::PinAuthInvalid);
-            }
-            Ok(true)
-        }
-        None => {
-            let pin_is_set = aegis_core::pin::PinState::pin_hash(store).is_some();
-            if uv_requested || pin_is_set {
-                return Err(ctap2::Ctap2Status::PinRequired);
-            }
-            Ok(false)
-        }
-    }
+    client_pin
+        .authorize(
+            store,
+            TokenRequest {
+                param: Some(param),
+                message,
+                uv_requested: false,
+                operation: TokenOperation::CredentialManagement { scope },
+            },
+        )
+        .map(|_| ())
 }
 
 /// Serve an `authenticatorCredentialManagement` request.
 ///
-/// Every subcommand but `getCredsMetadata` requires a PIN/UV auth token with
-/// the `cm` permission: the platform authenticates the subcommand (and, when
-/// present, its parameters) with the token.
+/// Every subcommand requires a PIN/UV auth token with the `cm` permission:
+/// the platform authenticates the subcommand (and, when present, its
+/// parameters) with the token.
 fn handle_credential_management<S>(
     request: &CredentialManagementRequest,
     store: &mut S,
@@ -1008,9 +1082,24 @@ fn handle_credential_management<S>(
 where
     S: CredentialStore + aegis_core::pin::PinState,
 {
-    let client_pin = &session.client_pin;
+    let client_pin = &mut session.client_pin;
     match request.sub_command {
         authenticator::CRED_MGMT_GET_METADATA => {
+            let Some(param) = request.pin_uv_auth_param.as_ref() else {
+                return write_status(ctap2::Ctap2Status::PinRequired, out);
+            };
+            let message = [authenticator::CRED_MGMT_GET_METADATA];
+            // The metadata of the device is global, so a token bound to a
+            // single relying party cannot drive it.
+            if let Err(status) = authorize_management(
+                client_pin,
+                store,
+                param.as_slice(),
+                &message,
+                ManagementScope::Device,
+            ) {
+                return write_status(status, out);
+            }
             encode_response(&authenticator::creds_metadata(store), out)
         }
         authenticator::CRED_MGMT_ENUMERATE_RPS => {
@@ -1018,13 +1107,16 @@ where
                 return write_status(ctap2::Ctap2Status::PinRequired, out);
             };
             let message = [authenticator::CRED_MGMT_ENUMERATE_RPS];
-            if !client_pin.verify_credential_management_param(param, &message) {
-                return write_status(ctap2::Ctap2Status::PinAuthInvalid, out);
-            }
             // The enumeration of relying parties is global, so a token bound
             // to a single relying party cannot drive it.
-            if !client_pin.allows_enumerate_rps() {
-                return write_status(ctap2::Ctap2Status::PinAuthInvalid, out);
+            if let Err(status) = authorize_management(
+                client_pin,
+                store,
+                param.as_slice(),
+                &message,
+                ManagementScope::Device,
+            ) {
+                return write_status(status, out);
             }
             let rps = authenticator::list_rps(store);
             if rps.is_empty() {
@@ -1052,22 +1144,25 @@ where
             encode_response(&authenticator::EnumerateRpsResponse { rp, total_rps }, out)
         }
         authenticator::CRED_MGMT_ENUMERATE_CREDENTIALS => {
-            let Some(hash) = request.rp_id_hash else {
-                return write_status(ctap2::Ctap2Status::MissingParameter, out);
-            };
             let Some(param) = request.pin_uv_auth_param.as_ref() else {
                 return write_status(ctap2::Ctap2Status::PinRequired, out);
+            };
+            let Some(hash) = request.rp_id_hash else {
+                return write_status(ctap2::Ctap2Status::MissingParameter, out);
             };
             let mut message = heapless::Vec::<u8, 128>::new();
             let _ = message.push(authenticator::CRED_MGMT_ENUMERATE_CREDENTIALS);
             let _ = message.extend_from_slice(&request.sub_command_params);
-            if !client_pin.verify_credential_management_param(param, &message) {
-                return write_status(ctap2::Ctap2Status::PinAuthInvalid, out);
-            }
             // A token bound to a relying party only enumerates the
             // credentials of that relying party.
-            if !client_pin.allows_enumerate_credentials(&hash) {
-                return write_status(ctap2::Ctap2Status::PinAuthInvalid, out);
+            if let Err(status) = authorize_management(
+                client_pin,
+                store,
+                param.as_slice(),
+                &message,
+                ManagementScope::RelyingPartyHash(&hash),
+            ) {
+                return write_status(status, out);
             }
             let ids = authenticator::list_credentials(store, &hash);
             if ids.is_empty() {
@@ -1098,18 +1193,21 @@ where
             let Some(param) = request.pin_uv_auth_param.as_ref() else {
                 return write_status(ctap2::Ctap2Status::PinRequired, out);
             };
-            let mut message = heapless::Vec::<u8, 128>::new();
-            let _ = message.push(authenticator::CRED_MGMT_DELETE);
-            let _ = message.extend_from_slice(&request.sub_command_params);
-            if !client_pin.verify_credential_management_param(param, &message) {
-                return write_status(ctap2::Ctap2Status::PinAuthInvalid, out);
-            }
             let Some(id) = request.credential_id.as_ref() else {
                 return write_status(ctap2::Ctap2Status::MissingParameter, out);
             };
+            let mut message = heapless::Vec::<u8, 128>::new();
+            let _ = message.push(authenticator::CRED_MGMT_DELETE);
+            let _ = message.extend_from_slice(&request.sub_command_params);
             // The credential must belong to the relying party the token is
             // bound to; the other credentials are preserved.
-            match authenticator::delete_credential_scoped(store, client_pin, id) {
+            match authenticator::delete_credential_scoped(
+                store,
+                client_pin,
+                Some(param.as_slice()),
+                &message,
+                id,
+            ) {
                 Ok(()) => write_status(ctap2::Ctap2Status::Ok, out),
                 Err(status) => write_status(status, out),
             }
