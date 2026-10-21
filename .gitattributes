@@ -1,0 +1,17 @@
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.rs text
+*.py text
+*.md text
+*.toml text
+*.yml text
+*.yaml text
+*.json text
+*.jsonc text
+*.uf2 binary
+*.bin binary
+*.elf binary

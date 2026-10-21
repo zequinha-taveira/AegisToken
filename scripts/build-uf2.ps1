@@ -21,11 +21,17 @@
 # For a production image, set AEGIS_UPDATE_VENDOR_PUBKEY to the release key
 # (65-byte SEC1 hex, from scripts/gen-update-key.py) before running. Otherwise a
 # development update key is embedded and a warning is printed.
+#
+# -Release builds a distributable image: it fails before compiling when
+# AEGIS_UPDATE_VENDOR_PUBKEY is missing, malformed or the development key, and
+# it turns the build-time gate on (AEGIS_RELEASE=1) for the firmware build.
+# Without it the script builds a development image, which is not safe to ship.
 
 param(
     [ValidateSet("universal", "rp2350a", "rp2350b", "rp2354a", "rp2354b")]
     [string]$Board = "universal",
-    [string]$BoardProfile = "generic"
+    [string]$BoardProfile = "generic",
+    [switch]$Release
 )
 
 if ($BoardProfile -eq "yubikey5-lab") {
@@ -60,15 +66,36 @@ if ($Board -eq "universal") {
     $out = "AegisToken_$product-$version.uf2"
 }
 
-if (-not $env:AEGIS_UPDATE_VENDOR_PUBKEY) {
+if ($Release) {
+    # A distributable image may not embed the development update key: its
+    # private key is the number 1, so anyone could sign an accepted update.
+    if (-not $env:AEGIS_UPDATE_VENDOR_PUBKEY) {
+        throw ("AEGIS_UPDATE_VENDOR_PUBKEY is not set: a release image may not embed the " +
+            "DEVELOPMENT firmware-update key. Set it to the release key (65-byte SEC1 hex, " +
+            "from scripts/gen-update-key.py) and run again.")
+    }
+    # Same policy as the build script (crates/aegis-build-support): a malformed
+    # key or the development key is rejected before the firmware is compiled.
+    $check = & cargo run --quiet -p aegis-build-support --bin vendor-key-check 2>&1 |
+        ForEach-Object { $_.ToString() }
+    if ($LASTEXITCODE -ne 0) {
+        throw ("release gate: " + (($check -join "`n").Trim()))
+    }
+} elseif (-not $env:AEGIS_UPDATE_VENDOR_PUBKEY) {
     Write-Warning ("AEGIS_UPDATE_VENDOR_PUBKEY is not set: this image embeds a " +
         "DEVELOPMENT firmware-update key. Do not ship it.")
 }
 
 $env:AEGIS_BOARD = $BoardProfile
 $featureArgs = if ($Board -eq "rp2350a") { @() } else { @("--no-default-features", "--features", $Board) }
-cargo build -p $bin --target $target --release @featureArgs
-if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
+$previousRelease = $env:AEGIS_RELEASE
+try {
+    if ($Release) { $env:AEGIS_RELEASE = "1" }
+    cargo build -p $bin --target $target --release @featureArgs
+    if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
+} finally {
+    $env:AEGIS_RELEASE = $previousRelease
+}
 
 picotool uf2 convert $elf -t elf $out
 if ($LASTEXITCODE -ne 0) { throw "picotool conversion failed ($LASTEXITCODE)" }

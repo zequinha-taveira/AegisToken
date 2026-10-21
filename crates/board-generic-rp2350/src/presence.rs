@@ -8,9 +8,7 @@
 //! `FidoWaitPresence`) is enforced by [`aegis_core::presence::ContextualPresence`]
 //! in the firmware state machine.
 
-use aegis_core::presence::{
-    PresenceController, PresenceError, PresenceOutcome, PresenceTiming, UserPresence,
-};
+use aegis_core::presence::{PresenceError, PresenceTiming, PresenceWaiter, UserPresence};
 use embassy_rp::Peri;
 use embassy_rp::gpio::Input;
 use embassy_rp::peripherals::BOOTSEL;
@@ -133,8 +131,7 @@ impl Button for BootselButton {
 /// Maps a [`Button`] onto the core presence state machine.
 pub struct ButtonPresence<B: Button> {
     button: B,
-    controller: PresenceController,
-    operation_counter: u32,
+    waiter: PresenceWaiter,
 }
 
 impl<B: Button> ButtonPresence<B> {
@@ -143,8 +140,7 @@ impl<B: Button> ButtonPresence<B> {
     pub fn new(button: B, timing: PresenceTiming) -> Self {
         Self {
             button,
-            controller: PresenceController::new(timing),
-            operation_counter: 0,
+            waiter: PresenceWaiter::new(timing),
         }
     }
 
@@ -153,26 +149,13 @@ impl<B: Button> ButtonPresence<B> {
         self.button.is_pressed()
     }
 
-    /// Arm a fresh operation, invalidating any press observed before it.
-    fn begin_operation(&mut self) -> Result<(), PresenceError> {
-        self.operation_counter = self.operation_counter.wrapping_add(1);
-        let operation_id = self.operation_counter;
-        self.controller.disarm();
-        self.controller.arm(operation_id, 0)
-    }
-
-    /// Feed one sample into the state machine.
-    fn poll(&mut self, now_ms: u64) -> Option<PresenceOutcome> {
-        let pressed = self.button.is_pressed();
-        self.controller.update(pressed, now_ms)
-    }
-
-    /// Map a terminal presence outcome to a result.
-    fn finish(outcome: PresenceOutcome) -> Result<(), PresenceError> {
-        match outcome {
-            PresenceOutcome::Confirmed { .. } => Ok(()),
-            PresenceOutcome::Timeout { .. } => Err(PresenceError::Timeout),
-        }
+    /// Advance the presence state machine by one sample.
+    ///
+    /// Returns `true` once the presence is confirmed. The operation stays armed
+    /// between calls, so a caller can interleave other work (sending CTAPHID
+    /// keepalive notifications) without restarting the debounce window.
+    pub fn poll_presence(&mut self) -> Result<bool, PresenceError> {
+        self.waiter.poll(self.button.is_pressed())
     }
 
     /// Await User Presence, yielding to the executor between samples.
@@ -181,28 +164,22 @@ impl<B: Button> ButtonPresence<B> {
     /// `block_for` and is meant for a dedicated context), this keeps the USB
     /// and Management tasks responsive while the button is being held.
     pub async fn wait(&mut self) -> Result<(), PresenceError> {
-        self.begin_operation()?;
-        let mut now_ms = 0u64;
         loop {
-            if let Some(outcome) = self.poll(now_ms) {
-                return Self::finish(outcome);
+            if self.poll_presence()? {
+                return Ok(());
             }
             Timer::after(Duration::from_millis(POLL_MS)).await;
-            now_ms += POLL_MS;
         }
     }
 }
 
 impl<B: Button> UserPresence for ButtonPresence<B> {
     fn wait_for_presence(&mut self) -> Result<(), PresenceError> {
-        self.begin_operation()?;
-        let mut now_ms = 0u64;
         loop {
-            if let Some(outcome) = self.poll(now_ms) {
-                return Self::finish(outcome);
+            if self.poll_presence()? {
+                return Ok(());
             }
             block_for(Duration::from_millis(POLL_MS));
-            now_ms += POLL_MS;
         }
     }
 }
@@ -238,6 +215,17 @@ impl PresenceAdapter {
         match self {
             PresenceAdapter::Bootsel(presence) => presence.wait().await,
             PresenceAdapter::Gpio(presence) => presence.wait().await,
+        }
+    }
+
+    /// Advance the presence state machine by one sample; `true` when confirmed.
+    ///
+    /// Lets the firmware interleave CTAPHID keepalive notifications while the
+    /// user is asked for presence, without restarting the debounce window.
+    pub fn poll_presence(&mut self) -> Result<bool, PresenceError> {
+        match self {
+            PresenceAdapter::Bootsel(presence) => presence.poll_presence(),
+            PresenceAdapter::Gpio(presence) => presence.poll_presence(),
         }
     }
 }

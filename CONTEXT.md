@@ -6,7 +6,7 @@ Universal firmware for the RP2350 family (RP2350A/B + RP2354A/B, one binary with
 
 - USB product: `AegisToken FIDO2 USB Authenticator`, VID `0x1209` PID `0x0001` (generic profile). Third-party boards use VID `0x2E8A` + allocated PID (see `README.md` table).
 - Release artifact: `rp2350-universal.uf2` via `scripts/build-uf2.ps1`.
-- Status: phases 0–15 done; 16 (RSA-2048) and 17 (applet conformance) in firmware, hardware validation pending. See `roadmap.md` and `validation.md` (AC-001..AC-021).
+- Status: phases 0–15 done; 16 (RSA-2048) and 17 (applet conformance) in firmware, hardware validation pending. FIDO slices 7a–7g done (sealed credential store, CTAPHID keepalive, CTAP2.1 credential management + `changePIN`, `getNextAssertion`, PIN enforcement, scoped `pinUvAuthToken`). See `roadmap.md` and `validation.md` (AC-001..AC-021).
 
 ## USB interfaces (strictly separated)
 
@@ -31,15 +31,23 @@ Invariants: FIDO never depends on Keyboard/Management/CCID. CCID never reachable
 ## Key facts for edits
 
 - Config: versioned CBOR, `DeviceConfig::for_board` derives factory defaults from board profile; USB identity in config must mirror `ValidationContext.identity`; LED off by default on LED-less boards.
+- Boot plan: `aegis-core::state::BootPlan::for_destination(destination)` decides, per path, what the firmware may serve (FIDO, CCID, Management, lab OTP HID) and which sealed stores may be opened; only `Active` enables FIDO/CCID, everything else is fail-closed. The firmware reads the plan and starts `fido_task`/`ccid_task` only when the path is allowed.
 - Presence: only valid in `FidoWaitPresence` (`bootsel_allowed_as_presence`); BOOTSEL or external GPIO per `PresenceProfile`.
 - Crypto: P-256/P-384/Ed25519/X25519 + RSA-2048 (PKCS#1 v1.5 only; no RSA-3072/PSS, no OpenPGP KDF). Private keys generated on-device, never exported/imported. OATH has no RTC — host supplies timestamp/counter.
 - Flash: 2 MiB minimum; applet region 19× 8 KiB two-slot stores (PIV meta + 10 objects, OATH 2+commit, OpenPGP 4+commit); `const assert` against `FlashLayout`.
 - PIV defaults (PIN `123456`, PUK `12345678`, 3DES mgmt key `0102..08`, CCC/CHUI) are spec interop vectors, not leaks.
-- DEV update key is embedded unless `AEGIS_UPDATE_VENDOR_PUBKEY` is set — never release such builds. Real secure boot/rollback enforced by RP2350 bootrom + OTP (production step, see `production.md`).
+- DEV update key is embedded unless `AEGIS_UPDATE_VENDOR_PUBKEY` is set — never release such builds; `-Release`/`AEGIS_RELEASE=1` makes the build fail instead (policy in `crates/aegis-build-support`). Real secure boot/rollback enforced by RP2350 bootrom + OTP (production step, see `production.md`).
+
+## Loop de melhoria (agentes)
+
+- `.opencode/agents/`: `sec-audit` → `spec` → `impl` → `gates` → `review`; skills
+  `aegis-spec` / `aegis-gates`; comandos `/spec` e `/gates`.
+- Uma fatia por commit na branch `development`; cada fatia tem spec em `specs/`,
+  teste de host e gates verdes.
 
 ## Validation pointers
 
-- Host gates: `cargo fmt --check`, `clippy -D warnings`, `cargo test` for `aegis-core` (~193 tests), `aegis-applets` (~147), `aegistoken-host` (5).
+- Host gates: `cargo fmt --check`, `clippy -D warnings`, `cargo test` for `aegis-core` (~250 tests), `aegis-applets` (~157), `aegistoken-host` (15).
 - Hardware scripts in `scripts/`: `validate_management.py`, `validate_fido.py` (needs FIDO interface free — Windows `fidohid` holds it; see `validation.md` options A/B/C), `validate_ccid/piv/oath/openpgp.py` (need `pcscd`/`usbccid`), `set_pin.py`.
 - Windows Management HID works driverless via libusb HID backend (no Zadig). Linux needs `scripts/99-aegistoken.rules`.
-- Known gaps: on-device credential store still in-memory pending storage-sharing refactor; CCID/RSA/SSH flows validated on host only, hardware runs pending (AC-016..021); no CTAPHID keepalive during presence wait.
+- Known gaps: CCID/RSA/SSH flows validated on host only, hardware runs pending (AC-016..021). FIDO credentials/PIN persist via `SealedCredentialStore` in the applet region store `19` when the OTP root key is provisioned (memory otherwise). CTAPHID keepalive (100 ms) is sent while waiting for user presence. Credential management (`enumerateRPs`/`enumerateCredentials`/`deleteCredential`) and `changePIN` require a PIN/UV token with the `cm` permission; the token is also scoped — `makeCredential`/`getAssertion` require the matching permission (`mc`/`ga`) and the token's permissions RP ID must match the request's `rp.id`, otherwise `PinAuthInvalid` (0x33). With a PIN set, `makeCredential`/`getAssertion` require the PIN (`PinRequired`). No keyboard HID interface is exposed (product decision, see `README.md`). The Recovery/Locked gap is closed at the boot level (the boot plan denies FIDO/CCID and the sealed stores); still open: the on-device execution of `RecoverySession`, the credential cleanup in the factory reset, and the suppression of the USB enumeration (the interfaces still enumerate and stay mute).

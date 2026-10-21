@@ -1,0 +1,12 @@
+[package]
+name = "aegis-build-support"
+description = "Host-side build policy for the AegisToken firmware: firmware-update vendor key resolution and the release gate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+p256.workspace = true

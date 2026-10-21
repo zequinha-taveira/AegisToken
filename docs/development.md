@@ -36,6 +36,10 @@ All scripts print `[PASS]/[FAIL]` per check and exit non-zero on failure;
 see `validation.md` for the AC matrix, the hardware procedures that cannot
 run in CI, and the recorded interop assumptions.
 
+## Library Research & Licensing Policy (Python & Rust)
+
+All dependencies and host tools must comply strictly with the project's dual permissive license (**MIT OR Apache-2.0**) without introducing copyleft (GPL/LGPL) constraints. See [`docs/pesquisa-bibliotecas.md`](pesquisa-bibliotecas.md) for the evaluation of mature libraries across USB/HID, PC/SC, FIDO2/WebAuthn, ASN.1/Crypto and Desktop GUI frameworks, and [`docs/plano-desenvolvimento.md`](plano-desenvolvimento.md) for the development plan and adoption roadmap.
+
 ## Release and Nightly Pipeline
 
 Automated build and publishing are orchestrated by [`.github/workflows/release.yml`](../.github/workflows/release.yml):

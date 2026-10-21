@@ -336,6 +336,10 @@ impl<S: Storage> CredentialStore for SealedCredentialStore<S> {
         self.cache.len()
     }
 
+    fn list(&self) -> &[Credential] {
+        &self.cache
+    }
+
     fn remove(&mut self, credential_id: &[u8]) -> Result<(), CoreError> {
         if let Some(index) = self
             .cache

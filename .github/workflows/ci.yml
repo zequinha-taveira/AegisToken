@@ -28,6 +28,43 @@ jobs:
         run: cargo clippy -p aegis-applets --all-targets -- -D warnings
       - name: Test (applets)
         run: cargo test -p aegis-applets
+      - name: Clippy (build support)
+        run: cargo clippy -p aegis-build-support --all-targets -- -D warnings
+      - name: Test (build support)
+        run: cargo test -p aegis-build-support
+
+  release-gate:
+    name: release gate (vendor key)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install target and components
+        run: |
+          rustup target add thumbv8m.main-none-eabihf
+          rustup component add rustfmt clippy
+      - name: Gate refuses a missing vendor key
+        env:
+          AEGIS_RELEASE: "1"
+        run: |
+          set +e
+          output="$(cargo check -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf 2>&1)"
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::The release gate must fail without AEGIS_UPDATE_VENDOR_PUBKEY."
+            exit 1
+          fi
+          echo "$output" | grep -q "AEGIS_RELEASE=1 requires a production firmware-update vendor key" || {
+            echo "::error::The release gate must fail with the gate message."
+            exit 1
+          }
+      - name: Gate accepts a production key
+        env:
+          AEGIS_RELEASE: "1"
+          # Format-valid but not a curve point: disposable public material,
+          # used only to check that the gate lets a non-development key pass.
+          AEGIS_UPDATE_VENDOR_PUBKEY: "04a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        run: cargo check -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf
 
   host-tool:
     name: host tool (aegistoken-host)
@@ -35,7 +72,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install components
-        run: rustup component add clippy
+        run: |
+          rustup component add clippy
+          # The `pcsc` crate links against the system PC/SC library on Linux.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkgconf libpcsclite-dev
       - name: Clippy
         run: cargo clippy -p aegistoken-host --all-targets -- -D warnings
       - name: Test

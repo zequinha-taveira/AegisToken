@@ -41,7 +41,19 @@ Firmware (default rp2350a, board profiles via `AEGIS_BOARD` or `-BoardProfile`):
 
 Python validators: `validate_management.py` (AC-003..009), `validate_fido.py` (AC-002/011/013/020), `validate_ccid.py` (AC-016), `validate_piv.py` (AC-017/021), `validate_oath.py` (AC-018), `validate_openpgp.py` (AC-019/021).
 
-Workflows (on demand): `/gates` runs the gates, `/spec <slice>` implements a roadmap slice spec-first; skills `aegis-gates` and `aegis-spec`, subagents `gates` and `review`.
+Workflows (on demand): `/gates` runs the gates, `/spec <slice>` writes a slice spec spec-first. Both delegate to the subagents in `.opencode/agents/`:
+
+| Agent | Role |
+|-------|------|
+| `sec-audit` | Finds invariant violations, secret leakage and path-isolation breaks (read-only) |
+| `spec` | Writes `specs/<slice>.md` (threat, invariants, acceptance criteria, test plan) |
+| `impl` | Implements one approved slice plus mandatory host tests |
+| `gates` | Runs the validation gates and reports real pass/fail evidence |
+| `review` | Adversarial review of the change against the spec and the security model |
+
+Skills: `aegis-spec` (`.opencode/skills/aegis-spec`) and `aegis-gates` (`.opencode/skills/aegis-gates`).
+
+Improvement loop (security hardening): `sec-audit` → `spec` → `impl` → `gates` → `review` → commit on `development` (one logical change per commit), updating `roadmap.md` / `validation.md` / `docs/security-model.md` in the same change.
 
 ## Rules
 
@@ -49,7 +61,7 @@ Workflows (on demand): `/gates` runs the gates, `/spec <slice>` implements a roa
 - FIDO path independent of Management/Keyboard/CCID. CCID never reachable from FIDO. Recovery denies FIDO/CCID/credentials (diagnostics + update only).
 - No new `unsafe` without justification. Readable first, no premature optimization.
 - `AnyPin::steal` for runtime LED GPIO is the single justified exception (one owner per pin); GPIO 0-5 (QSPI) never a candidate (compile-time enforced).
-- Never commit or log secrets (`*.pem`, `*.key`, PINs, seeds, OTP dumps — gitignored). Without `AEGIS_UPDATE_VENDOR_PUBKEY` build uses DEV update key: warn, never release.
+- Never commit or log secrets (`*.pem`, `*.key`, PINs, seeds, OTP dumps — gitignored). Without `AEGIS_UPDATE_VENDOR_PUBKEY` build uses DEV update key: warn, never release. A distributable image must be built with `& scripts/build-uf2.ps1 -Release` (or `AEGIS_RELEASE=1`), which fails the build instead of embedding the DEV key; the policy lives in `crates/aegis-build-support` and is covered by host tests.
 - PIV defaults in `crates/aegis-applets/src/piv.rs` (`DEFAULT_MGMT_KEY`, `DEFAULT_PIN`, `DEFAULT_PUK`, CCC/CHUI) are NIST SP 800-73-4 interop values. Do not flag as leaks, do not randomize.
 - No private-key import in applets (on-device generation only); only public material (certs) importable.
 - Tests mandatory for new/changed logic. Check existing test layout first (`cargo test -p aegis-core`, `-p aegis-applets`).

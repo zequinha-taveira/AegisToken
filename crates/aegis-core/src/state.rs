@@ -3,6 +3,10 @@
 //! The execution state is deliberately independent from the lifecycle state
 //! (PRD §20). It describes *what the firmware is doing right now*, not the
 //! provisioning status of the device.
+//!
+//! The boot destination ([`boot_destination`]) leads to the boot plan
+//! ([`BootPlan`]), which states per path what the firmware may serve and
+//! which sealed stores it may open.
 
 use crate::error::CoreError;
 
@@ -96,6 +100,100 @@ pub const fn fido_allowed(state: ExecutionState) -> bool {
     )
 }
 
+/// Whether `state` is a destination a boot can land on.
+#[must_use]
+pub const fn is_boot_destination(state: ExecutionState) -> bool {
+    matches!(
+        state,
+        ExecutionState::Active | ExecutionState::Recovery | ExecutionState::Locked
+    )
+}
+
+/// Boot plan: the transport paths the firmware may serve after a boot.
+///
+/// The plan is the single policy decision for the boot. It is derived from
+/// the boot destination and states, per path, what may be served and which
+/// sealed stores may be opened. The firmware reads the plan and obeys it; it
+/// never decides on its own which paths to open.
+///
+/// The plan is fail-closed: only [`ExecutionState::Active`] enables the FIDO
+/// and CCID paths, and the sealed stores follow their path. Management
+/// (diagnostics and firmware update) stays enabled in every destination, and
+/// so does the read-only laboratory OTP HID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootPlan {
+    destination: ExecutionState,
+    fido: bool,
+    ccid: bool,
+    management: bool,
+    otp_lab: bool,
+    sealed_credential_store: bool,
+    sealed_applet_stores: bool,
+}
+
+impl BootPlan {
+    /// Derive the plan for a boot destination.
+    ///
+    /// Any state that is not a boot destination yields the same fail-closed
+    /// plan as the denied destinations: no FIDO, no CCID, no sealed store.
+    #[must_use]
+    pub const fn for_destination(destination: ExecutionState) -> Self {
+        let fido =
+            is_boot_destination(destination) && matches!(destination, ExecutionState::Active);
+        Self {
+            destination,
+            fido,
+            ccid: fido,
+            management: true,
+            otp_lab: true,
+            sealed_credential_store: fido,
+            sealed_applet_stores: fido,
+        }
+    }
+
+    /// The destination the plan was derived from.
+    #[must_use]
+    pub const fn destination(&self) -> ExecutionState {
+        self.destination
+    }
+
+    /// Whether the FIDO path may be served.
+    #[must_use]
+    pub const fn fido(&self) -> bool {
+        self.fido
+    }
+
+    /// Whether the CCID path may be served.
+    #[must_use]
+    pub const fn ccid(&self) -> bool {
+        self.ccid
+    }
+
+    /// Whether the Management HID path may be served.
+    #[must_use]
+    pub const fn management(&self) -> bool {
+        self.management
+    }
+
+    /// Whether the laboratory OTP HID path may be served.
+    #[must_use]
+    pub const fn otp_lab(&self) -> bool {
+        self.otp_lab
+    }
+
+    /// Whether the sealed FIDO credential store may be opened.
+    #[must_use]
+    pub const fn sealed_credential_store(&self) -> bool {
+        self.sealed_credential_store
+    }
+
+    /// Whether the sealed applet stores may be opened.
+    #[must_use]
+    pub const fn sealed_applet_stores(&self) -> bool {
+        self.sealed_applet_stores
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ExecutionState::*;
@@ -169,6 +267,91 @@ mod tests {
         assert!(fido_allowed(FidoOperation));
         for state in [Boot, Management, FirmwareUpdate, Recovery, Locked] {
             assert!(!fido_allowed(state), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn boot_plan_active_enables_fido_ccid_management() {
+        let plan = BootPlan::for_destination(Active);
+        assert_eq!(plan.destination(), Active);
+        assert!(plan.fido());
+        assert!(plan.ccid());
+        assert!(plan.management());
+        assert!(plan.otp_lab());
+        assert!(plan.sealed_credential_store());
+        assert!(plan.sealed_applet_stores());
+    }
+
+    #[test]
+    fn boot_plan_recovery_denies_fido_ccid_keeps_management() {
+        let plan = BootPlan::for_destination(Recovery);
+        assert_eq!(plan.destination(), Recovery);
+        assert!(!plan.fido());
+        assert!(!plan.ccid());
+        assert!(plan.management());
+        assert!(plan.otp_lab());
+        assert!(!plan.sealed_credential_store());
+        assert!(!plan.sealed_applet_stores());
+    }
+
+    #[test]
+    fn boot_plan_locked_denies_fido_ccid_keeps_management() {
+        let plan = BootPlan::for_destination(Locked);
+        assert_eq!(plan.destination(), Locked);
+        assert!(!plan.fido());
+        assert!(!plan.ccid());
+        assert!(plan.management());
+        assert!(plan.otp_lab());
+        assert!(!plan.sealed_credential_store());
+        assert!(!plan.sealed_applet_stores());
+    }
+
+    #[test]
+    fn boot_plan_fido_and_ccid_never_diverge() {
+        for state in ALL {
+            let plan = BootPlan::for_destination(state);
+            assert_eq!(plan.fido(), plan.ccid(), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn boot_plan_never_enables_fido_where_fido_allowed_denies() {
+        for state in ALL {
+            let plan = BootPlan::for_destination(state);
+            if !fido_allowed(state) {
+                assert!(!plan.fido(), "{state:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn boot_plan_is_fail_closed_for_non_destination_states() {
+        for state in ALL {
+            if is_boot_destination(state) {
+                continue;
+            }
+            let plan = BootPlan::for_destination(state);
+            assert!(!plan.fido(), "{state:?}");
+            assert!(!plan.ccid(), "{state:?}");
+            assert!(plan.management(), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn boot_destination_is_always_a_legal_successor_of_boot() {
+        for held in [true, false] {
+            let destination = boot_destination(held);
+            assert!(Boot.can_transition(destination), "{held}");
+            assert_eq!(Boot.transition(destination), Ok(destination), "{held}");
+        }
+    }
+
+    #[test]
+    fn boot_plan_denies_sealed_stores_outside_active() {
+        for state in ALL {
+            let plan = BootPlan::for_destination(state);
+            assert_eq!(plan.sealed_credential_store(), plan.fido(), "{state:?}");
+            assert_eq!(plan.sealed_applet_stores(), plan.ccid(), "{state:?}");
         }
     }
 }

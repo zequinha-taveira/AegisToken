@@ -16,6 +16,7 @@ use crate::error::CoreError;
 use crate::identity::{BoardIdentity, MAX_BOARD_IDENTITY_LEN};
 use crate::lifecycle::{LifecycleManager, LifecycleState};
 use crate::recovery::DiagnosticsReport;
+use crate::state::{BootPlan, ExecutionState};
 
 /// Bit set on the command byte of a response.
 pub const RESPONSE_FLAG: u8 = 0x80;
@@ -425,6 +426,7 @@ pub struct ManagementService {
     lifecycle: LifecycleManager,
     config: DeviceConfig,
     staged: Option<DeviceConfig>,
+    boot_plan: BootPlan,
 }
 
 impl ManagementService {
@@ -443,7 +445,14 @@ impl ManagementService {
             lifecycle: LifecycleManager::new(lifecycle),
             config,
             staged: None,
+            boot_plan: BootPlan::for_destination(ExecutionState::Active),
         }
+    }
+
+    /// Record the boot plan, so the diagnostics report shows which paths the
+    /// device is serving.
+    pub const fn set_boot_plan(&mut self, plan: BootPlan) {
+        self.boot_plan = plan;
     }
 
     /// Discovered capabilities.
@@ -575,6 +584,7 @@ impl ManagementService {
             self.config.version,
             self.staged.is_some(),
             &self.capabilities,
+            self.boot_plan,
         );
         Response::with_payload(&report)
     }

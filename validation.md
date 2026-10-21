@@ -32,7 +32,7 @@ do MVP em hardware RP2350A (e depois RP2350B).
 - `picotool` — conversão de UF2 e `picotool info` (valida imagem RP2350).
 - `python-fido2` — validação FIDO2/U2F (`scripts/validate_fido.py`).
 - `hidapi` + `cbor2` — validação do Management HID (`scripts/validate_management.py`).
-- `pyscard` — validação CCID/ISO 7816 dos applets (`scripts/validate_ccid.py`).
+- `pcsc_transport` (embutido, MIT OR Apache-2.0, ou `pyscard` como fallback) — validação CCID/ISO 7816 dos applets (`scripts/validate_ccid.py`).
 - `aegistoken-host` — CLI de host em Rust sobre **libusb** para o Management HID,
   sem WinUSB/Zadig (ver abaixo).
 - Autoteste on-target no boot (log via defmt/RTT).
@@ -59,6 +59,7 @@ codificação `getInfo`, resposta do Management HID e leitura de BOOTSEL; com
 ```powershell
 python scripts/validate_management.py   # Management HID (AC-003..AC-009)
 python scripts/validate_fido.py         # FIDO2/U2F (AC-002, AC-011, AC-013)
+python scripts/validate_fido.py --pin 123456   # + changePIN e credential management
 python scripts/validate_ccid.py         # CCID (AC-016)
 python scripts/validate_piv.py          # PIV (AC-017/AC-021)
 python scripts/validate_oath.py         # OATH/TOTP/HOTP (AC-018)
@@ -413,7 +414,7 @@ acessível via `hidraw`.
 | AC-007 | Rejeitar configuração incompatível | `validate_management.py` (status 4 e 6) | **Verificado** |
 | AC-008 | Persistir configuração após power cycle | `ConfigStorage` (testes) + ciclo físico | Parcial (COMMIT grava em flash; ciclo físico pendente) |
 | AC-009 | Descoberta sem seleção manual | `validate_management.py` | **Verificado** |
-| AC-010 | BOOTSEL no boot → Recovery | Bootrom (BOOTSEL → bootloader USB) | Pendente |
+| AC-010 | BOOTSEL no boot → Recovery | Bootrom (BOOTSEL → bootloader USB) + gating por plano de boot (`aegis-core::state::BootPlan`) | Bootrom pendente; gating entregue (host/estático, ver abaixo) |
 | AC-011 | BOOTSEL em `FIDO_WAIT_PRESENCE` → presença | `validate_fido.py` makeCredential/getAssertion | **Verificado** |
 | AC-012 | BOOTSEL em outros estados ≠ aprovação | Testes de host (`ContextualPresence`) | Coberto por teste de host |
 | AC-013 | Material privado nunca exportado | Ausência de API de exportação + testes | **Verificado** / revisão |
@@ -425,6 +426,163 @@ acessível via `hidraw`.
 | AC-019 | OpenPGP Card: PW1/PW3, ECC e assinatura | `validate_openpgp.py` + GnuPG/OpenSC | Slices P-256/Ed25519/X25519 OK em testes de host; hardware pendente; persistência selada entregue |
 | AC-020 | SSH/Git (`ed25519-sk`) + OpenPGP Ed25519/X25519 | `validate_fido.py` + `validate_openpgp.py` + OpenSSH | Firmware pronto em testes de host; hardware pendente |
 | AC-021 | RSA-2048 (PIV/OpenPGP): keygen, assinatura, decifra | `validate_piv.py` + `validate_openpgp.py` + OpenSSL/GnuPG/`pkcs11-tool` | Firmware pronto em testes de host (147 `aegis-applets`); hardware pendente; RSA-3072/PSS fora de escopo |
+
+### Fases 7e — credential management e `changePIN` (host; hardware pendente)
+
+Cobertos por 225 testes de host em `aegis-core` (14 novos) e pelo validador
+`scripts/validate_fido.py --pin <PIN>`, que exercita em hardware:
+
+- `getPinUvAuthTokenUsingPinWithPermissions` com a permissão `cm`;
+- `changePIN` (rotação de ida e volta);
+- `enumerateRPs` e `enumerateCredentials` sobre uma credencial residente.
+
+O status de hardware permanece pendente (sem RP2350 físico nesta sessão).
+
+### Fase 7g — escopo e ciclo de vida do `pinUvAuthToken` (host; hardware pendente)
+
+Cobertos por 254 testes de host em `aegis-core` (16 novos nesta fatia: 13 em
+`pin.rs` e 3 em `authenticator.rs`; nenhuma remoção). A especificação da
+fatia é `specs/ctap2-token-scope.md` (AC1..AC15).
+
+| AC | Critério | Teste de host | Status |
+|----|----------|---------------|--------|
+| AC-1 | Emissão com `mc`/`ga` sem `rpId` aceita; `permissions = 0` → 0x02 e permissão não suportada → 0x40 | `token_requests_validate_the_permissions` | **Verificado** |
+| AC-2 | Token `cm` sem `rpId` fica sem vínculo e opera o dispositivo inteiro | `cm_token_without_rp_id_drives_the_whole_device` | **Verificado** |
+| AC-3 | Token legado concede `mc|ga` e nunca autoriza credential management | `legacy_token_is_accepted_by_make_credential_and_get_assertion`, `token_permissions_follow_the_requested_subcommand` | **Verificado** |
+| AC-4 | `makeCredential` exige a permissão `mc` (0x33) | `make_credential_requires_the_mc_permission` | **Verificado** |
+| AC-5 | `getAssertion` exige a permissão `ga` (0x33) | `get_assertion_requires_the_ga_permission` | **Verificado** |
+| AC-6 | Token de outro RP é recusado (0x33) | `token_bound_to_another_rp_is_refused` | **Verificado** |
+| AC-7 | Primeiro uso vincula o token ao RP; outro RP é recusado | `first_use_binds_the_token_to_the_relying_party` | **Verificado** |
+| AC-8 | Credential management exige `cm` (0x33); sem `pinUvAuthParam` → 0x36 | `credential_management_requires_the_cm_permission` | **Verificado** |
+| AC-9 | Escopo global exige token sem vínculo de RP (0x33) | `device_scope_requires_a_token_without_rp_binding` | **Verificado** |
+| AC-10 | `enumerateCredentialsBegin` restrito ao `rpIDHash` do RP vinculado | `enumerate_credentials_is_restricted_to_the_bound_rp` | **Verificado** |
+| AC-11 | `deleteCredential` restrito ao RP da credencial (lido do store); credencial preservada | `delete_credential_is_restricted_to_the_bound_rp` | **Verificado** |
+| AC-12 | Operação com presença bem-sucedida esvazia as permissões do token | `user_presence_operation_drops_the_token_permissions` (auxiliar em `aegis-core`) | **Verificado** no auxiliar; *wiring* do firmware verificado só por build/inspeção |
+| AC-13 | Operação com erro (ou sem token) mantém as permissões | `failed_operation_keeps_the_token_permissions` (auxiliar em `aegis-core`) | **Verificado** no auxiliar; *wiring* do firmware verificado só por build/inspeção |
+| AC-14 | `changePIN` invalida o token (0x33) | `change_pin_invalidates_the_token` | **Verificado** |
+| AC-15 | `authenticatorReset` invalida o token (0x33) | `reset_invalidates_the_pin_uv_auth_token` | **Verificado** |
+| AC-W | Wiring de firmware (escopo por operação, por RP e ciclo de vida) | `cargo clippy-fw` + `cargo build-fw` | **Verificado** (build/alvo) |
+
+Método: testes de host em `aegis-core` (`pin::tests` e `authenticator::tests`).
+A decisão de autorização mora em `aegis-core::pin::ClientPin::authorize`
+(HMAC + permissão + escopo de RP, com `Result<bool, Ctap2Status>`); o firmware
+apenas despacha e informa o contexto (permissão exigida, RP da requisição,
+RP efetivo da credencial). Sem HAL, executor ou dependência de storage.
+
+**Limitação (gate de hardware pendente):** a validação de ponta a ponta em
+dispositivo físico continua **pendente** — não há RP2350 físico nesta sessão.
+`scripts/validate_fido.py --pin <PIN>` é o candidato natural: o validador foi
+estendido com os casos negativos desta fatia (token legado em credential
+management → 0x33; token `cm` com `rpId` → `enumerateRPsBegin` recusado;
+token `mc` vinculado a `example.com` em `getAssertion` de outro RP → 0x33) e
+passou a buscar um **token novo por operação** — o token é consumido por uma
+operação com User Presence bem-sucedida (§6.5.5.7), então reutilizá-lo
+falharia com 0x33. O script não foi executado (sem dispositivo).
+
+**Mudanças de comportamento observável:** o token de `getPinToken` (0x05)
+passa a ser recusado em credential management (0x33); `getCredsMetadata`
+(0x01) passa a exigir token com `cm` (sem `pinUvAuthParam` → 0x36); o token
+usado numa operação com User Presence bem-sucedida perde as permissões
+(0x33 no uso seguinte); `authenticatorReset` invalida o token ativo.
+
+### Fase 7h — Recovery/Locked não servem FIDO/CCID (host; hardware pendente)
+
+Cobertos por 254 testes de host em `aegis-core` (8 novos nesta fatia) e por
+`cargo clippy-fw` + `cargo build-fw-release` (verificação estática do wiring):
+
+| AC | Critério | Teste de host / verificação | Status |
+|----|----------|----------------------------|--------|
+| AC-1 | `Active` habilita FIDO, CCID, Management e HID OTP | `boot_plan_active_enables_fido_ccid_management` | **Verificado** |
+| AC-2 | `Recovery` nega FIDO/CCID e mantém Management | `boot_plan_recovery_denies_fido_ccid_keeps_management` | **Verificado** |
+| AC-3 | `Locked` nega FIDO/CCID e mantém Management | `boot_plan_locked_denies_fido_ccid_keeps_management` | **Verificado** |
+| AC-4 | FIDO e CCID não divergem; FIDO nunca habilitado onde `fido_allowed` nega | `boot_plan_fido_and_ccid_never_diverge`, `boot_plan_never_enables_fido_where_fido_allowed_denies` | **Verificado** |
+| AC-5 | Falha fechada nos estados que não são destino de boot | `boot_plan_is_fail_closed_for_non_destination_states` | **Verificado** |
+| AC-6 | O destino de boot é sucessor legal de `Boot` | `boot_destination_is_always_a_legal_successor_of_boot` | **Verificado** |
+| AC-7 | Stores selados só são abertos quando o caminho está habilitado | `boot_plan_denies_sealed_stores_outside_active` + `cargo clippy-fw` (pontos de abertura condicionados ao plano) | **Verificado** (host/estático) |
+| AC-8 | Management HID não é afetado pelo gating | Suíte de `aegis-core::management_protocol` (`GET_STATUS`, `GET_DIAGNOSTICS`) + flags do plano | **Verificado** |
+| AC-9 | Boot com BOOTSEL não inicia `fido_task`/`ccid_task`; mantém `housekeeping`/`otp_task`; loga destino e plano | `cargo clippy-fw` + `cargo build-fw-release` + log de boot | **Verificado** (estático) |
+| AC-10 | FIDO/CCID enumeram mas não respondem; Management responde | Procedimento físico abaixo | Pendente (hardware) |
+| AC-11 | `GET_DIAGNOSTICS` expõe o destino do boot e os caminhos servidos | `diagnostics_report_shows_the_boot_plan`, `diagnostics_report_shows_the_denied_paths_in_recovery` | **Verificado** |
+| AC-12 | A leitura do BOOTSEL no boot exige nível estável (3 amostras) | `cargo clippy-fw` + `cargo build-fw` (rotina `read_bootsel_stable`) | **Verificado** (estático) |
+
+Método: a decisão é lógica pura no núcleo (`aegis-core::state::BootPlan`),
+sem HAL, executor ou storage; o firmware apenas lê o plano e obedece.
+
+**Diagnóstico de um dispositivo silenciado:** `GET_DIAGNOSTICS` (0x0A) passa a
+reportar `boot_destination` (0x08), `fido_enabled` (0x09) e `ccid_enabled`
+(0x0A), para que um dispositivo mudo pelo plano seja distinguível de um
+dispositivo quebrado.
+
+**Leitura do BOOTSEL:** o destino do boot é decidido por 3 amostras do pad
+(1 ms de intervalo). Uma leitura instável é tratada como "solto" e registrada
+em log: um falso positivo colocaria o dispositivo em `Recovery` e o deixaria
+mudo, o que é pior do que perder um boot de recuperação.
+
+**Procedimento físico (AC-10, pendente de RP2350 físico):**
+
+1. Flash do firmware: `& scripts/build-uf2.ps1`.
+2. **Manter BOOTSEL pressionado durante o power cycle.**
+3. Esperar a enumeração e registrar que as interfaces FIDO (usage page
+   `0xF1D0`) e CCID enumeram.
+4. `python scripts/validate_fido.py` → **deve falhar/timeout** (sem resposta).
+5. `python scripts/validate_ccid.py` (ou `opensc-tool -l` + seleção de AID) →
+   **deve falhar/timeout**.
+6. `python scripts/validate_management.py` → `GET_STATUS` e `GET_DIAGNOSTICS`
+   **devem responder**.
+7. Power cycle **sem** BOOTSEL → `validate_fido.py` volta a passar.
+
+**Limitação:** as interfaces FIDO/CCID **continuam enumerando**; a supressão da
+enumeração USB é não-objetivo desta fatia (efeito observável: enumerado e
+mudo). A saída do Recovery é o **power cycle sem BOOTSEL mantido** (o destino
+volta a ser `Active`) ou um firmware update assinado seguido de reboot — o
+caminho de update permanece disponível em Recovery.
+
+**Selftest destrutivo:** `crates/firmware-universal-rp2350/src/selftest.rs`
+abre um `SealedCredentialStore` **na área de scratch** (`0x0016_0000`, região de
+staging), não na região do store de credenciais (`0x136000`), e apenas sob a
+feature `selftest` (fora das imagens padrão de `scripts/build-uf2.ps1`). Ele
+não é via de leitura de credenciais em Recovery.
+
+### Estado de asserção pendente é restrito ao canal CTAPHID (host)
+
+A continuação de `authenticatorGetNextAssertion` fica em
+`aegis-core::assertion` (lógica pura, testável em host): o estado é criado
+apenas para uma requisição que produziu assinatura e é indexado pelo **canal
+CTAPHID** que a iniciou. Uma segunda aplicação no mesmo host recebe
+`NoCredentials` — sem id de credencial, sem user handle e sem a assinatura de
+um `clientDataHash` que não enviou.
+
+| Verificação | Resultado |
+|-------------|-----------|
+| `cargo test -p aegis-core assertion` | 4 testes aprovados |
+| Canal diferente tenta continuar | `None` (o dono da asserção ainda consegue continuar) |
+| Credenciais servidas em ordem | primeira, segunda; depois `None` |
+| Contexto preservado (`rp_id`, `clientDataHash`, `uv`) | verificado |
+
+**Limitação:** a validação em hardware (dois canais CTAPHID contra o firmware
+flashado) permanece pendente — não há RP2350 físico nesta sessão.
+
+### Gate de release: a chave de update de desenvolvimento nunca é distribuída (host)
+Verificado por testes de host em `crates/aegis-build-support` e por execução
+real do build (a spec é `specs/release-requires-vendor-key.md`):
+
+| Verificação | Resultado |
+|-------------|-----------|
+| `cargo test -p aegis-build-support` | 12 testes aprovados |
+| `AEGIS_RELEASE=1` sem `AEGIS_UPDATE_VENDOR_PUBKEY` | build **falha** (`AEGIS_RELEASE=1 requires a production firmware-update vendor key …`) |
+| `AEGIS_RELEASE=1` com chave de produção válida | build **passa**, sem o aviso de chave DEV |
+| `AEGIS_RELEASE=1` com o hex da chave DEV explícito | build **falha** (a chave DEV é detectada por bytes) |
+| `AEGIS_RELEASE=true` (valor inválido) | build **falha** (`AEGIS_RELEASE must be '1' …`) |
+| Chave com sinal (`+a`) ou caractere não-hex | **falha** (`must be hexadecimal …`) — o parsing estrito rejeita o que `from_str_radix` aceitaria |
+| Sem `AEGIS_RELEASE` e sem chave | build **passa** com o aviso de chave DEV (comportamento de desenvolvimento) |
+| `& scripts/build-uf2.ps1 -Release` sem a chave | **falha antes** de compilar |
+| `& scripts/build-uf2.ps1 -Release` com chave malformada ou com a chave DEV | **falha antes** de compilar (mesma política do `build.rs`, via `vendor-key-check`) |
+| `& scripts/build-uf2.ps1 -Release` com chave válida | compila, gera o UF2 e restaura `AEGIS_RELEASE` no shell |
+| Job de release do CI | tags versionadas compilam com `-Release`; nightlies seguem em modo de desenvolvimento |
+
+**Limitação:** o gate é opt-in por variável de ambiente/`-Release`; builds de
+terceiros que não o usem continuam embutindo a chave de desenvolvimento com
+aviso. O aviso no boot permanece como defesa para imagens já gravadas.
 
 ### Evidência — Management HID (12/12)
 
@@ -515,19 +673,50 @@ A validação com um cliente real revelou dois bugs de transporte, já corrigido
   físicos estão fora de escopo.
 - **Backup:** cobre só a identidade determinística — passkeys residentes e
   chaves OpenPGP/PIV não sobrevivem à troca de placa.
-- **Keepalive:** durante a espera de User Presence o firmware não envia
-  `CTAPHID_KEEPALIVE`; a resposta chega dentro do timeout de presença (15 s).
-  Melhoria prevista para a integração final.
+- **Keepalive:** durante a espera de User Presence o firmware envia
+  `CTAPHID_KEEPALIVE` a cada 100 ms no canal do pedido pendente
+  (`PROCESSING` em CTAP2, `UP_NEEDED` em CTAP1/U2F), evitando que o host
+  descarte a operação por timeout.
 - **Secure boot (AC-014/AC-015):** a execução de imagem inválida/antiga é
   impedida pelo bootrom; exige selar as imagens (`picotool seal`) e fundir as
   chaves/rollback em OTP — etapa de produção.
 - **Provisionamento:** a chave mestra de OTP e o attestation key de U2F_REGISTER
   são etapas de produção.
-- **Storage persistente de credenciais:** o firmware usa store em memória até o
-  refactor de compartilhamento de storage (ver `roadmap.md`).
+- **Storage persistente de credenciais:** com a chave raiz de OTP provisionada, a
+  tarefa FIDO abre o `SealedCredentialStore` no store `19` da região de applets e
+  as credenciais/estado de PIN sobrevivem a power cycle; sem a chave, o firmware
+  usa store em memória (placa de desenvolvimento). Validação física de AC-008
+  segue pendente.
 - **Applets em hardware (AC-016..AC-021):** sem dispositivo físico nesta
   sessão; cobertura = testes de host (147), autoteste `applet-select`
   on-target e scripts PC/SC prontos (`validate_ccid/piv/oath/openpgp.py`).
+- **Credential management CTAP2.1:** o firmware anuncia `FIDO_2_0` (e não
+  `FIDO_2_1`); `changePIN` e a enumeração de credenciais existem, mas a opção
+  `credMgmt` só é anunciada quando há PIN configurado, porque todo subcomando
+  de credential management exige um token com a permissão `cm`. A mutação de
+  *user information* e o `largeBlobKey` não são implementados.
+- **PIN obrigatório quando configurado:** com PIN no dispositivo,
+  `makeCredential`/`getAssertion` exigem a prova do PIN (`PinRequired` 0x36) e
+  rejeitam um `pinUvAuthParam` inválido (`PinAuthInvalid` 0x33). O validador
+  precisa ser executado com `--pin <PIN>` nesse caso.
+- **Escopo do `pinUvAuthToken`:** o token é escopado por operação (`mc` para
+  `makeCredential`, `ga` para `getAssertion`) e por RP (o *permissions RP ID*
+  precisa casar com o `rp.id` da requisição); `enumerateRPsBegin` exige token
+  sem vínculo de RP e `deleteCredential`/`enumerateCredentialsBegin` ficam
+  restritos ao RP vinculado. Divergência → `PinAuthInvalid` (0x33), com a
+  operação abortada antes de qualquer efeito. Um token emitido sem *permissions
+  RP ID* é vinculado ao RP do **primeiro uso** (§6.5.5.7), inclusive o token
+  legado de `getPinToken`.
+- **Ciclo de vida do `pinUvAuthToken`:** todo subcomando de credential
+  management exige token com a permissão `cm` — inclusive `getCredsMetadata`
+  (0x01), que antes respondia sem autenticação; sem `pinUvAuthParam` a
+  resposta é `PinRequired` (0x36). O token legado de `getPinToken` concede
+  apenas `mc|ga` e **não** autoriza credential management (0x33): o caminho
+  suportado é `getPinUvAuthTokenUsingPinWithPermissions` (0x09) com `cm`.
+  Após uma `makeCredential`/`getAssertion` bem-sucedida que testou User
+  Presence usando o token, o token fica **sem permissões** (uso posterior →
+  0x33); `changePIN` e `authenticatorReset` o invalidam. A validação em
+  dispositivo físico desse comportamento está **pendente**.
 - **RSA (AC-021):** RSA-2048/PKCS#1 v1.5 apenas; RSA-3072 e PSS fora de escopo.
   Sem brainpoolP512r1 / X448 / Ed448 (sem aritmética `no_std` madura em Rust).
   Keygen probabilístico (Miller-Rabin 12 rounds, sem certificação FIPS);

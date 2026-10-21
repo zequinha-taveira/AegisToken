@@ -222,6 +222,29 @@ pub fn error_report(channel: u32, code: CtapHidError) -> [u8; REPORT_SIZE] {
     report
 }
 
+/// Keepalive status: the request is still being processed.
+pub const KEEPALIVE_PROCESSING: u8 = 0x01;
+
+/// Keepalive status: user presence is required and has not been given yet.
+pub const KEEPALIVE_UP_NEEDED: u8 = 0x02;
+
+/// Build a keepalive notification.
+///
+/// The payload is the status byte followed by one data byte, as defined by
+/// the CTAPHID specification. `status` is [`KEEPALIVE_PROCESSING`] while a
+/// CTAP2 request runs and [`KEEPALIVE_UP_NEEDED`] while a CTAP1/U2F request
+/// waits for the user.
+#[must_use]
+pub fn keepalive_report(channel: u32, status: u8) -> [u8; REPORT_SIZE] {
+    let mut report = [0u8; REPORT_SIZE];
+    report[0..4].copy_from_slice(&channel.to_be_bytes());
+    report[4] = INIT_FLAG | (CtapHidCommand::Keepalive.code() & 0x7F);
+    report[5..7].copy_from_slice(&2u16.to_be_bytes());
+    report[7] = status;
+    report[8] = 0;
+    report
+}
+
 /// Parse a raw 64-byte report.
 pub fn parse_report(report: &[u8; REPORT_SIZE]) -> Result<Packet, CoreError> {
     let channel = u32::from_be_bytes([report[0], report[1], report[2], report[3]]);
@@ -450,6 +473,25 @@ mod tests {
         assert_eq!(command, CtapHidCommand::Error);
         assert_eq!(length, 1);
         assert_eq!(data[0], CtapHidError::InvalidCmd as u8);
+    }
+
+    #[test]
+    fn keepalive_report_carries_status_and_channel() {
+        let report = keepalive_report(0x1122_3344, KEEPALIVE_UP_NEEDED);
+        let Packet::Init {
+            channel,
+            command,
+            length,
+            data,
+        } = decode(report)
+        else {
+            panic!("expected init");
+        };
+        assert_eq!(channel, 0x1122_3344);
+        assert_eq!(command, CtapHidCommand::Keepalive);
+        assert_eq!(length, 2);
+        assert_eq!(data[0], KEEPALIVE_UP_NEEDED);
+        assert_eq!(data[1], 0);
     }
 
     #[test]

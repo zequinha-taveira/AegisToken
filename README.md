@@ -120,6 +120,13 @@ laboratório autorizado: não distribuir essa imagem em releases públicas.
 - **FIDO2/CTAP2**: `authenticatorGetInfo`, `makeCredential`, `getAssertion`,
   `clientPIN` (protocolo v1), `reset` e credential management — ES256 e
   EdDSA (`ed25519-sk`, pronta para SSH/Git; ver `docs/ssh-git.md`).
+  O `pinUvAuthToken` é **escopado**: `makeCredential` exige a permissão `mc`,
+  `getAssertion` a `ga` e o *permissions RP ID* do token precisa casar com o
+  `rp.id` da requisição (token sem `rpId` é vinculado no primeiro uso);
+  credential management exige a permissão `cm`. Falta de permissão ou RP
+  divergente responde `PinAuthInvalid` (0x33) e aborta a operação antes de
+  qualquer efeito. O token perde as permissões depois de uma operação com
+  User Presence bem-sucedida, e `changePIN`/`reset` o invalidam.
 - **U2F/CTAP1**: `U2F_VERSION` e `U2F_AUTHENTICATE` (check-only e sign, ES256).
 - **CCID / ISO 7816** (Fases 11–12, 16): transporte CCID (classe `0x0B`), APDU
   ISO 7816-4 (curto e estendido), roteamento por AID e framework de PIN/retry.
@@ -141,7 +148,10 @@ laboratório autorizado: não distribuir essa imagem em releases públicas.
 - **Segredos selados** com AES-256-GCM sob a chave mestra lida da OTP; nunca
   exportáveis.
 - **Lifecycle** completo (`Factory → Commissioning → Commissioned → … →
-  Decommissioned`) e modo **Recovery**, que nega FIDO e acesso a credenciais.
+  Decommissioned`) e modo **Recovery**: no boot com BOOTSEL mantido, o plano de
+  boot nega FIDO e CCID (e não abre os stores selados) — diagnóstico e
+  atualização de firmware seguem disponíveis. Para sair do Recovery: power
+  cycle **sem** BOOTSEL mantido.
 - **Atualização segura** de firmware: pacote assinado (P-256/ES256), SHA-256 e
   anti-rollback, com staging separado da imagem em execução.
 - **Secure boot/anti-rollback** nativos do RP2350 (ECDSA secp256k1 + hash da
@@ -292,6 +302,10 @@ ou remapeamento para o driver HID genérico).
   update e atestação.
 - [`docs/yubico-compatibility.md`](docs/yubico-compatibility.md) — escopo,
   requisitos e matriz de testes para Yubico Authenticator/`ykman`.
+- [`docs/pesquisa-bibliotecas.md`](docs/pesquisa-bibliotecas.md) — pesquisa
+  de bibliotecas maduras em Python e Rust sob licenciamento MIT OR Apache-2.0.
+- [`docs/plano-desenvolvimento.md`](docs/plano-desenvolvimento.md) — plano de
+  desenvolvimento para evolução do ferramental de host, Desktop Manager e integração de bibliotecas.
 
 ## Segurança
 
@@ -304,7 +318,9 @@ ou remapeamento para o driver HID genérico).
 - Chaves privadas e material sensível são ignorados pelo `.gitignore`
   (`*.pem`, `*.key`, etc.). Nunca faça commit de chaves.
 - Sem `AEGIS_UPDATE_VENDOR_PUBKEY`, o build embute uma chave de
-  **desenvolvimento** e registra um aviso — não libere imagens assim.
+  **desenvolvimento** e registra um aviso — não libere imagens assim. Para
+  uma imagem distribuível use `& scripts/build-uf2.ps1 -Release`: o build
+  **falha** se a chave de update for a chave de desenvolvimento.
 
 ## Licença
 

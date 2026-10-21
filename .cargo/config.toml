@@ -1,7 +1,7 @@
 [alias]
 build-fw = "build -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf"
 build-fw-release = "build -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf --release"
-clippy-fw = "clippy -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf -- -D warnings"
+clippy-fw = "clippy -p board-generic-rp2350 -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf --release -- -D warnings"
 # RP2354A/B targets (2 MiB in-package flash).
 build-fw-rp2354a = "build -p firmware-universal-rp2350 --no-default-features --features rp2354a --target thumbv8m.main-none-eabihf"
 build-fw-rp2354b = "build -p firmware-universal-rp2350 --no-default-features --features rp2354b --target thumbv8m.main-none-eabihf"
@@ -9,6 +9,8 @@ test-core = "test -p aegis-core"
 clippy-core = "clippy -p aegis-core --all-targets -- -D warnings"
 test-applets = "test -p aegis-applets"
 clippy-applets = "clippy -p aegis-applets --all-targets -- -D warnings"
+test-build-support = "test -p aegis-build-support"
+clippy-build-support = "clippy -p aegis-build-support --all-targets -- -D warnings"
 
 [env]
 DEFMT_LOG = "debug"

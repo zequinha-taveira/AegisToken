@@ -5,8 +5,10 @@
 
 #![forbid(unsafe_code)]
 
+mod card;
 mod cli;
 mod framing;
+mod piv_cmd;
 mod transport;
 
 use std::process::ExitCode;
