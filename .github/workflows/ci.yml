@@ -42,17 +42,27 @@ jobs:
         run: |
           rustup target add thumbv8m.main-none-eabihf
           rustup component add rustfmt clippy
-      - name: Gate refuses the development key
+      - name: Gate refuses a missing vendor key
         env:
           AEGIS_RELEASE: "1"
         run: |
-          if cargo check -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf; then
+          set +e
+          output="$(cargo check -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf 2>&1)"
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
             echo "::error::The release gate must fail without AEGIS_UPDATE_VENDOR_PUBKEY."
             exit 1
           fi
+          echo "$output" | grep -q "AEGIS_RELEASE=1 requires a production firmware-update vendor key" || {
+            echo "::error::The release gate must fail with the gate message."
+            exit 1
+          }
       - name: Gate accepts a production key
         env:
           AEGIS_RELEASE: "1"
+          # Format-valid but not a curve point: disposable public material,
+          # used only to check that the gate lets a non-development key pass.
           AEGIS_UPDATE_VENDOR_PUBKEY: "04a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
         run: cargo check -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf
 

@@ -96,6 +96,14 @@ fn parse_sec1_hex(value: &str) -> Result<[u8; 65], String> {
     let mut out = [0u8; 65];
     for (index, byte) in out.iter_mut().enumerate() {
         let hex = &value[index * 2..index * 2 + 2];
+        // `from_str_radix` accepts a leading sign, so the digits are checked
+        // first: only 0-9 and a-f are a hex byte here.
+        if !hex.bytes().all(|digit| digit.is_ascii_hexdigit()) {
+            return Err(format!(
+                "AEGIS_UPDATE_VENDOR_PUBKEY must be hexadecimal ({HEX_LEN} characters); \
+                 the character pair at offset {index} is not a hex byte."
+            ));
+        }
         *byte = u8::from_str_radix(hex, 16).map_err(|_| {
             format!(
                 "AEGIS_UPDATE_VENDOR_PUBKEY must be hexadecimal ({HEX_LEN} characters); \
@@ -184,6 +192,34 @@ mod tests {
         let compressed =
             resolve_vendor_key(Some(&format!("02{}", "a1".repeat(64))), false).unwrap_err();
         assert!(compressed.contains("uncompressed SEC1"));
+    }
+
+    #[test]
+    fn signed_or_padded_hex_is_rejected() {
+        // `from_str_radix` would read "+a" as 10; the key must be plain hex.
+        let signed =
+            resolve_vendor_key(Some(&format!("+4{}", "+a".repeat(64))), false).unwrap_err();
+        assert!(signed.contains("hexadecimal"));
+        let spaced =
+            resolve_vendor_key(Some(&format!("0 {}", "a1".repeat(64))), false).unwrap_err();
+        assert!(spaced.contains("hexadecimal"));
+        let too_long =
+            resolve_vendor_key(Some(&format!("04{}", "a1".repeat(65))), false).unwrap_err();
+        assert!(too_long.contains("exactly 130 hex characters"));
+    }
+
+    #[test]
+    fn uppercase_hex_is_accepted_and_matches_the_dev_key() {
+        let uppercase = DEV_HEX.to_ascii_uppercase();
+        let key = resolve_vendor_key(Some(&uppercase), false).unwrap();
+        assert!(key.is_dev);
+        assert_eq!(key.bytes, DEV_VENDOR_PUBLIC_KEY);
+    }
+
+    #[test]
+    fn release_refuses_an_empty_key() {
+        let error = resolve_vendor_key(Some(""), true).unwrap_err();
+        assert!(error.contains("AEGIS_RELEASE=1 requires a production"));
     }
 
     #[test]

@@ -440,9 +440,9 @@ O status de hardware permanece pendente (sem RP2350 físico nesta sessão).
 
 ### Fase 7g — escopo e ciclo de vida do `pinUvAuthToken` (host; hardware pendente)
 
-Cobertos por 252 testes de host em `aegis-core` (11 novos nesta fatia; 6
-testes obsoletos substituídos). A especificação da fatia é
-`specs/ctap2-token-scope.md` (AC1..AC15).
+Cobertos por 254 testes de host em `aegis-core` (16 novos nesta fatia: 13 em
+`pin.rs` e 3 em `authenticator.rs`; nenhuma remoção). A especificação da
+fatia é `specs/ctap2-token-scope.md` (AC1..AC15).
 
 | AC | Critério | Teste de host | Status |
 |----|----------|---------------|--------|
@@ -457,8 +457,8 @@ testes obsoletos substituídos). A especificação da fatia é
 | AC-9 | Escopo global exige token sem vínculo de RP (0x33) | `device_scope_requires_a_token_without_rp_binding` | **Verificado** |
 | AC-10 | `enumerateCredentialsBegin` restrito ao `rpIDHash` do RP vinculado | `enumerate_credentials_is_restricted_to_the_bound_rp` | **Verificado** |
 | AC-11 | `deleteCredential` restrito ao RP da credencial (lido do store); credencial preservada | `delete_credential_is_restricted_to_the_bound_rp` | **Verificado** |
-| AC-12 | Operação com presença bem-sucedida esvazia as permissões do token | `user_presence_operation_drops_the_token_permissions` | **Verificado** |
-| AC-13 | Operação com erro (ou sem token) mantém as permissões | `failed_operation_keeps_the_token_permissions` | **Verificado** |
+| AC-12 | Operação com presença bem-sucedida esvazia as permissões do token | `user_presence_operation_drops_the_token_permissions` (auxiliar em `aegis-core`) | **Verificado** no auxiliar; *wiring* do firmware verificado só por build/inspeção |
+| AC-13 | Operação com erro (ou sem token) mantém as permissões | `failed_operation_keeps_the_token_permissions` (auxiliar em `aegis-core`) | **Verificado** no auxiliar; *wiring* do firmware verificado só por build/inspeção |
 | AC-14 | `changePIN` invalida o token (0x33) | `change_pin_invalidates_the_token` | **Verificado** |
 | AC-15 | `authenticatorReset` invalida o token (0x33) | `reset_invalidates_the_pin_uv_auth_token` | **Verificado** |
 | AC-W | Wiring de firmware (escopo por operação, por RP e ciclo de vida) | `cargo clippy-fw` + `cargo build-fw` | **Verificado** (build/alvo) |
@@ -485,9 +485,9 @@ passa a ser recusado em credential management (0x33); `getCredsMetadata`
 usado numa operação com User Presence bem-sucedida perde as permissões
 (0x33 no uso seguinte); `authenticatorReset` invalida o token ativo.
 
-### Recovery/Locked não servem FIDO/CCID (host; hardware pendente)
+### Fase 7h — Recovery/Locked não servem FIDO/CCID (host; hardware pendente)
 
-Cobertos por 252 testes de host em `aegis-core` (8 novos nesta fatia) e por
+Cobertos por 254 testes de host em `aegis-core` (8 novos nesta fatia) e por
 `cargo clippy-fw` + `cargo build-fw-release` (verificação estática do wiring):
 
 | AC | Critério | Teste de host / verificação | Status |
@@ -502,9 +502,21 @@ Cobertos por 252 testes de host em `aegis-core` (8 novos nesta fatia) e por
 | AC-8 | Management HID não é afetado pelo gating | Suíte de `aegis-core::management_protocol` (`GET_STATUS`, `GET_DIAGNOSTICS`) + flags do plano | **Verificado** |
 | AC-9 | Boot com BOOTSEL não inicia `fido_task`/`ccid_task`; mantém `housekeeping`/`otp_task`; loga destino e plano | `cargo clippy-fw` + `cargo build-fw-release` + log de boot | **Verificado** (estático) |
 | AC-10 | FIDO/CCID enumeram mas não respondem; Management responde | Procedimento físico abaixo | Pendente (hardware) |
+| AC-11 | `GET_DIAGNOSTICS` expõe o destino do boot e os caminhos servidos | `diagnostics_report_shows_the_boot_plan`, `diagnostics_report_shows_the_denied_paths_in_recovery` | **Verificado** |
+| AC-12 | A leitura do BOOTSEL no boot exige nível estável (3 amostras) | `cargo clippy-fw` + `cargo build-fw` (rotina `read_bootsel_stable`) | **Verificado** (estático) |
 
 Método: a decisão é lógica pura no núcleo (`aegis-core::state::BootPlan`),
 sem HAL, executor ou storage; o firmware apenas lê o plano e obedece.
+
+**Diagnóstico de um dispositivo silenciado:** `GET_DIAGNOSTICS` (0x0A) passa a
+reportar `boot_destination` (0x08), `fido_enabled` (0x09) e `ccid_enabled`
+(0x0A), para que um dispositivo mudo pelo plano seja distinguível de um
+dispositivo quebrado.
+
+**Leitura do BOOTSEL:** o destino do boot é decidido por 3 amostras do pad
+(1 ms de intervalo). Uma leitura instável é tratada como "solto" e registrada
+em log: um falso positivo colocaria o dispositivo em `Recovery` e o deixaria
+mudo, o que é pior do que perder um boot de recuperação.
 
 **Procedimento físico (AC-10, pendente de RP2350 físico):**
 
@@ -538,13 +550,16 @@ real do build (a spec é `specs/release-requires-vendor-key.md`):
 
 | Verificação | Resultado |
 |-------------|-----------|
-| `cargo test -p aegis-build-support` | 9 testes aprovados |
+| `cargo test -p aegis-build-support` | 12 testes aprovados |
 | `AEGIS_RELEASE=1` sem `AEGIS_UPDATE_VENDOR_PUBKEY` | build **falha** (`AEGIS_RELEASE=1 requires a production firmware-update vendor key …`) |
 | `AEGIS_RELEASE=1` com chave de produção válida | build **passa**, sem o aviso de chave DEV |
 | `AEGIS_RELEASE=1` com o hex da chave DEV explícito | build **falha** (a chave DEV é detectada por bytes) |
 | `AEGIS_RELEASE=true` (valor inválido) | build **falha** (`AEGIS_RELEASE must be '1' …`) |
+| Chave com sinal (`+a`) ou caractere não-hex | **falha** (`must be hexadecimal …`) — o parsing estrito rejeita o que `from_str_radix` aceitaria |
 | Sem `AEGIS_RELEASE` e sem chave | build **passa** com o aviso de chave DEV (comportamento de desenvolvimento) |
 | `& scripts/build-uf2.ps1 -Release` sem a chave | **falha antes** de compilar |
+| `& scripts/build-uf2.ps1 -Release` com chave malformada ou com a chave DEV | **falha antes** de compilar (mesma política do `build.rs`, via `vendor-key-check`) |
+| `& scripts/build-uf2.ps1 -Release` com chave válida | compila, gera o UF2 e restaura `AEGIS_RELEASE` no shell |
 | Job de release do CI | tags versionadas compilam com `-Release`; nightlies seguem em modo de desenvolvimento |
 
 **Limitação:** o gate é opt-in por variável de ambiente/`-Release`; builds de

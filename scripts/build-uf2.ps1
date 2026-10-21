@@ -24,8 +24,8 @@
 #
 # -Release builds a distributable image: it fails before compiling when
 # AEGIS_UPDATE_VENDOR_PUBKEY is missing, malformed or the development key, and
-# it turns the build-time gate on (AEGIS_RELEASE=1). Without it the script
-# builds a development image, which is not safe to ship.
+# it turns the build-time gate on (AEGIS_RELEASE=1) for the firmware build.
+# Without it the script builds a development image, which is not safe to ship.
 
 param(
     [ValidateSet("universal", "rp2350a", "rp2350b", "rp2354a", "rp2354b")]
@@ -74,7 +74,13 @@ if ($Release) {
             "DEVELOPMENT firmware-update key. Set it to the release key (65-byte SEC1 hex, " +
             "from scripts/gen-update-key.py) and run again.")
     }
-    $env:AEGIS_RELEASE = "1"
+    # Same policy as the build script (crates/aegis-build-support): a malformed
+    # key or the development key is rejected before the firmware is compiled.
+    $check = & cargo run --quiet -p aegis-build-support --bin vendor-key-check 2>&1 |
+        ForEach-Object { $_.ToString() }
+    if ($LASTEXITCODE -ne 0) {
+        throw ("release gate: " + (($check -join "`n").Trim()))
+    }
 } elseif (-not $env:AEGIS_UPDATE_VENDOR_PUBKEY) {
     Write-Warning ("AEGIS_UPDATE_VENDOR_PUBKEY is not set: this image embeds a " +
         "DEVELOPMENT firmware-update key. Do not ship it.")
@@ -82,8 +88,14 @@ if ($Release) {
 
 $env:AEGIS_BOARD = $BoardProfile
 $featureArgs = if ($Board -eq "rp2350a") { @() } else { @("--no-default-features", "--features", $Board) }
-cargo build -p $bin --target $target --release @featureArgs
-if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
+$previousRelease = $env:AEGIS_RELEASE
+try {
+    if ($Release) { $env:AEGIS_RELEASE = "1" }
+    cargo build -p $bin --target $target --release @featureArgs
+    if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
+} finally {
+    $env:AEGIS_RELEASE = $previousRelease
+}
 
 picotool uf2 convert $elf -t elf $out
 if ($LASTEXITCODE -ne 0) { throw "picotool conversion failed ($LASTEXITCODE)" }
