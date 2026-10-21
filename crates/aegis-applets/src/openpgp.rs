@@ -1174,9 +1174,9 @@ impl<S: OpenPgpStore> OpenPgp<S> {
             return Response::status(Sw::SECURITY_STATUS_NOT_SATISFIED);
         }
         let algo = self.keys[1].effective_algo(1);
-        let cipher = tlv::find(input, 0xA6).unwrap_or(input);
-        let public_template = tlv::find(cipher, 0x7F49).unwrap_or(cipher);
         if algo == KEY_ALGO_RSA2048 {
+            let cipher = tlv::find(input, 0xA6).unwrap_or(input);
+            let public_template = tlv::find(cipher, 0x7F49).unwrap_or(cipher);
             let payload = tlv::find(public_template, 0x86).unwrap_or(public_template);
             let Some(block) = rsa_cipher_block(payload) else {
                 return Response::status(Sw::WRONG_DATA);
@@ -1195,44 +1195,12 @@ impl<S: OpenPgpStore> OpenPgp<S> {
             }
             return Response::ok(&self.out);
         }
-        let Some(point) = tlv::find(public_template, 0x86) else {
-            return Response::status(Sw::WRONG_DATA);
-        };
-        if algo == KEY_ALGO_ECDH_X25519 {
-            if point.len() != 32 {
-                return Response::status(Sw::WRONG_DATA);
-            }
-            let mut peer = [0u8; 32];
-            peer.copy_from_slice(point);
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&self.keys[1].material[..32]);
-            let secret = x25519_dalek::StaticSecret::from(seed);
-            let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(peer));
-            self.out.clear();
-            if self.out.extend_from_slice(&shared.to_bytes()).is_err() {
-                return Response::status(Sw::NOT_ENOUGH_MEMORY);
-            }
-            return Response::ok(&self.out);
-        }
-        if algo != KEY_ALGO_ECDH_P256 {
-            return Response::status(Sw::FUNCTION_NOT_SUPPORTED);
-        }
-        let Ok(public) = p256::PublicKey::from_sec1_bytes(point) else {
-            return Response::status(Sw::WRONG_DATA);
-        };
-        let Ok(secret) = p256::SecretKey::from_slice(&self.keys[1].material[..32]) else {
-            return Response::status(Sw::NO_PRECISE_DIAGNOSIS);
-        };
-        let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
-        self.out.clear();
-        if self
-            .out
-            .extend_from_slice(shared.raw_secret_bytes().as_slice())
-            .is_err()
-        {
-            return Response::status(Sw::NOT_ENOUGH_MEMORY);
-        }
-        Response::ok(&self.out)
+        // ECDH decryption follows RFC 6637: the card derives the key
+        // encryption key from the shared point and unwraps the session key
+        // that the sender wrapped for it. Until that material is
+        // provisioned, the request fails closed — the shared secret never
+        // leaves the card, which is the whole point of a decryption card.
+        Response::status(Sw::FUNCTION_NOT_SUPPORTED)
     }
 
     fn verify_change(&mut self, apdu: &Apdu<'_>) -> Response<'_> {
@@ -1637,7 +1605,7 @@ mod tests {
     }
 
     #[test]
-    fn pso_decipher_returns_the_p256_shared_secret() {
+    fn pso_decipher_refuses_to_leak_the_shared_secret() {
         let mut applet = applet();
         let mut rng = TestRng(5);
         verify_pw3(&mut applet, &mut rng);
@@ -1662,8 +1630,10 @@ mod tests {
         let mut cipher = Vec::<u8, 192>::new();
         append_tlv(&mut cipher, 0xA6, &public_template);
         let (shared, status) = run(&mut applet, &mut rng, &frame(INS_PSO, 0x80, 0x86, &cipher));
-        assert_eq!(status, Sw::OK);
-        assert_eq!(shared.len(), 32);
+        // The ECDH decryption follows RFC 6637 and is not provisioned yet: the
+        // card fails closed instead of handing the shared secret to the host.
+        assert_eq!(status, Sw::FUNCTION_NOT_SUPPORTED);
+        assert!(shared.is_empty());
     }
 
     #[test]
@@ -2042,7 +2012,7 @@ mod tests {
     }
 
     #[test]
-    fn x25519_decipher_agrees_with_peer() {
+    fn x25519_decipher_fails_closed_without_rfc6637_material() {
         let mut applet = applet();
         let mut rng = TestRng(11);
         verify_pw3(&mut applet, &mut rng);
@@ -2069,13 +2039,11 @@ mod tests {
         let mut cipher = Vec::<u8, 128>::new();
         append_tlv(&mut cipher, 0xA6, &public_template);
         let (shared, status) = run(&mut applet, &mut rng, &frame(INS_PSO, 0x80, 0x86, &cipher));
-        assert_eq!(status, Sw::OK);
-        assert_eq!(shared.len(), 32);
-
-        // DH symmetry: peer(card_pub) must equal card(peer_pub).
-        let card_public = x25519_dalek::PublicKey::from(<[u8; 32]>::try_from(card_point).unwrap());
-        let expected = peer_secret.diffie_hellman(&card_public);
-        assert_eq!(&shared[..], &expected.to_bytes());
+        // Curve25519 is not covered by RFC 6637 and has no normalised KDF
+        // parameters: the card refuses instead of handing the shared secret
+        // to the host.
+        assert_eq!(status, Sw::FUNCTION_NOT_SUPPORTED);
+        assert!(shared.is_empty());
     }
 
     #[test]

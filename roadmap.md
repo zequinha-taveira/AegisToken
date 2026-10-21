@@ -1094,8 +1094,16 @@ adiado.
   fingerprints RFC 4880; estes campos têm suporte estrutural, mas ainda
   precisam de validação externa.
 - **Cripto fora desta slice:** RSA, Ed25519/EdDSA e X25519/KDF OpenPGP ficam
-  para as Fases 15–16; o ECDH atual retorna o shared secret P-256 bruto para
-  testes de transporte, não o KDF+AES RFC 6637 completo.
+  para as Fases 15–16.
+- **ECDH OpenPGP (S1 entregue, S2 pendente):** o applet **não devolve mais o
+  shared secret** ao host. As primitivas da RFC 6637 (KDF de concatenação
+  NIST SP 800-56A com SHA-256, AES Key Wrap da RFC 3394 e o bloco de
+  parâmetros do §8) estão em `aegis-applets::ecdh`, com os vetores da RFC
+  3394 e um vetor de referência da KDF; enquanto o material RFC 6637 não está
+  provisionado, `PSO:DECIPHER` responde `6A81` em vez de vazar o segredo.
+  A etapa S2 (material provisionado, desembrulho da chave de sessão e
+  decifra do texto no cartão) depende de hardware e de interop com o GnuPG.
+  Spec: `specs/openpgp-rfc6637-ecdh.md`.
 
 ## Persistência selada dos applets (entregue)
 
