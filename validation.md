@@ -440,8 +440,9 @@ O status de hardware permanece pendente (sem RP2350 físico nesta sessão).
 
 ### Fase 7g — escopo e ciclo de vida do `pinUvAuthToken` (host; hardware pendente)
 
-Cobertos por 254 testes de host em `aegis-core` (16 novos nesta fatia: 13 em
-`pin.rs` e 3 em `authenticator.rs`; nenhuma remoção). A especificação da
+Cobertos por 258 testes de host em `aegis-core` (16 novos nesta fatia: 13 em
+`pin.rs` e 3 em `authenticator.rs`; 6 testes antigos de escopo foram
+substituídos pelos novos). A especificação da
 fatia é `specs/ctap2-token-scope.md` (AC1..AC15).
 
 | AC | Critério | Teste de host | Status |
@@ -487,7 +488,8 @@ usado numa operação com User Presence bem-sucedida perde as permissões
 
 ### Fase 7h — Recovery/Locked não servem FIDO/CCID (host; hardware pendente)
 
-Cobertos por 254 testes de host em `aegis-core` (8 novos nesta fatia) e por
+Cobertos por 258 testes de host em `aegis-core` (10 novos nesta fatia: 8 em
+`aegis-core::state`, 1 em `recovery.rs` e 1 em `management_protocol.rs`) e por
 `cargo clippy-fw` + `cargo build-fw-release` (verificação estática do wiring):
 
 | AC | Critério | Teste de host / verificação | Status |
@@ -561,6 +563,29 @@ um `clientDataHash` que não enviou.
 
 **Limitação:** a validação em hardware (dois canais CTAPHID contra o firmware
 flashado) permanece pendente — não há RP2350 físico nesta sessão.
+
+### Contagem de credenciais conforme a CTAP 2.1 (host)
+
+O membro `numberOfCredentials` (chave CBOR 5) segue as regras da CTAP 2.1:
+presente apenas quando mais de uma credencial correspondeu e a requisição **não**
+trouxe `allowList`; ausente com `allowList`, com uma única credencial e nas
+respostas de `authenticatorGetNextAssertion`. A lista de candidatos deixou de
+ser truncada em silêncio: um store com mais credenciais que o limite responde
+`LimitExceeded` (0x15). Spec: `specs/ctap2-number-of-credentials.md`.
+
+| AC | Verificação | Resultado |
+|----|-------------|-----------|
+| AC-1 | Sem `allowList` e 2 credenciais → membro presente com o valor 2 | **Verificado** (`number_of_credentials_follows_the_ctap21_rules`, `the_count_member_is_absent_when_the_rules_forbid_it`) |
+| AC-2 | Com `allowList` e 2 correspondências → membro ausente | **Verificado** |
+| AC-3 | Com 1 credencial → membro ausente | **Verificado** |
+| AC-4 | Resposta de continuação → membro ausente | **Verificado** |
+| AC-5 | Caminho do firmware informa a contagem real e a omite quando a norma exige | `cargo clippy-fw` + `cargo build-fw-release` (build/alvo) |
+| AC-6 | Estouro do limite → `LimitExceeded`, sem truncamento | **Verificado** (`a_candidate_list_over_the_limit_is_not_truncated_silently`) |
+| AC-7 | Regressão de `getAssertion` (assinatura, `authData` com UP/UV) | **Verificado** (suíte de `aegis-core` verde) |
+
+**Limitação:** a validação em hardware (enumeração com duas contas do mesmo RP
+contra o firmware flashado) permanece pendente — não há RP2350 físico nesta
+sessão.
 
 ### Gate de release: a chave de update de desenvolvimento nunca é distribuída (host)
 Verificado por testes de host em `crates/aegis-build-support` e por execução

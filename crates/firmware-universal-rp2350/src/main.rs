@@ -946,7 +946,10 @@ where
             if !up {
                 return write_status(ctap2::Ctap2Status::UpRequired, out);
             }
-            let candidates = authenticator::assertion_candidates(store, &request);
+            let candidates = match authenticator::assertion_candidates(store, &request) {
+                Ok(candidates) => candidates,
+                Err(status) => return write_status(status, out),
+            };
             let Some(first) = candidates.first().cloned() else {
                 return write_status(ctap2::Ctap2Status::NoCredentials, out);
             };
@@ -961,7 +964,14 @@ where
             // its permissions.
             client_pin.close_user_presence_operation(uv, response.is_ok());
             match response {
-                Ok(response) => {
+                Ok(mut response) => {
+                    // The count tells the platform how many credentials match;
+                    // the CTAP 2.1 rules forbid it with an allow list, with a
+                    // single match and in the continuation responses.
+                    response.number_of_credentials = authenticator::number_of_credentials(
+                        candidates.len(),
+                        !request.allow_list.is_empty(),
+                    );
                     // The pending assertion is remembered only for a request
                     // that produced a signature, and only for the channel
                     // that asked for it.

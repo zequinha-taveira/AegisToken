@@ -80,6 +80,13 @@ The `pinUvAuthToken` is a live proof of user verification and is scoped:
   never asked for, and receives no credential id or user handle. The state is
   only created for a request that produced a signature
   (`aegis-core::assertion`, host-tested).
+- **The credential count follows the CTAP 2.1 rules and is never truncated.**
+  `numberOfCredentials` is present only when more than one credential matched
+  and the request carried no allow list; it is absent with an allow list, with
+  a single match and in the continuation responses. A store holding more
+  matching credentials than the limit is reported as `LimitExceeded` instead
+  of silently dropping a credential, so the count can never understate the
+  number of candidates (`aegis-core::authenticator`, host-tested).
 - **The scope check is pure core logic.** It lives in `aegis-core` (`pin` and
   `authenticator`), with no HAL, executor or storage dependency; the firmware
   only hands over the relying party, the credential id and the `rpIdHash` of

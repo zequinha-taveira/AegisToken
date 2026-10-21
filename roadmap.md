@@ -490,7 +490,7 @@ adiado.
 - **Correção de segurança:** todo subcomando de credential management (exceto
   `getCredsMetadata`) exige token com permissão `cm`; antes, `deleteCredential`
   não exigia autenticação alguma. Tokens do `getPinToken` legado também são
-  aceitos (o PIN já foi provado) — **revisto na fatia 7h**: o token legado
+  aceitos (o PIN já foi provado) — **revisto na fatia 7g**: o token legado
   concede apenas `mc|ga` e nunca autoriza credential management.
 - `getInfo` anuncia `pinUvAuthToken: true` e `credMgmt` apenas quando há PIN
   configurado (o token é obrigatório para enumerar).
@@ -515,7 +515,7 @@ adiado.
   RP (`enumerateRPsBegin` exige token sem vínculo; `deleteCredential` e
   `enumerateCredentialsBegin` ficam restritos ao RP vinculado).
 - ~~`getCredsMetadata` (0x01) responde sem qualquer autenticação.~~
-  **Entregue na fatia 7h:** todo subcomando de credential management exige
+  **Entregue na fatia 7g:** todo subcomando de credential management exige
   token com a permissão `cm`; a ausência de `pinUvAuthParam` responde
   `PinRequired` (0x36).
 
@@ -536,6 +536,14 @@ adiado.
   silenciosamente, e, com PIN configurado, `makeCredential`/`getAssertion`
   exigem a prova do PIN (`PinRequired` 0x36) — como em um autenticador real.
   Sem PIN, o fluxo continua somente com User Presence.
+
+**Aditivo (entregue junto das fatias 7g/7h)**
+
+- `aegis-core::assertion` (`PendingAssertion`): o estado da asserção pendente
+  passa a ser **vinculado ao canal CTAPHID** que iniciou o pedido — outra
+  aplicação no mesmo host não consegue continuar uma asserção que não pediu —
+  e só é criado quando a asserção produziu assinatura (4 testes de host; total
+  da fatia: 228 → 232, antes dos +16 da 7g e dos +10 da 7h).
 
 **Verificação**
 
@@ -594,16 +602,21 @@ adiado.
 
 **Verificação**
 
-- 252 testes de host em `aegis-core` (11 novos nesta fatia — emissão sem
-  `rpId`, token legado, escopo por operação, escopo por RP, vínculo no
-  primeiro uso, `cm` por subcomando, redução de permissões, manutenção em
-  operação com erro, invalidação por `changePIN` e por reset — e 6 testes
-  obsoletos substituídos), clippy limpo em host e alvo, build de firmware
-  gerado.
+- 258 testes de host em `aegis-core` (16 novos nesta fatia — 13 em `pin.rs`:
+  emissão sem `rpId`, token legado, escopo por operação, escopo por RP,
+  vínculo no primeiro uso, `cm` por subcomando, escopo de
+  `enumerateCredentialsBegin`, redução de permissões, manutenção em operação
+  com erro e invalidação por `changePIN`; e 3 em `authenticator.rs`:
+  `deleteCredential` restrito ao RP, token sem vínculo de RP apaga qualquer
+  credencial e invalidação pelo reset), clippy limpo em host e alvo, build de
+  firmware gerado.
 - Gate de hardware (`scripts/validate_fido.py --pin <PIN>`) **pendente**:
-  não há RP2350 físico nesta sessão. O validador precisa ser estendido com os
-  casos negativos (token com `cm` + `rpId` → `enumerateRPs` recusado; token
-  `mc` usado em `getAssertion` de outro RP → 0x33).
+  não há RP2350 físico nesta sessão. O validador **já cobre** os casos
+  negativos desta fatia (token legado em credential management → 0x33; token
+  `cm` com `rpId` → `enumerateRPsBegin` recusado; token `mc` vinculado a
+  `example.com` em `getAssertion` de outro RP → 0x33) e busca um **token novo
+  por operação**, já que o token é consumido por uma operação com User
+  Presence bem-sucedida (§6.5.5.7). Falta apenas a execução física.
 
 **Limitações registradas**
 
@@ -624,6 +637,15 @@ adiado.
 - **Divergência documentada:** o token sem *permissions RP ID* é vinculado no
   primeiro uso, como manda a nota de §6.5.5.7, em vez de a emissão ser
   recusada — recusar quebraria plataformas que pedem `mc`/`ga` sem `rpId`.
+- **O vínculo de RP é feito na autorização**, como o algoritmo da CTAP2.1
+  (§6.1.2, passo 6: a associação do `rp.id` ao token acontece durante a
+  operação). Uma operação que depois falha deixa o token vinculado àquele RP:
+  a plataforma precisa de um token novo para operar em outro RP.
+- **O *wiring* da redução de permissões** após operação com presença
+  (`main.rs`: `close_user_presence_operation(uv, resultado.is_ok())`) é
+  verificado apenas por build e inspeção — o teste de host cobre o auxiliar em
+  `aegis-core::pin`, não a chamada no firmware. O gate de hardware continua
+  pendente.
 
 ### 7h — Gating por destino de boot (`BootPlan`) (concluída)
 
@@ -641,14 +663,49 @@ adiado.
 
 **Verificação**
 
-- 8 testes de host em `aegis-core::state` (`boot_plan_*`), clippy limpo em host e
-  alvo, build de firmware gerado.
+- 258 testes de host em `aegis-core` (10 novos nesta fatia — 8 em
+  `aegis-core::state`, 1 em `recovery.rs` e 1 em `management_protocol.rs`, os
+  dois do relatório de diagnóstico), clippy limpo em host e alvo, build de
+  firmware gerado.
+- O relatório de diagnóstico (`GET_DIAGNOSTICS`) passou a expor o destino do
+  boot e os caminhos servidos (`boot_destination`, `fido_enabled`,
+  `ccid_enabled`), para que um dispositivo silenciado pelo plano possa ser
+  distinguido de um dispositivo quebrado.
+- A leitura do BOOTSEL no boot passou a exigir um nível estável (3 amostras,
+  1 ms de intervalo): uma leitura instável é tratada como "solto" e
+  registrada em log, para que um falso positivo não mute o produto.
 
 **Limitações registradas**
 
 - As interfaces FIDO/CCID **continuam enumerando** em `Recovery`/`Locked`: elas
   não respondem, mas o host ainda as vê. Suprimir a enumeração exige mudar a
   descritorização USB, o que fica para uma fatia própria.
+
+### 7i — Contagem de credenciais conforme a CTAP 2.1 (concluída)
+
+**Entregue**
+
+- `numberOfCredentials` (chave CBOR 5) passou a ser um membro **opcional**:
+  `aegis-core::authenticator::number_of_credentials(count, has_allow_list)`
+  decide a presença conforme a CTAP 2.1 — presente só quando mais de uma
+  credencial correspondeu e a requisição **não** trouxe `allowList`; ausente com
+  `allowList`, com uma única correspondência e nas respostas de
+  `authenticatorGetNextAssertion`. Antes, o firmware fixava `1` e emitia o
+  membro onde a norma o proíbe.
+- A lista de candidatos parou de truncar em silêncio: `assertion_candidates`
+  devolve `Result` e responde `LimitExceeded` (0x15) quando o store tem mais
+  credenciais correspondentes que o limite — a contagem não pode mais
+  subnotificar os candidatos.
+
+**Verificação**
+
+- 261 testes de host em `aegis-core` (3 novos nesta fatia), clippy limpo em host
+  e alvo, build de firmware gerado. Spec: `specs/ctap2-number-of-credentials.md`.
+
+**Limitações registradas**
+
+- Sem RP2350 físico, a enumeração com duas contas do mesmo RP continua
+  pendente de validação em hardware.
 
 ## Fase 7 — requisitos
 
