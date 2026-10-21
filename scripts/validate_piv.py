@@ -25,11 +25,17 @@ import os
 import sys
 
 try:
-    from smartcard.System import readers
-except ImportError as exc:  # pragma: no cover - tooling dependency
-    print("pyscard is required: pip install pyscard")
-    print(exc)
-    sys.exit(2)
+    from pcsc_transport import readers
+except ImportError:
+    try:
+        from scripts.pcsc_transport import readers
+    except ImportError:
+        try:
+            from smartcard.System import readers
+        except ImportError as exc:  # pragma: no cover - tooling dependency
+            print("PC/SC transport is required: scripts/pcsc_transport.py (built-in) or pyscard")
+            print(exc)
+            sys.exit(2)
 
 try:
     from cryptography.hazmat.primitives import hashes

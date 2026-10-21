@@ -292,6 +292,10 @@ ou remapeamento para o driver HID genérico).
   update e atestação.
 - [`docs/yubico-compatibility.md`](docs/yubico-compatibility.md) — escopo,
   requisitos e matriz de testes para Yubico Authenticator/`ykman`.
+- [`docs/pesquisa-bibliotecas.md`](docs/pesquisa-bibliotecas.md) — pesquisa
+  de bibliotecas maduras em Python e Rust sob licenciamento MIT OR Apache-2.0.
+- [`docs/plano-desenvolvimento.md`](docs/plano-desenvolvimento.md) — plano de
+  desenvolvimento para evolução do ferramental de host, Desktop Manager e integração de bibliotecas.
 
 ## Segurança
 

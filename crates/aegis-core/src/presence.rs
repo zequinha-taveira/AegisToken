@@ -202,6 +202,73 @@ impl PresenceController {
     }
 }
 
+/// Drives a [`PresenceController`] one sample at a time.
+///
+/// The waiter owns the operation lifecycle (arming, the millisecond clock and
+/// the debounce state) so a caller can interleave other work — sending
+/// CTAPHID keepalive notifications, for instance — while waiting for the user
+/// without restarting the debounce window.
+#[derive(Debug, Clone)]
+pub struct PresenceWaiter {
+    controller: PresenceController,
+    operation_counter: u32,
+    now_ms: u64,
+    armed: bool,
+}
+
+impl PresenceWaiter {
+    /// Create a waiter with the given debounce and timeout parameters.
+    #[must_use]
+    pub const fn new(timing: PresenceTiming) -> Self {
+        Self {
+            controller: PresenceController::new(timing),
+            operation_counter: 0,
+            now_ms: 0,
+            armed: false,
+        }
+    }
+
+    /// Arm a fresh operation, invalidating any press observed before it.
+    pub fn begin(&mut self) -> Result<(), PresenceError> {
+        self.operation_counter = self.operation_counter.wrapping_add(1);
+        self.controller.disarm();
+        self.controller.arm(self.operation_counter, 0)?;
+        self.now_ms = 0;
+        self.armed = true;
+        Ok(())
+    }
+
+    /// Feed one sample; `Ok(true)` once presence is confirmed.
+    ///
+    /// Each call advances the internal clock by one millisecond, matching the
+    /// sampling period used by the firmware. The operation stays armed between
+    /// calls, so a caller may interleave other work.
+    pub fn poll(&mut self, pressed: bool) -> Result<bool, PresenceError> {
+        if !self.armed {
+            self.begin()?;
+        }
+        let outcome = self.controller.update(pressed, self.now_ms);
+        self.now_ms = self.now_ms.saturating_add(1);
+        match outcome {
+            Some(PresenceOutcome::Confirmed { .. }) => {
+                self.armed = false;
+                Ok(true)
+            }
+            Some(PresenceOutcome::Timeout { .. }) => {
+                self.armed = false;
+                Err(PresenceError::Timeout)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Whether an operation is currently armed.
+    #[must_use]
+    pub const fn is_armed(&self) -> bool {
+        self.armed
+    }
+}
+
 /// Enforces the contextual BOOTSEL rule (PRD §17).
 ///
 /// Presence is only armed and only accepts samples while the execution state is
@@ -469,5 +536,69 @@ mod tests {
         assert!(g.is_armed());
         assert_eq!(g.update(ExecutionState::FidoOperation, true, 10), None);
         assert!(!g.is_armed());
+    }
+
+    fn waiter() -> PresenceWaiter {
+        PresenceWaiter::new(PresenceTiming {
+            debounce_ms: 20,
+            timeout_ms: 1_000,
+        })
+    }
+
+    #[test]
+    fn waiter_confirms_after_the_debounce_window() {
+        let mut w = waiter();
+        assert!(!w.is_armed());
+        // Samples 0..20 are inside the debounce window.
+        for _ in 0..20 {
+            assert_eq!(w.poll(true), Ok(false));
+        }
+        assert_eq!(w.poll(true), Ok(true));
+    }
+
+    #[test]
+    fn waiter_keeps_the_debounce_window_across_polls() {
+        let mut w = waiter();
+        w.begin().unwrap();
+        assert_eq!(w.poll(true), Ok(false));
+        // Interleaved work (keepalives) does not restart the window.
+        for _ in 0..19 {
+            assert_eq!(w.poll(true), Ok(false));
+        }
+        assert_eq!(w.poll(true), Ok(true));
+    }
+
+    #[test]
+    fn waiter_times_out_and_disarms() {
+        let mut w = waiter();
+        for _ in 0..1_000 {
+            assert_eq!(w.poll(false), Ok(false));
+        }
+        assert_eq!(w.poll(false), Err(PresenceError::Timeout));
+        assert!(!w.is_armed());
+    }
+
+    #[test]
+    fn waiter_consumes_presence_once() {
+        let mut w = waiter();
+        for _ in 0..20 {
+            assert_eq!(w.poll(true), Ok(false));
+        }
+        assert_eq!(w.poll(true), Ok(true));
+        assert!(!w.is_armed());
+        // The stale press does not satisfy a new operation: a release and a
+        // fresh press are required.
+        assert_eq!(w.poll(true), Ok(false));
+        assert_eq!(w.poll(false), Ok(false));
+        for _ in 0..20 {
+            assert_eq!(w.poll(false), Ok(false));
+        }
+        assert_eq!(w.poll(true), Ok(false));
+        for _ in 0..20 {
+            if w.poll(true) == Ok(true) {
+                return;
+            }
+        }
+        panic!("fresh press was not confirmed");
     }
 }

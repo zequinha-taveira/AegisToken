@@ -125,6 +125,12 @@ pub enum Ctap2Status {
     UpRequired = 0x3B,
     /// UV blocked.
     UvBlocked = 0x3C,
+    /// Integrity check failed.
+    IntegrityFailure = 0x3D,
+    /// Invalid subcommand.
+    InvalidSubcommand = 0x3E,
+    /// The requested permission is not granted by this authenticator.
+    UnauthorizedPermission = 0x40,
     /// Unspecified error.
     Other = 0x7F,
 }
@@ -287,6 +293,10 @@ pub struct GetInfoResponse {
     pub options_uv: bool,
     /// Whether a PIN can be configured.
     pub options_client_pin: bool,
+    /// Whether PIN/UV auth tokens are supported.
+    pub options_pin_uv_auth_token: bool,
+    /// Whether credential management is supported.
+    pub options_cred_mgmt: bool,
     /// Maximum message size.
     pub max_msg_size: u16,
     /// Supported PIN/UV auth protocols.
@@ -303,6 +313,10 @@ impl Default for GetInfoResponse {
             options_uv: false,
             // clientPIN (PIN/UV auth protocol v1) is advertised; presence is UP-only.
             options_client_pin: true,
+            options_pin_uv_auth_token: true,
+            // Credential management needs a PIN: the platform must obtain a
+            // token with the `cm` permission before enumerating or deleting.
+            options_cred_mgmt: false,
             max_msg_size: MAX_MSG_SIZE,
             pin_protocols: &[1],
         }
@@ -328,7 +342,7 @@ impl<C> minicbor::Encode<C> for GetInfoResponse {
         e.bytes(&self.aaguid)?;
 
         e.u8(4)?;
-        e.map(4)?;
+        e.map(6)?;
         e.str("rk")?;
         e.bool(self.options_rk)?;
         e.str("up")?;
@@ -337,6 +351,10 @@ impl<C> minicbor::Encode<C> for GetInfoResponse {
         e.bool(self.options_uv)?;
         e.str("clientPin")?;
         e.bool(self.options_client_pin)?;
+        e.str("pinUvAuthToken")?;
+        e.bool(self.options_pin_uv_auth_token)?;
+        e.str("credMgmt")?;
+        e.bool(self.options_cred_mgmt)?;
 
         e.u8(5)?;
         e.u16(self.max_msg_size)?;

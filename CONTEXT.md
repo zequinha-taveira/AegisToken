@@ -6,7 +6,7 @@ Universal firmware for the RP2350 family (RP2350A/B + RP2354A/B, one binary with
 
 - USB product: `AegisToken FIDO2 USB Authenticator`, VID `0x1209` PID `0x0001` (generic profile). Third-party boards use VID `0x2E8A` + allocated PID (see `README.md` table).
 - Release artifact: `rp2350-universal.uf2` via `scripts/build-uf2.ps1`.
-- Status: phases 0–15 done; 16 (RSA-2048) and 17 (applet conformance) in firmware, hardware validation pending. See `roadmap.md` and `validation.md` (AC-001..AC-021).
+- Status: phases 0–15 done; 16 (RSA-2048) and 17 (applet conformance) in firmware, hardware validation pending. FIDO slices 7a–7e done (sealed credential store, CTAPHID keepalive, CTAP2.1 credential management + `changePIN`). See `roadmap.md` and `validation.md` (AC-001..AC-021).
 
 ## USB interfaces (strictly separated)
 
@@ -42,4 +42,4 @@ Invariants: FIDO never depends on Keyboard/Management/CCID. CCID never reachable
 - Host gates: `cargo fmt --check`, `clippy -D warnings`, `cargo test` for `aegis-core` (~193 tests), `aegis-applets` (~147), `aegistoken-host` (5).
 - Hardware scripts in `scripts/`: `validate_management.py`, `validate_fido.py` (needs FIDO interface free — Windows `fidohid` holds it; see `validation.md` options A/B/C), `validate_ccid/piv/oath/openpgp.py` (need `pcscd`/`usbccid`), `set_pin.py`.
 - Windows Management HID works driverless via libusb HID backend (no Zadig). Linux needs `scripts/99-aegistoken.rules`.
-- Known gaps: on-device credential store still in-memory pending storage-sharing refactor; CCID/RSA/SSH flows validated on host only, hardware runs pending (AC-016..021); no CTAPHID keepalive during presence wait.
+- Known gaps: CCID/RSA/SSH flows validated on host only, hardware runs pending (AC-016..021). FIDO credentials/PIN persist via `SealedCredentialStore` in the applet region store `19` when the OTP root key is provisioned (memory otherwise). CTAPHID keepalive (100 ms) is sent while waiting for user presence. Credential management (`enumerateRPs`/`enumerateCredentials`/`deleteCredential`) and `changePIN` require a PIN/UV token with the `cm` permission.

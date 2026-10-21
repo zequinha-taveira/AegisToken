@@ -17,9 +17,12 @@ use aegis_applets::sealed::{
     OPENPGP_DATA_STORE_BASE, OPENPGP_SHARDS, PivLayout, SealedOathStore, SealedOpenPgpStore,
     SealedPivStore,
 };
-use aegis_core::authenticator::{self, CredentialManagementRequest, MemoryCredentialStore};
+use aegis_core::authenticator::{
+    self, CredentialManagementRequest, CredentialStore, MemoryCredentialStore,
+};
 use aegis_core::capabilities::Rp2350Family;
 use aegis_core::configuration::{DeviceConfig, LedBehavior, ValidationContext};
+use aegis_core::credential_store::SealedCredentialStore;
 use aegis_core::ctap2::{self, Ctap2Request};
 use aegis_core::ctaphid::{self, Assembler, CtapHidCommand, CtapHidError};
 use aegis_core::identity::BoardIdentity;
@@ -27,7 +30,7 @@ use aegis_core::lifecycle::LifecycleState;
 use aegis_core::management_protocol::{ManagementCommand, ManagementService};
 use aegis_core::otp_lab;
 use aegis_core::pin::{
-    ClientPin, ClientPinRequest, SUB_GET_KEY_AGREEMENT, SUB_GET_PIN_TOKEN,
+    ClientPin, ClientPinRequest, SUB_CHANGE_PIN, SUB_GET_KEY_AGREEMENT, SUB_GET_PIN_TOKEN,
     SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS, SUB_GET_RETRIES, SUB_SET_PIN,
 };
 use aegis_core::storage::ConfigStorage;
@@ -80,12 +83,13 @@ const CONFIG_BASE: u32 = BOARD_PROFILE.hardware.flash.layout.config_offset;
 /// Size of one storage slot; must match the flash erase granularity.
 const SLOT_SIZE: u32 = BOARD_PROFILE.hardware.flash.layout.slot_size;
 
-/// Sealed applet stores must fit the applet flash region with room to spare
-/// for the FIDO credential store.
-const _: () = assert!(
-    aegis_applets::sealed::APPLET_STORE_COUNT
-        <= BOARD_PROFILE.hardware.flash.layout.applet_store_count()
-);
+/// Index of the two-slot store holding the sealed FIDO credential database,
+/// placed right after the applet stores inside the same flash region.
+const FIDO_CRED_STORE: u32 = aegis_applets::sealed::APPLET_STORE_COUNT;
+
+/// Sealed applet stores plus the FIDO credential store must fit the applet
+/// flash region.
+const _: () = assert!(FIDO_CRED_STORE < BOARD_PROFILE.hardware.flash.layout.applet_store_count());
 
 /// Watchdog timeout while the main loop is running.
 const WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5_000);
@@ -216,7 +220,14 @@ async fn main(_spawner: Spawner) {
 
     join3(
         usb_supervisor(usb_device),
-        fido_task(fido_reader, fido_writer, &device.rng, presence),
+        fido_task(
+            fido_reader,
+            fido_writer,
+            &device.rng,
+            presence,
+            storage,
+            root_key,
+        ),
         join3(
             housekeeping(
                 management_reader,
@@ -396,6 +407,37 @@ async fn wait_presence(presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter
     guard.wait().await.is_ok()
 }
 
+/// Interval between CTAPHID keepalive notifications, in milliseconds.
+const KEEPALIVE_INTERVAL_MS: u64 = 100;
+
+/// Wait for User Presence, notifying the host meanwhile.
+///
+/// A host waiting for the user needs periodic traffic on the FIDO channel or
+/// it may time the request out; a keepalive frame keeps the channel alive
+/// while the presence window is open. The presence state machine keeps its
+/// debounce window across the notifications.
+async fn wait_presence_notifying(
+    chan: &mut FidoChannel<'_>,
+    status: u8,
+    presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter>,
+) -> bool {
+    let mut guard = presence.lock().await;
+    let mut elapsed = 0u64;
+    loop {
+        match guard.poll_presence() {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
+        }
+        Timer::after_millis(1).await;
+        elapsed += 1;
+        if elapsed % KEEPALIVE_INTERVAL_MS == 0 {
+            let report = ctaphid::keepalive_report(chan.channel, status);
+            chan.write(&report).await;
+        }
+    }
+}
+
 /// Drive the USB device and honor soft-detach requests from the Management
 /// channel.
 ///
@@ -462,16 +504,109 @@ fn apply_led_config(led: &mut Option<&mut dyn Led>, config: &DeviceConfig) {
 }
 
 /// Serve the CTAPHID transport and CTAP2 commands.
-async fn fido_task(
+///
+/// Credentials and PIN state are sealed to flash when the device root key is
+/// provisioned; otherwise they live in a volatile store as before.
+async fn fido_task<const FLASH_SIZE: usize>(
+    reader: FidoReader,
+    writer: FidoWriter,
+    rng: &Mutex<CriticalSectionRawMutex, HardwareRng>,
+    presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter>,
+    storage: &CriticalSectionMutex<RefCell<FlashStorage<FLASH_SIZE>>>,
+    root_key: Option<[u8; aegis_core::secret::KEY_LEN]>,
+) {
+    if let Some(key) = root_key {
+        let layout = BOARD_PROFILE.hardware.flash.layout;
+        let region = RegionStorage::new(storage, layout.applet_offset);
+        let base = layout.applet_store_offset(FIDO_CRED_STORE);
+        match SealedCredentialStore::open(region, base, SLOT_SIZE, &key) {
+            Ok(mut store) => {
+                info!("FIDO credential store sealed to flash");
+                run_fido(reader, writer, rng, presence, &mut store).await;
+            }
+            Err(_) => info!("FIDO sealed credential store unavailable; using memory"),
+        }
+    } else {
+        info!("no root key; FIDO credentials will not persist");
+    }
+
+    let mut store = MemoryCredentialStore::new();
+    run_fido(reader, writer, rng, presence, &mut store).await;
+}
+
+/// The FIDO channel a request arrived on, with the writer used to answer it.
+///
+/// Keepalive notifications go out on the same channel as the request they
+/// refer to, so the host can match them to the pending operation.
+struct FidoChannel<'a> {
+    writer: &'a mut FidoWriter,
+    channel: u32,
+}
+
+impl FidoChannel<'_> {
+    /// Write a raw report to the FIDO endpoint.
+    async fn write(&mut self, report: &[u8]) {
+        let _ = self.writer.write(report).await;
+    }
+
+    /// Send a CTAPHID message on this channel.
+    async fn send(&mut self, command: CtapHidCommand, payload: &[u8]) {
+        send_ctaphid(self.writer, self.channel, command, payload).await;
+    }
+}
+
+/// Cursor for the stateful credential-management enumeration commands.
+///
+/// The CTAP2.1 enumeration subcommands are split in a `Begin` command and a
+/// `GetNext` command; the authenticator keeps the position between them.
+#[derive(Default)]
+struct EnumerationState {
+    /// Relying parties returned by the last `enumerateRPsBegin`.
+    rps: heapless::Vec<
+        aegis_core::authenticator::RpEntry,
+        { aegis_core::authenticator::MAX_CREDENTIALS },
+    >,
+    /// Index of the next relying party to return.
+    rp_index: usize,
+    /// Credential ids returned by the last `enumerateCredentialsBegin`.
+    credentials:
+        heapless::Vec<heapless::Vec<u8, 32>, { aegis_core::authenticator::MAX_CREDENTIALS }>,
+    /// Index of the next credential to return.
+    credential_index: usize,
+}
+
+/// State shared by the CTAP2 commands of one FIDO session.
+struct FidoSession {
+    /// PIN/UV auth handler.
+    client_pin: ClientPin,
+    /// Credential-management enumeration cursor.
+    enumeration: EnumerationState,
+}
+
+impl FidoSession {
+    /// Create a session with no PIN/UV auth token.
+    fn new() -> Self {
+        Self {
+            client_pin: ClientPin::new(),
+            enumeration: EnumerationState::default(),
+        }
+    }
+}
+
+/// Drive the FIDO interface with a credential store.
+async fn run_fido<S>(
     mut reader: FidoReader,
     mut writer: FidoWriter,
     rng: &Mutex<CriticalSectionRawMutex, HardwareRng>,
     presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter>,
-) {
+    store: &mut S,
+) -> !
+where
+    S: CredentialStore + aegis_core::pin::PinState,
+{
     let mut assembler = Assembler::new();
     let mut next_channel: u32 = 1;
-    let mut store = MemoryCredentialStore::new();
-    let mut client_pin = ClientPin::new();
+    let mut session = FidoSession::new();
     let mut buf = [0u8; ctaphid::REPORT_SIZE];
 
     loop {
@@ -504,12 +639,16 @@ async fn fido_task(
 
         match assembler.accept(packet) {
             Ok(Some(message)) => {
+                let mut chan = FidoChannel {
+                    writer: &mut writer,
+                    channel: message.channel,
+                };
                 handle_ctaphid(
-                    &mut writer,
+                    &mut chan,
                     &mut next_channel,
                     &message,
-                    &mut store,
-                    &mut client_pin,
+                    store,
+                    &mut session,
                     rng,
                     presence,
                 )
@@ -525,15 +664,17 @@ async fn fido_task(
 }
 
 /// Handle one complete CTAPHID message.
-async fn handle_ctaphid(
-    writer: &mut FidoWriter,
+async fn handle_ctaphid<S>(
+    chan: &mut FidoChannel<'_>,
     next_channel: &mut u32,
     message: &ctaphid::Message,
-    store: &mut MemoryCredentialStore,
-    client_pin: &mut ClientPin,
+    store: &mut S,
+    session: &mut FidoSession,
     rng: &Mutex<CriticalSectionRawMutex, HardwareRng>,
     presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter>,
-) {
+) where
+    S: CredentialStore + aegis_core::pin::PinState,
+{
     match message.command {
         CtapHidCommand::Init => {
             match ctaphid::init_response(
@@ -542,54 +683,53 @@ async fn handle_ctaphid(
                 next_channel,
                 CTAPHID_CAPABILITIES,
             ) {
-                Ok(response) => {
-                    send_ctaphid(writer, message.channel, CtapHidCommand::Init, &response).await
-                }
+                Ok(response) => chan.send(CtapHidCommand::Init, &response).await,
                 Err(error) => {
-                    let _ = writer
-                        .write(&ctaphid::error_report(message.channel, error))
-                        .await;
+                    let report = ctaphid::error_report(message.channel, error);
+                    chan.write(&report).await;
                 }
             }
         }
         CtapHidCommand::Ping => {
-            send_ctaphid(
-                writer,
-                message.channel,
-                CtapHidCommand::Ping,
-                &message.payload,
-            )
-            .await;
+            chan.send(CtapHidCommand::Ping, &message.payload).await;
         }
         CtapHidCommand::Cbor => {
             let mut out = [0u8; 512];
-            let len =
-                handle_ctap2(&message.payload, &mut out, store, client_pin, rng, presence).await;
+            let len = handle_ctap2(
+                chan,
+                &message.payload,
+                &mut out,
+                store,
+                session,
+                rng,
+                presence,
+            )
+            .await;
             if let Some(&command) = message.payload.first() {
                 LAST_CTAP_COMMAND.store(command, core::sync::atomic::Ordering::Relaxed);
             }
             if let Some(&status) = out.first() {
                 LAST_CTAP_STATUS.store(status, core::sync::atomic::Ordering::Relaxed);
             }
-            send_ctaphid(writer, message.channel, CtapHidCommand::Cbor, &out[..len]).await;
+            chan.send(CtapHidCommand::Cbor, &out[..len]).await;
         }
         CtapHidCommand::Msg => {
             let up = if u2f::requires_user_presence(&message.payload) {
-                wait_presence(presence).await
+                wait_presence_notifying(chan, ctaphid::KEEPALIVE_UP_NEEDED, presence).await
             } else {
                 false
             };
             let response = u2f::handle(&message.payload, store, up);
             let mut out = [0u8; u2f::MAX_RESPONSE + 2];
             let len = response.encode_into(&mut out);
-            send_ctaphid(writer, message.channel, CtapHidCommand::Msg, &out[..len]).await;
+            chan.send(CtapHidCommand::Msg, &out[..len]).await;
         }
         CtapHidCommand::Wink => {
-            send_ctaphid(writer, message.channel, CtapHidCommand::Wink, &[]).await;
+            chan.send(CtapHidCommand::Wink, &[]).await;
         }
         _ => {
             let report = ctaphid::error_report(message.channel, CtapHidError::InvalidCmd);
-            let _ = writer.write(&report).await;
+            chan.write(&report).await;
         }
     }
 }
@@ -621,25 +761,38 @@ fn encode_response<T: minicbor::Encode<()>>(value: &T, out: &mut [u8]) -> usize 
 /// status byte, which is itself valid CBOR. User presence is required for
 /// credential creation and assertion; the BOOTSEL context rule is enforced by
 /// only asking for presence on these FIDO commands.
-async fn handle_ctap2(
+async fn handle_ctap2<S>(
+    chan: &mut FidoChannel<'_>,
     payload: &[u8],
     out: &mut [u8],
-    store: &mut MemoryCredentialStore,
-    client_pin: &mut ClientPin,
+    store: &mut S,
+    session: &mut FidoSession,
     rng: &Mutex<CriticalSectionRawMutex, HardwareRng>,
     presence: &Mutex<CriticalSectionRawMutex, PresenceAdapter>,
-) -> usize {
+) -> usize
+where
+    S: CredentialStore + aegis_core::pin::PinState,
+{
     let Some((&command, params)) = payload.split_first() else {
         return write_status(ctap2::Ctap2Status::InvalidLength, out);
     };
+    let client_pin = &mut session.client_pin;
 
     match ctap2::parse_request(command, params) {
-        Ok(Ctap2Request::GetInfo) => encode_response(&ctap2::GetInfoResponse::default(), out),
+        Ok(Ctap2Request::GetInfo) => {
+            // Credential management is only offered when a PIN is set: the
+            // platform must obtain a token with the `cm` permission.
+            let info = ctap2::GetInfoResponse {
+                options_cred_mgmt: aegis_core::pin::PinState::pin_hash(store).is_some(),
+                ..ctap2::GetInfoResponse::default()
+            };
+            encode_response(&info, out)
+        }
         Ok(Ctap2Request::MakeCredential(request)) => {
             let uv = request.pin_uv_auth_param.as_ref().is_some_and(|param| {
                 client_pin.verify_pin_uv_auth_param(param, &request.client_data_hash)
             });
-            let up = wait_presence(presence).await;
+            let up = wait_presence_notifying(chan, ctaphid::KEEPALIVE_PROCESSING, presence).await;
             let mut rng = rng.lock().await;
             match authenticator::make_credential(store, &mut *rng, &request, up, uv) {
                 Ok(response) => encode_response(&response, out),
@@ -650,7 +803,7 @@ async fn handle_ctap2(
             let uv = request.pin_uv_auth_param.as_ref().is_some_and(|param| {
                 client_pin.verify_pin_uv_auth_param(param, &request.client_data_hash)
             });
-            let up = wait_presence(presence).await;
+            let up = wait_presence_notifying(chan, ctaphid::KEEPALIVE_PROCESSING, presence).await;
             let mut rng = rng.lock().await;
             match authenticator::get_assertion(store, &mut *rng, &request, up, uv) {
                 Ok(response) => encode_response(&response, out),
@@ -671,6 +824,10 @@ async fn handle_ctap2(
                     Ok(()) => write_status(ctap2::Ctap2Status::Ok, out),
                     Err(status) => write_status(status, out),
                 },
+                SUB_CHANGE_PIN => match client_pin.change_pin(&request, store) {
+                    Ok(()) => write_status(ctap2::Ctap2Status::Ok, out),
+                    Err(status) => write_status(status, out),
+                },
                 SUB_GET_PIN_TOKEN | SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS => {
                     let mut rng = rng.lock().await;
                     match client_pin.get_pin_token(&request, store, &mut *rng) {
@@ -678,12 +835,12 @@ async fn handle_ctap2(
                         Err(status) => write_status(status, out),
                     }
                 }
-                _ => write_status(ctap2::Ctap2Status::InvalidCommand, out),
+                _ => write_status(ctap2::Ctap2Status::InvalidSubcommand, out),
             },
             Err(status) => write_status(status, out),
         },
         Ok(Ctap2Request::Reset) => {
-            let up = wait_presence(presence).await;
+            let up = wait_presence_notifying(chan, ctaphid::KEEPALIVE_PROCESSING, presence).await;
             match authenticator::reset(store, up) {
                 Ok(()) => write_status(ctap2::Ctap2Status::Ok, out),
                 Err(status) => write_status(status, out),
@@ -691,25 +848,144 @@ async fn handle_ctap2(
         }
         Ok(Ctap2Request::CredentialManagement) => {
             match CredentialManagementRequest::parse(params) {
-                Ok(request) => match request.sub_command {
-                    authenticator::CRED_MGMT_GET_METADATA => {
-                        encode_response(&authenticator::creds_metadata(store), out)
-                    }
-                    authenticator::CRED_MGMT_DELETE => match request.credential_id {
-                        Some(id) => match authenticator::delete_credential(store, &id) {
-                            Ok(()) => write_status(ctap2::Ctap2Status::Ok, out),
-                            Err(status) => write_status(status, out),
-                        },
-                        None => write_status(ctap2::Ctap2Status::MissingParameter, out),
-                    },
-                    _ => write_status(ctap2::Ctap2Status::InvalidCommand, out),
-                },
+                Ok(request) => handle_credential_management(&request, store, session, out),
                 Err(status) => write_status(status, out),
             }
         }
         Ok(_) => write_status(ctap2::Ctap2Status::InvalidCommand, out),
         Err(status) => write_status(status, out),
     }
+}
+
+/// Serve an `authenticatorCredentialManagement` request.
+///
+/// Every subcommand but `getCredsMetadata` requires a PIN/UV auth token with
+/// the `cm` permission: the platform authenticates the subcommand (and, when
+/// present, its parameters) with the token.
+fn handle_credential_management<S>(
+    request: &CredentialManagementRequest,
+    store: &mut S,
+    session: &mut FidoSession,
+    out: &mut [u8],
+) -> usize
+where
+    S: CredentialStore + aegis_core::pin::PinState,
+{
+    let client_pin = &session.client_pin;
+    match request.sub_command {
+        authenticator::CRED_MGMT_GET_METADATA => {
+            encode_response(&authenticator::creds_metadata(store), out)
+        }
+        authenticator::CRED_MGMT_ENUMERATE_RPS => {
+            let Some(param) = request.pin_uv_auth_param.as_ref() else {
+                return write_status(ctap2::Ctap2Status::PinRequired, out);
+            };
+            let message = [authenticator::CRED_MGMT_ENUMERATE_RPS];
+            if !client_pin.verify_credential_management_param(param, &message) {
+                return write_status(ctap2::Ctap2Status::PinAuthInvalid, out);
+            }
+            let rps = authenticator::list_rps(store);
+            if rps.is_empty() {
+                return write_status(ctap2::Ctap2Status::NoCredentials, out);
+            }
+            let total_rps = rps.len() as u32;
+            let first = rps[0].clone();
+            session.enumeration.rps = rps;
+            session.enumeration.rp_index = 1;
+            encode_response(
+                &authenticator::EnumerateRpsResponse {
+                    rp: first,
+                    total_rps,
+                },
+                out,
+            )
+        }
+        authenticator::CRED_MGMT_ENUMERATE_RPS_NEXT => {
+            let index = session.enumeration.rp_index;
+            let Some(rp) = session.enumeration.rps.get(index).cloned() else {
+                return write_status(ctap2::Ctap2Status::NoCredentials, out);
+            };
+            session.enumeration.rp_index = index + 1;
+            let total_rps = session.enumeration.rps.len() as u32;
+            encode_response(&authenticator::EnumerateRpsResponse { rp, total_rps }, out)
+        }
+        authenticator::CRED_MGMT_ENUMERATE_CREDENTIALS => {
+            let Some(hash) = request.rp_id_hash else {
+                return write_status(ctap2::Ctap2Status::MissingParameter, out);
+            };
+            let Some(param) = request.pin_uv_auth_param.as_ref() else {
+                return write_status(ctap2::Ctap2Status::PinRequired, out);
+            };
+            let mut message = heapless::Vec::<u8, 128>::new();
+            let _ = message.push(authenticator::CRED_MGMT_ENUMERATE_CREDENTIALS);
+            let _ = message.extend_from_slice(&request.sub_command_params);
+            if !client_pin.verify_credential_management_param(param, &message) {
+                return write_status(ctap2::Ctap2Status::PinAuthInvalid, out);
+            }
+            let ids = authenticator::list_credentials(store, &hash);
+            if ids.is_empty() {
+                return write_status(ctap2::Ctap2Status::NoCredentials, out);
+            }
+            let total_credentials = ids.len() as u32;
+            let first = ids[0].clone();
+            session.enumeration.credentials = ids;
+            session.enumeration.credential_index = 1;
+            match credential_response(store, &first, total_credentials) {
+                Some(response) => encode_response(&response, out),
+                None => write_status(ctap2::Ctap2Status::NoCredentials, out),
+            }
+        }
+        authenticator::CRED_MGMT_ENUMERATE_CREDENTIALS_NEXT => {
+            let index = session.enumeration.credential_index;
+            let Some(id) = session.enumeration.credentials.get(index).cloned() else {
+                return write_status(ctap2::Ctap2Status::NoCredentials, out);
+            };
+            session.enumeration.credential_index = index + 1;
+            let total_credentials = session.enumeration.credentials.len() as u32;
+            match credential_response(store, &id, total_credentials) {
+                Some(response) => encode_response(&response, out),
+                None => write_status(ctap2::Ctap2Status::NoCredentials, out),
+            }
+        }
+        authenticator::CRED_MGMT_DELETE => {
+            let Some(param) = request.pin_uv_auth_param.as_ref() else {
+                return write_status(ctap2::Ctap2Status::PinRequired, out);
+            };
+            let mut message = heapless::Vec::<u8, 128>::new();
+            let _ = message.push(authenticator::CRED_MGMT_DELETE);
+            let _ = message.extend_from_slice(&request.sub_command_params);
+            if !client_pin.verify_credential_management_param(param, &message) {
+                return write_status(ctap2::Ctap2Status::PinAuthInvalid, out);
+            }
+            let Some(id) = request.credential_id.as_ref() else {
+                return write_status(ctap2::Ctap2Status::MissingParameter, out);
+            };
+            match authenticator::delete_credential(store, id) {
+                Ok(()) => write_status(ctap2::Ctap2Status::Ok, out),
+                Err(status) => write_status(status, out),
+            }
+        }
+        _ => write_status(ctap2::Ctap2Status::InvalidSubcommand, out),
+    }
+}
+
+/// Build the `enumerateCredentials` response for one credential.
+fn credential_response<S>(
+    store: &S,
+    credential_id: &[u8],
+    total_credentials: u32,
+) -> Option<authenticator::EnumerateCredentialsResponse>
+where
+    S: CredentialStore + aegis_core::pin::PinState,
+{
+    let credential = store.get(credential_id)?;
+    let public_key = authenticator::cose_public_key(&credential)?;
+    Some(authenticator::EnumerateCredentialsResponse {
+        user_id: credential.user_id.clone(),
+        credential_id: credential.id.clone(),
+        public_key,
+        total_credentials,
+    })
 }
 
 /// Split a CTAPHID payload across initialization and continuation reports.

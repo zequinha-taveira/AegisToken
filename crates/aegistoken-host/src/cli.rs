@@ -28,6 +28,9 @@ struct Cli {
     positional: Vec<String>,
     help: bool,
     version: bool,
+    key: Option<String>,
+    old_key: Option<String>,
+    alg: Option<String>,
 }
 
 /// Parse arguments and run the requested command.
@@ -51,6 +54,59 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<ExitCode, String> {
         return list(&cli.options);
     }
 
+    // --- Smart card / CCID commands (do not require ManagementDevice) ---
+    let reader_filter = cli.positional.first().map(|s| s.as_str());
+    match command {
+        "card-list" => return crate::card::list_readers(),
+        "card-status" => return crate::card::card_status(reader_filter),
+        "card-select" => {
+            let aid = cli
+                .positional
+                .first()
+                .ok_or("card-select requires an AID argument (piv, oath, openpgp or hex)")?;
+            let reader = cli.positional.get(1).map(|s| s.as_str());
+            return crate::card::select_applet(aid, reader);
+        }
+        "card-apdu" => {
+            let apdu_hex = cli
+                .positional
+                .first()
+                .ok_or("card-apdu requires a hex APDU argument")?;
+            let reader = cli.positional.get(1).map(|s| s.as_str());
+            return crate::card::transmit_raw(apdu_hex, reader);
+        }
+        "piv-list" => {
+            let reader = cli.positional.first().map(|s| s.as_str());
+            return crate::piv_cmd::piv_list(reader);
+        }
+        "piv-import-cert" => {
+            let slot = cli
+                .positional
+                .first()
+                .ok_or("piv-import-cert requires <SLOT> (9A, 9C, 9D, 9E)")?;
+            let cert_path = cli
+                .positional
+                .get(1)
+                .ok_or("piv-import-cert requires <CERT_FILE>")?;
+            let reader = cli.positional.get(2).map(|s| s.as_str());
+            return crate::piv_cmd::piv_import_cert(slot, cert_path, cli.key.as_deref(), reader);
+        }
+        "piv-set-mgmt-key" => {
+            let new_key = cli
+                .positional
+                .first()
+                .ok_or("piv-set-mgmt-key requires <NEW_KEY_HEX>")?;
+            let reader = cli.positional.get(1).map(|s| s.as_str());
+            return crate::piv_cmd::piv_set_mgmt_key(
+                new_key,
+                cli.old_key.as_deref(),
+                cli.alg.as_deref(),
+                reader,
+            );
+        }
+        _ => {}
+    }
+
     let mut device = ManagementDevice::open(&cli.options).map_err(|error| error.to_string())?;
     if command == "validate" {
         return validate(&mut device);
@@ -65,6 +121,9 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         positional: Vec::new(),
         help: false,
         version: false,
+        key: None,
+        old_key: None,
+        alg: None,
     };
     let mut args = args.into_iter();
 
@@ -82,6 +141,9 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                 let millis = parse_u64(&option_value(inline, &mut args, name)?)?;
                 cli.options.timeout = Duration::from_millis(millis.max(1));
             }
+            "--key" => cli.key = Some(option_value(inline, &mut args, name)?),
+            "--old-key" => cli.old_key = Some(option_value(inline, &mut args, name)?),
+            "--alg" => cli.alg = Some(option_value(inline, &mut args, name)?),
             _ if arg.starts_with('-') && arg.len() > 1 => {
                 return Err(format!("unknown option: {arg}"));
             }
@@ -731,6 +793,9 @@ OPTIONS:
   --pid <HEX>           USB product id (default 0x0001)
   -i, --interface <N>   Management HID interface number (skip name discovery)
   --timeout <MS>        transfer timeout in milliseconds (default 2000)
+  --key <HEX>           PIV management key (default: standard NIST 3DES)
+  --old-key <HEX>       current PIV management key (for piv-set-mgmt-key)
+  --alg <ALG>           PIV management algorithm (tdes, aes128, aes192, aes256)
   -h, --help            show this help
   -V, --version         show version
 
@@ -752,6 +817,17 @@ COMMANDS:
   soft-detach           SOFT_DETACH (acknowledged, then leave the bus)
   last-fido             GET_LAST_FIDO_STATUS
   send <CMD> [HEX|@FILE]       send a raw command (CMD decimal or 0x hex)
-  validate              run the Management HID acceptance checks"
+  validate              run the Management HID acceptance checks
+
+SMART CARD / CCID COMMANDS (PC/SC):
+  card-list                                   list PC/SC smart card readers
+  card-status [READER]                        connect and show ATR and protocol
+  card-select <AID> [READER]                  SELECT an applet by AID (piv, oath, openpgp or hex)
+  card-apdu <HEX> [READER]                    transmit a raw APDU and show the response
+
+PIV / NIST SP 800-73-4 COMMANDS (PC/SC):
+  piv-list [READER]                           list certificates in slots (9A, 9C, 9D, 9E)
+  piv-import-cert <SLOT> <CERT_FILE> [READER] import X.509 cert (PEM/DER) into PIV slot
+  piv-set-mgmt-key <NEW_KEY_HEX> [READER]     replace PIV management key (3DES/AES)"
     );
 }

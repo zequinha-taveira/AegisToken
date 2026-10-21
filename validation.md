@@ -32,7 +32,7 @@ do MVP em hardware RP2350A (e depois RP2350B).
 - `picotool` — conversão de UF2 e `picotool info` (valida imagem RP2350).
 - `python-fido2` — validação FIDO2/U2F (`scripts/validate_fido.py`).
 - `hidapi` + `cbor2` — validação do Management HID (`scripts/validate_management.py`).
-- `pyscard` — validação CCID/ISO 7816 dos applets (`scripts/validate_ccid.py`).
+- `pcsc_transport` (embutido, MIT OR Apache-2.0, ou `pyscard` como fallback) — validação CCID/ISO 7816 dos applets (`scripts/validate_ccid.py`).
 - `aegistoken-host` — CLI de host em Rust sobre **libusb** para o Management HID,
   sem WinUSB/Zadig (ver abaixo).
 - Autoteste on-target no boot (log via defmt/RTT).
@@ -59,6 +59,7 @@ codificação `getInfo`, resposta do Management HID e leitura de BOOTSEL; com
 ```powershell
 python scripts/validate_management.py   # Management HID (AC-003..AC-009)
 python scripts/validate_fido.py         # FIDO2/U2F (AC-002, AC-011, AC-013)
+python scripts/validate_fido.py --pin 123456   # + changePIN e credential management
 python scripts/validate_ccid.py         # CCID (AC-016)
 python scripts/validate_piv.py          # PIV (AC-017/AC-021)
 python scripts/validate_oath.py         # OATH/TOTP/HOTP (AC-018)
@@ -426,6 +427,17 @@ acessível via `hidraw`.
 | AC-020 | SSH/Git (`ed25519-sk`) + OpenPGP Ed25519/X25519 | `validate_fido.py` + `validate_openpgp.py` + OpenSSH | Firmware pronto em testes de host; hardware pendente |
 | AC-021 | RSA-2048 (PIV/OpenPGP): keygen, assinatura, decifra | `validate_piv.py` + `validate_openpgp.py` + OpenSSL/GnuPG/`pkcs11-tool` | Firmware pronto em testes de host (147 `aegis-applets`); hardware pendente; RSA-3072/PSS fora de escopo |
 
+### Fases 7e — credential management e `changePIN` (host; hardware pendente)
+
+Cobertos por 225 testes de host em `aegis-core` (14 novos) e pelo validador
+`scripts/validate_fido.py --pin <PIN>`, que exercita em hardware:
+
+- `getPinUvAuthTokenUsingPinWithPermissions` com a permissão `cm`;
+- `changePIN` (rotação de ida e volta);
+- `enumerateRPs` e `enumerateCredentials` sobre uma credencial residente.
+
+O status de hardware permanece pendente (sem RP2350 físico nesta sessão).
+
 ### Evidência — Management HID (12/12)
 
 ```
@@ -515,19 +527,28 @@ A validação com um cliente real revelou dois bugs de transporte, já corrigido
   físicos estão fora de escopo.
 - **Backup:** cobre só a identidade determinística — passkeys residentes e
   chaves OpenPGP/PIV não sobrevivem à troca de placa.
-- **Keepalive:** durante a espera de User Presence o firmware não envia
-  `CTAPHID_KEEPALIVE`; a resposta chega dentro do timeout de presença (15 s).
-  Melhoria prevista para a integração final.
+- **Keepalive:** durante a espera de User Presence o firmware envia
+  `CTAPHID_KEEPALIVE` a cada 100 ms no canal do pedido pendente
+  (`PROCESSING` em CTAP2, `UP_NEEDED` em CTAP1/U2F), evitando que o host
+  descarte a operação por timeout.
 - **Secure boot (AC-014/AC-015):** a execução de imagem inválida/antiga é
   impedida pelo bootrom; exige selar as imagens (`picotool seal`) e fundir as
   chaves/rollback em OTP — etapa de produção.
 - **Provisionamento:** a chave mestra de OTP e o attestation key de U2F_REGISTER
   são etapas de produção.
-- **Storage persistente de credenciais:** o firmware usa store em memória até o
-  refactor de compartilhamento de storage (ver `roadmap.md`).
+- **Storage persistente de credenciais:** com a chave raiz de OTP provisionada, a
+  tarefa FIDO abre o `SealedCredentialStore` no store `19` da região de applets e
+  as credenciais/estado de PIN sobrevivem a power cycle; sem a chave, o firmware
+  usa store em memória (placa de desenvolvimento). Validação física de AC-008
+  segue pendente.
 - **Applets em hardware (AC-016..AC-021):** sem dispositivo físico nesta
   sessão; cobertura = testes de host (147), autoteste `applet-select`
   on-target e scripts PC/SC prontos (`validate_ccid/piv/oath/openpgp.py`).
+- **Credential management CTAP2.1:** o firmware anuncia `FIDO_2_0` (e não
+  `FIDO_2_1`); `changePIN` e a enumeração de credenciais existem, mas a opção
+  `credMgmt` só é anunciada quando há PIN configurado, porque todo subcomando
+  de credential management exige um token com a permissão `cm`. A mutação de
+  *user information* e o `largeBlobKey` não são implementados.
 - **RSA (AC-021):** RSA-2048/PKCS#1 v1.5 apenas; RSA-3072 e PSS fora de escopo.
   Sem brainpoolP512r1 / X448 / Ed448 (sem aritmética `no_std` madura em Rust).
   Keygen probabilístico (Miller-Rabin 12 rounds, sem certificação FIPS);

@@ -14,7 +14,7 @@ Documento vivo: cada fase é marcada conforme concluída e verificada.
 | 4 | Protocolo Management HID | Concluída |
 | 5 | Storage persistente + armazenamento seguro | Concluída |
 | 6 | User Presence contextual (BOOTSEL) | Concluída |
-| 7 | FIDO (CTAP1/U2F + CTAP2) | Concluída (7a–7d) |
+| 7 | FIDO (CTAP1/U2F + CTAP2) | Concluída (7a–7e) |
 | 8 | Atualização segura de firmware | Concluída |
 | 9 | Recovery + lifecycle completo | Concluída |
 | 10 | Validação de hardware (AC-001..AC-015) | Concluída (bootrom/OTP pendentes) |
@@ -25,6 +25,7 @@ Documento vivo: cada fase é marcada conforme concluída e verificada.
 | 15 | SSH/Git signing + Ed25519 no CTAP2 | Concluída (firmware; hardware pendente) |
 | 16 | RSA (PIV/OpenPGP) | Em andamento (16a–16d em firmware; hardware pendente) |
 | 17 | Conformidade e validação dos applets | Em andamento (firmware; hardware pendente) |
+| 18 | Ferramental de host, Desktop Manager e pesquisa de bibliotecas (Python/Rust) | Em andamento (pesquisa de bibliotecas MIT/Apache-2.0 entregue em `docs/`) |
 
 ## Decisões arquiteturais fixadas
 
@@ -37,6 +38,14 @@ Documento vivo: cada fase é marcada conforme concluída e verificada.
 - **Desktop Manager:** ainda não existe crate de Desktop Manager nem integração
   de "Ejetar" no repositório; por ora há apenas o CLI de host
   (`aegistoken-host`).
+- **Pesquisa e conformidade de bibliotecas (Python e Rust — MIT OR Apache-2.0):**
+  todas as dependências e ferramentas de apoio (tanto em Rust quanto em Python
+  para validadores, CLI e Desktop Manager) devem ser maduras, ativamente
+  mantidas e estritamente licenciadas sob **MIT OR Apache-2.0** (ou licenças
+  permissivas equivalentes como BSD-2/3-Clause sem restrições virais).
+  Dependências sob GPL/LGPL (como `pyscard` no ecossistema Python) devem ser
+  substituídas ou encapsuladas sem contaminação, preservando o licenciamento
+  duplo permissivo integral do AegisToken. Detalhes em `docs/pesquisa-bibliotecas.md`.
 - **FIDO:** implementação independente com `minicbor` + RustCrypto
   (`p256`, `sha2`, `hmac`, `hkdf`, `aes-gcm`).
 - **Validação de firmware / anti-rollback:** secure boot nativo do RP2350
@@ -352,7 +361,6 @@ AC-009**.
 Fase grande, dividida em fatias. Decisões fixadas: credenciais cifradas em
 flash (seladas com a chave de OTP), atestação *packed self*, `clientPIN`
 adiado.
-
 ### 7a — Núcleo do protocolo CTAP2 (concluída)
 
 **Entregáveis**
@@ -393,8 +401,11 @@ adiado.
 
 **Pendências**
 
-- Store de credenciais persistente e cifrado em flash (fatia 7c); hoje o
-  firmware usa store em memória (volátil).
+- Store de credenciais persistente e cifrado em flash: entregue na fatia 7c
+  (`SealedCredentialStore`) e ligado ao firmware junto da persistência selada
+  dos applets.
+- `CTAPHID_KEEPALIVE` durante a espera de User Presence (a cada 100 ms no canal
+  do pedido): entregue.
 - Verificação em hardware com um cliente FIDO2 real.
 
 ### 7c — clientPIN / reset / credential management / store cifrado (concluída)
@@ -420,12 +431,60 @@ adiado.
 
 **Pendências**
 
-- O firmware usa store em memória: o `SealedCredentialStore` exige posse do
-  `Storage`, que hoje pertence ao `Board` (compartilhado com o Management HID).
-  Ligar o store selado on-device requer um refactor de compartilhamento de
-  storage (tarefa ou mutex de flash).
+- ~~O firmware usa store em memória~~ **Entregue:** com a chave raiz
+  provisionada, o firmware abre o `SealedCredentialStore` na região de applets
+  (store `APPLET_STORE_COUNT`, dois slots de 4 KiB) e persiste credenciais/estado
+  de PIN após power cycle; sem a chave, mantém o store volátil. O
+  compartilhamento de flash usa o mesmo `RegionStorage` + mutex do CCID; store
+  selado é a fonte de verdade quando disponível.
 - Enumeração de credenciais (enumerateRPs/Credentials) e `changePIN` ficam para
   uma fatia incremental.
+
+### 7e — Credential management CTAP2.1 e `changePIN` (concluída)
+
+**Entregue**
+
+- `aegis-core::authenticator`: parsing de `authenticatorCredentialManagement`
+  conforme a CTAP2.1 (`subCommand`, `subCommandParams`, `pinUvAuthProtocol`,
+  `pinUvAuthParam`); `subCommandParams` é preservado byte a byte porque a
+  plataforma o autentica. Layout legado (id do credential no topo) segue
+  aceito.
+- Subcomandos implementados: `getCredsMetadata` (0x01), `enumerateRPsBegin`
+  (0x02) + `enumerateRPsGetNextRP` (0x03), `enumerateCredentialsBegin` (0x04) +
+  `enumerateCredentialsGetNextCredential` (0x05) e `deleteCredential` (0x06).
+  Respostas com as chaves da especificação (`rp` 0x03, `rpIDHash` 0x04,
+  `totalRPs` 0x05, `user` 0x06, `credentialID` 0x07, `publicKey` 0x08,
+  `totalCredentials` 0x09).
+- `aegis-core::pin`: `changePIN` (0x04) — autentica `newPinEnc || pinHashEnc`
+  com o segredo compartilhado, consome uma tentativa quando o PIN atual está
+  errado, restaura o orçamento de tentativas e invalida o token no sucesso.
+- Permissões de `pinUvAuthToken` (`mc` 0x01, `ga` 0x02, `cm` 0x04):
+  `getPinUvAuthTokenUsingPinWithPermissions` (0x09) exige o bitfield, rejeita
+  zero e permissões não suportadas (`UnauthorizedPermission` 0x40);
+  `getPinToken` (0x05) concede `mc|ga` e rejeita `permissions`/`rpId`.
+- **Correção de segurança:** todo subcomando de credential management (exceto
+  `getCredsMetadata`) exige token com permissão `cm`; antes, `deleteCredential`
+  não exigia autenticação alguma. Tokens do `getPinToken` legado também são
+  aceitos (o PIN já foi provado).
+- `getInfo` anuncia `pinUvAuthToken: true` e `credMgmt` apenas quando há PIN
+  configurado (o token é obrigatório para enumerar).
+- `setPIN`/`getPINToken` aceitam o `pinUvAuthParam` truncado em 16 bytes
+  (forma da CTAP2.1) além dos 32 bytes completos.
+
+**Verificação**
+
+- 225 testes de host em `aegis-core` (14 novos: `changePIN` com PIN correto,
+  errado, curto e sem PIN; permissões de token; parsing dos
+  `subCommandParams`; listagem de RPs/credenciais; chaves das respostas),
+  clippy limpo em host e alvo, build de firmware e UF2 gerados.
+
+**Limitações registradas**
+
+- O firmware anuncia `FIDO_2_0` (não `FIDO_2_1`): `makeCredential` com a opção
+  `uv` não é exigida, e a mutação de *user information* (0x07) e o
+  `largeBlobKey` (0x0B) não são implementados.
+- O par RP/credencial da plataforma é verificado pela permissão `cm` e, para
+  tokens com `rpId` associado, apenas o escopo do RP é considerado.
 
 ### 7d — CTAP1/U2F (concluída)
 
@@ -832,6 +891,10 @@ adiado.
   (blob fragmentado em N shards + shard de commit) e os adaptadores
   `SealedOathStore` (2+1 shards) / `SealedOpenPgpStore` (4+1 shards),
   implementando `PivStore`/`OathStore`/`OpenPgpStore` sem mudar os applets.
+- `aegis-core::credential_store::SealedCredentialStore` usa o mesmo esquema
+  (blob CBOR de credenciais + estado de PIN selado com nonce monotônico) no
+  store `19` da região de applets, aberto pela tarefa FIDO quando a chave raiz
+  está provisionada.
 - Formato por shard: `[nonce:12][gen:u64][body][tag:16]`, nonce =
   `gen || applet || shard`; geração sempre `max(observado)+1`, lida do flash a
   cada escrita — nonce nunca reutilizado, mesmo após escrita interrompida.
@@ -839,10 +902,11 @@ adiado.
   loads aceitam a geração mais nova presente em *todos* os shards, com fallback
   para a anterior — escrita interrompida recupera a geração completa anterior.
 - Flash: 19 two-slot stores de 8 KiB na região de applets (`0..18`: meta PIV,
-  10 objetos PIV, OATH 2+commit, OpenPGP 4+commit); 5 stores livres. Limite
-  garantido em build por `const assert` contra `FlashLayout`.
+  10 objetos PIV, OATH 2+commit, OpenPGP 4+commit); o store `19` guarda o banco
+  de credenciais/PIN do FIDO selado; 4 stores livres. Limite garantido em build
+  por `const assert` contra `FlashLayout`.
 - Compartilhamento: `Board.storage` atrás de `CriticalSectionMutex<RefCell<…>>`;
-  housekeeping e CCID usam `RegionStorage` (janela com base) com lock por
+  housekeeping, CCID e FIDO usam `RegionStorage` (janela com base) com lock por
   chamada; cada região tem um único escritor.
 - Sem chave raiz provisionada (placa de desenvolvimento), o firmware usa os
   stores em memória como antes; com a chave, abre os selados e registra em log.
@@ -1031,6 +1095,51 @@ adiado.
 
 - AC-016..AC-021 verificados em hardware RP2350 real (ou limitações registradas
   com evidência), suíte de host e de scripts verde, documentação atualizada.
+
+---
+
+## Fase 18 — Ferramental de host, Desktop Manager e pesquisa de bibliotecas (Python/Rust)
+
+**Objetivo**
+
+Mapear, avaliar e integrar bibliotecas maduras nos ecossistemas Python e Rust
+licenciadas sob **MIT OR Apache-2.0** (ou permissivas compatíveis), eliminando
+dependências LGPL (como `pyscard`) dos validadores, expandindo o ferramental de
+linha de comando (`aegistoken-host`) e estruturando a base tecnológica do futuro
+**Desktop Manager**.
+
+**Entregue (pesquisa, especificações e primeiras etapas de código)**
+
+- `docs/pesquisa-bibliotecas.md`: levantamento comparativo de crates Rust e
+  pacotes Python maduros categorizados por camada técnica.
+- `docs/plano-desenvolvimento.md`: plano de desenvolvimento estruturado em 4 eixos
+  com matriz de rastreabilidade de bibliotecas adotadas.
+- **Etapa 1.1 entregue:** `scripts/pcsc_transport.py` implementado via `ctypes`
+  puro (`winscard.dll`/`libpcsclite`), eliminando dependência do `pyscard` (LGPL)
+  nos validadores de hardware (`validate_ccid.py`, `validate_piv.py`,
+  `validate_oath.py`, `validate_openpgp.py`). Testes em `tests/test_pcsc_transport.py`.
+- **Etapa 2.1 entregue:** Crate `pcsc` integrado ao `aegistoken-host` com novo
+  módulo `crates/aegistoken-host/src/card.rs` e subcomandos `card-list`,
+  `card-status`, `card-select` e `card-apdu`.
+- **Etapa 2.2 entregue:** Crate `iso7816` integrado para decodificação tipada de
+  comandos APDU (`CommandView`) e formatação amigável de status words (`iso7816::Status`).
+- **Etapa 2.3 entregue:** Gestão de certificados PIV e chaves públicas integrada ao
+  `aegistoken-host` via `x509-cert` e `der` (RustCrypto). Módulo `piv_cmd.rs` com
+  comandos `piv-list` (inspeção X.509 detalhada dos slots 9A, 9C, 9D, 9E), `piv-import-cert`
+  (importação PEM/DER com autenticação de chave de gestão) e `piv-set-mgmt-key`
+  (troca de Management Key 3DES/AES). 15 testes unitários aprovados no host CLI.
+
+**Pendências e próximos passos**
+
+- **Etapa 2.4:** Subcomando OATH/TOTP no CLI.
+- **Etapa 2.5:** Avaliação do `nusb`.
+- **Eixo 3:** Protótipo do Desktop Manager em Rust (`tauri` v2).
+
+**Critério de saída**
+
+- Documentação e pesquisa de bibliotecas concluídas; ferramental de host
+  100% aderente à política de licenciamento duplo permissivo `MIT OR Apache-2.0`;
+  zero dependências com restrições copyleft distribuídas.
 
 ---
 

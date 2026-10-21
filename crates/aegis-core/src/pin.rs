@@ -13,6 +13,7 @@ use p256::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 
 use crate::authenticator::Rng;
+use crate::configuration::FixedString;
 use crate::ctap2::Ctap2Status;
 use crate::error::CoreError;
 
@@ -101,6 +102,28 @@ pub const SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS: u8 = 0x09;
 /// Protocol version implemented here.
 pub const PIN_PROTOCOL: u8 = 1;
 
+/// `pinUvAuthToken` permission: `authenticatorMakeCredential`.
+pub const PERMISSION_MC: u8 = 0x01;
+/// `pinUvAuthToken` permission: `authenticatorGetAssertion`.
+pub const PERMISSION_GA: u8 = 0x02;
+/// `pinUvAuthToken` permission: `authenticatorCredentialManagement`.
+pub const PERMISSION_CM: u8 = 0x04;
+/// `pinUvAuthToken` permission: `authenticatorBioEnrollment` (unsupported).
+pub const PERMISSION_BE: u8 = 0x08;
+/// `pinUvAuthToken` permission: `authenticatorLargeBlobs` (unsupported).
+pub const PERMISSION_LBW: u8 = 0x10;
+/// `pinUvAuthToken` permission: `authenticatorConfig` (unsupported).
+pub const PERMISSION_ACFG: u8 = 0x20;
+
+/// Permissions this authenticator can grant.
+pub const SUPPORTED_PERMISSIONS: u8 = PERMISSION_MC | PERMISSION_GA | PERMISSION_CM;
+
+/// Default permissions granted by the superseded `getPinToken` subcommand.
+pub const DEFAULT_PERMISSIONS: u8 = PERMISSION_MC | PERMISSION_GA;
+
+/// Maximum length of a relying party identifier.
+pub const MAX_RP_ID_LEN: usize = 253;
+
 /// Default retry budget.
 pub const DEFAULT_RETRIES: u8 = 8;
 
@@ -133,6 +156,10 @@ pub struct ClientPinRequest {
     pub new_pin_enc: Option<heapless::Vec<u8, 96>>,
     /// Encrypted PIN hash.
     pub pin_hash_enc: Option<heapless::Vec<u8, 32>>,
+    /// Requested `pinUvAuthToken` permissions (CTAP2.1).
+    pub permissions: Option<u8>,
+    /// Permissions RP ID (CTAP2.1).
+    pub rp_id: Option<FixedString<MAX_RP_ID_LEN>>,
 }
 
 impl ClientPinRequest {
@@ -151,6 +178,8 @@ impl ClientPinRequest {
             pin_uv_auth_param: None,
             new_pin_enc: None,
             pin_hash_enc: None,
+            permissions: None,
+            rp_id: None,
         };
 
         for _ in 0..length {
@@ -180,6 +209,12 @@ impl ClientPinRequest {
                     request.pin_hash_enc = Some(
                         heapless::Vec::from_slice(bytes).map_err(|_| Ctap2Status::LimitExceeded)?,
                     )
+                }
+                0x09 => request.permissions = Some(d.u8().map_err(|_| Ctap2Status::InvalidCbor)?),
+                0x0A => {
+                    let text = d.str().map_err(|_| Ctap2Status::InvalidCbor)?;
+                    request.rp_id =
+                        Some(FixedString::new(text).map_err(|_| Ctap2Status::InvalidParameter)?)
                 }
                 _ => d.skip().map_err(|_| Ctap2Status::InvalidCbor)?,
             }
@@ -257,6 +292,18 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Compare the prefix of `expected` with `param`.
+///
+/// PIN/UV auth protocol 1 truncates the HMAC to 16 bytes; the full 32-byte
+/// form is also accepted. Shorter prefixes are rejected: they would reduce
+/// the authentication strength to a few bits.
+fn ct_eq_prefix(expected: &[u8; 32], param: &[u8]) -> bool {
+    if param.len() != 16 && param.len() != 32 {
+        return false;
+    }
+    ct_eq(&expected[..param.len()], param)
 }
 
 /// Compute the CTAP PIN hash: SHA-256 of the PIN zero-padded to 64 bytes.
@@ -343,6 +390,12 @@ fn shared_secret(private: &[u8; 32], platform: &Ec2KeyAgreement) -> Result<[u8; 
 pub struct ClientPin {
     agreement_private: Option<[u8; 32]>,
     pin_uv_auth_token: Option<[u8; 32]>,
+    /// Permissions bound to the active token.
+    pin_uv_auth_permissions: u8,
+    /// Permissions RP ID bound to the active token.
+    pin_uv_auth_rp_id: Option<FixedString<MAX_RP_ID_LEN>>,
+    /// The active token came from the superseded `getPinToken` subcommand.
+    legacy_token: bool,
 }
 
 impl ClientPin {
@@ -352,6 +405,9 @@ impl ClientPin {
         Self {
             agreement_private: None,
             pin_uv_auth_token: None,
+            pin_uv_auth_permissions: 0,
+            pin_uv_auth_rp_id: None,
+            legacy_token: false,
         }
     }
 
@@ -372,6 +428,27 @@ impl ClientPin {
         }
         let expected = hmac_sha256(&token, message);
         ct_eq(&expected[..param.len()], param)
+    }
+
+    /// Whether the active token may drive credential management.
+    ///
+    /// A token obtained through `getPinUvAuthTokenWithPermissions` must carry
+    /// the `cm` permission. A token obtained through the superseded
+    /// `getPinToken` subcommand is accepted as well: it required the PIN, and
+    /// the CTAP2.0 flow has no way to request permissions.
+    #[must_use]
+    pub fn allows_credential_management(&self) -> bool {
+        self.pin_uv_auth_token.is_some()
+            && (self.legacy_token || self.pin_uv_auth_permissions & PERMISSION_CM != 0)
+    }
+
+    /// Verify a credential-management `pinUvAuthParam`.
+    ///
+    /// `message` is the subcommand byte, optionally followed by the
+    /// subcommand parameters, as the platform authenticates it.
+    #[must_use]
+    pub fn verify_credential_management_param(&self, param: &[u8], message: &[u8]) -> bool {
+        self.allows_credential_management() && self.verify_pin_uv_auth_param(param, message)
     }
 
     /// `getPINRetries`.
@@ -443,7 +520,7 @@ impl ClientPin {
             .ok_or(Ctap2Status::MissingParameter)?;
 
         let expected = hmac_sha256(&shared, new_pin_enc);
-        if !ct_eq(&expected, auth) {
+        if !ct_eq_prefix(&expected, auth) {
             return Err(Ctap2Status::PinAuthInvalid);
         }
 
@@ -471,7 +548,13 @@ impl ClientPin {
             .map_err(|_| Ctap2Status::Other)
     }
 
-    /// `getPINToken`.
+    /// `getPINToken` and `getPinUvAuthTokenUsingPinWithPermissions`.
+    ///
+    /// The superseded `getPinToken` subcommand grants the default `mc`/`ga`
+    /// permissions and rejects the `permissions` and `rpId` parameters.
+    /// `getPinUvAuthTokenUsingPinWithPermissions` requires the `permissions`
+    /// bitfield and binds it (plus the optional permissions RP ID) to the
+    /// issued token.
     pub fn get_pin_token<R: Rng>(
         &mut self,
         request: &ClientPinRequest,
@@ -485,6 +568,8 @@ impl ClientPin {
             return Err(Ctap2Status::PinBlocked);
         }
 
+        let (permissions, legacy) = self.requested_permissions(request)?;
+
         let shared = self.shared(request)?;
         let pin_hash_enc = request
             .pin_hash_enc
@@ -496,7 +581,7 @@ impl ClientPin {
             .ok_or(Ctap2Status::MissingParameter)?;
 
         let expected = hmac_sha256(&shared, pin_hash_enc);
-        if !ct_eq(&expected, auth) {
+        if !ct_eq_prefix(&expected, auth) {
             return Err(Ctap2Status::PinAuthInvalid);
         }
 
@@ -521,12 +606,143 @@ impl ClientPin {
         let mut token: [u8; 32] = Default::default();
         rng.fill_bytes(&mut token);
         self.pin_uv_auth_token = Some(token);
+        self.pin_uv_auth_permissions = permissions;
+        self.pin_uv_auth_rp_id = request.rp_id.clone();
+        self.legacy_token = legacy;
         let mut encrypted = [0u8; 48];
         let length = aes_cbc_encrypt(&shared, &token, &mut encrypted)?;
         Ok(PinTokenResponse {
             token: heapless::Vec::from_slice(&encrypted[..length])
                 .map_err(|_| Ctap2Status::LimitExceeded)?,
         })
+    }
+
+    /// Validate the `permissions`/`rpId` parameters of a token request.
+    ///
+    /// Returns the permission bitfield to bind to the token and whether the
+    /// request used the superseded `getPinToken` subcommand.
+    fn requested_permissions(&self, request: &ClientPinRequest) -> Result<(u8, bool), Ctap2Status> {
+        match request.sub_command {
+            SUB_GET_PIN_TOKEN => {
+                // The superseded subcommand takes neither parameter.
+                if request.permissions.is_some() || request.rp_id.is_some() {
+                    return Err(Ctap2Status::InvalidParameter);
+                }
+                Ok((DEFAULT_PERMISSIONS, true))
+            }
+            SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS => {
+                let permissions = request.permissions.ok_or(Ctap2Status::MissingParameter)?;
+                if permissions == 0 {
+                    return Err(Ctap2Status::InvalidParameter);
+                }
+                if permissions & !SUPPORTED_PERMISSIONS != 0 {
+                    return Err(Ctap2Status::UnauthorizedPermission);
+                }
+                Ok((permissions, false))
+            }
+            _ => Err(Ctap2Status::InvalidCommand),
+        }
+    }
+
+    /// `changePIN`: rotate the PIN.
+    ///
+    /// The platform proves knowledge of the current PIN with `pinHashEnc`
+    /// (the encrypted `LEFT(SHA-256(PIN), 16)`) and carries the new PIN in
+    /// `newPinEnc` (padded to 64 bytes). The request is authenticated with the
+    /// shared secret: `authenticate(sharedSecret, newPinEnc || pinHashEnc)`.
+    ///
+    /// A wrong current PIN consumes one retry, as the spec requires; a
+    /// successful rotation restores the retry budget and invalidates the
+    /// active `pinUvAuthToken`.
+    pub fn change_pin(
+        &mut self,
+        request: &ClientPinRequest,
+        state: &mut impl PinState,
+    ) -> Result<(), Ctap2Status> {
+        let Some(stored_hash) = state.pin_hash() else {
+            return Err(Ctap2Status::PinNotSet);
+        };
+        if state.pin_retries() == 0 {
+            return Err(Ctap2Status::PinBlocked);
+        }
+
+        let shared = self.shared(request)?;
+        let new_pin_enc = request
+            .new_pin_enc
+            .as_ref()
+            .ok_or(Ctap2Status::MissingParameter)?;
+        let pin_hash_enc = request
+            .pin_hash_enc
+            .as_ref()
+            .ok_or(Ctap2Status::MissingParameter)?;
+        let auth = request
+            .pin_uv_auth_param
+            .as_ref()
+            .ok_or(Ctap2Status::MissingParameter)?;
+
+        // The platform authenticates `newPinEnc || pinHashEnc` with the
+        // shared secret.
+        let mut message = [0u8; 128];
+        if new_pin_enc.len() + pin_hash_enc.len() > message.len() {
+            return Err(Ctap2Status::InvalidParameter);
+        }
+        message[..new_pin_enc.len()].copy_from_slice(new_pin_enc);
+        message[new_pin_enc.len()..new_pin_enc.len() + pin_hash_enc.len()]
+            .copy_from_slice(pin_hash_enc);
+        let expected = hmac_sha256(&shared, &message[..new_pin_enc.len() + pin_hash_enc.len()]);
+        if !ct_eq_prefix(&expected, auth) {
+            return Err(Ctap2Status::PinAuthInvalid);
+        }
+
+        // The current PIN is proven by the encrypted hash; a mismatch spends
+        // one retry.
+        let mut plain = [0u8; 32];
+        let length = aes_cbc_decrypt(&shared, pin_hash_enc, &mut plain)?;
+        if length < 16 || !ct_eq(&plain[..16], &stored_hash[..16]) {
+            let retries = state.pin_retries().saturating_sub(1);
+            state
+                .set_pin_retries(retries)
+                .map_err(|_| Ctap2Status::Other)?;
+            // The key agreement is dropped: the platform must renegotiate.
+            self.agreement_private = None;
+            self.pin_uv_auth_token = None;
+            return Err(if retries == 0 {
+                Ctap2Status::PinBlocked
+            } else {
+                Ctap2Status::PinInvalid
+            });
+        }
+
+        let mut padded = [0u8; 96];
+        let length = aes_cbc_decrypt(&shared, new_pin_enc, &mut padded)?;
+        if length != 64 {
+            return Err(Ctap2Status::InvalidParameter);
+        }
+        let pin_len = padded[..64]
+            .iter()
+            .position(|&byte| byte == 0)
+            .ok_or(Ctap2Status::PinPolicyViolation)?;
+        if padded[pin_len..64].iter().any(|&byte| byte != 0) {
+            return Err(Ctap2Status::PinPolicyViolation);
+        }
+        let pin = core::str::from_utf8(&padded[..pin_len])
+            .map_err(|_| Ctap2Status::PinPolicyViolation)?;
+        if pin.chars().count() < 4 {
+            return Err(Ctap2Status::PinPolicyViolation);
+        }
+
+        state
+            .set_pin_hash(pin_hash(pin.as_bytes()))
+            .map_err(|_| Ctap2Status::Other)?;
+        state
+            .set_pin_retries(DEFAULT_RETRIES)
+            .map_err(|_| Ctap2Status::Other)?;
+        // A rotated PIN invalidates every issued token.
+        self.pin_uv_auth_token = None;
+        self.pin_uv_auth_permissions = 0;
+        self.pin_uv_auth_rp_id = None;
+        self.legacy_token = false;
+        Ok(())
     }
 }
 
@@ -620,6 +836,8 @@ mod tests {
             pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
             new_pin_enc: Some(heapless::Vec::from_slice(&encrypted[..encrypted_length]).unwrap()),
             pin_hash_enc: None,
+            permissions: None,
+            rp_id: None,
         };
         let result = authenticator.set_pin(&request, &mut state);
         (result, state)
@@ -654,6 +872,8 @@ mod tests {
             pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
             new_pin_enc: Some(heapless::Vec::from_slice(&new_pin_enc[..length]).unwrap()),
             pin_hash_enc: None,
+            permissions: None,
+            rp_id: None,
         };
         authenticator.set_pin(&request, &mut state).unwrap();
         assert_eq!(state.hash, Some(pin_hash(b"1234")));
@@ -670,6 +890,8 @@ mod tests {
             pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
             new_pin_enc: None,
             pin_hash_enc: Some(heapless::Vec::from_slice(&pin_hash_enc[..length]).unwrap()),
+            permissions: None,
+            rp_id: None,
         };
         let response = authenticator
             .get_pin_token(&request, &mut state, &mut rng)
@@ -721,6 +943,8 @@ mod tests {
             pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
             new_pin_enc: Some(heapless::Vec::from_slice(&new_pin_enc[..length]).unwrap()),
             pin_hash_enc: None,
+            permissions: None,
+            rp_id: None,
         };
         assert_eq!(
             authenticator.set_pin(&request, &mut state),
@@ -751,6 +975,8 @@ mod tests {
             pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
             new_pin_enc: Some(heapless::Vec::from_slice(&new_pin_enc[..length]).unwrap()),
             pin_hash_enc: None,
+            permissions: None,
+            rp_id: None,
         };
         assert_eq!(
             authenticator.set_pin(&request, &mut state),
@@ -820,6 +1046,8 @@ mod tests {
                     heapless::Vec::from_slice(&encrypted[..encrypted_length]).unwrap(),
                 ),
                 pin_hash_enc: None,
+                permissions: None,
+                rp_id: None,
             };
 
             assert_eq!(
@@ -855,6 +1083,8 @@ mod tests {
             pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
             new_pin_enc: None,
             pin_hash_enc: Some(heapless::Vec::from_slice(&pin_hash_enc[..length]).unwrap()),
+            permissions: None,
+            rp_id: None,
         };
         assert_eq!(
             authenticator.get_pin_token(&request, &mut state, &mut rng),
@@ -881,6 +1111,8 @@ mod tests {
             pin_uv_auth_param: Some(heapless::Vec::from_slice(&[0u8; 32]).unwrap()),
             new_pin_enc: None,
             pin_hash_enc: Some(heapless::Vec::from_slice(&[0u8; 16]).unwrap()),
+            permissions: None,
+            rp_id: None,
         };
         assert_eq!(
             authenticator.get_pin_token(&request, &mut state, &mut rng),
@@ -908,11 +1140,265 @@ mod tests {
             pin_uv_auth_param: Some(heapless::Vec::from_slice(&[0u8; 32]).unwrap()),
             new_pin_enc: None,
             pin_hash_enc: Some(heapless::Vec::from_slice(&[0u8; 16]).unwrap()),
+            permissions: None,
+            rp_id: None,
         };
         assert_eq!(
             authenticator.get_pin_token(&request, &mut state, &mut rng),
             Err(Ctap2Status::PinNotSet)
         );
         let _ = key_agreement;
+    }
+
+    /// Build a `changePIN` request from the platform side.
+    fn change_pin_request(
+        platform: &Platform,
+        shared: &[u8; 32],
+        current_pin: &[u8],
+        new_pin: &[u8],
+    ) -> ClientPinRequest {
+        let hash = pin_hash(current_pin);
+        let mut pin_hash_enc = [0u8; 32];
+        let hash_length = aes_cbc_encrypt(shared, &hash[..16], &mut pin_hash_enc).unwrap();
+
+        let mut padded = [0u8; 64];
+        padded[..new_pin.len()].copy_from_slice(new_pin);
+        let mut new_pin_enc = [0u8; 96];
+        let new_length = aes_cbc_encrypt(shared, &padded, &mut new_pin_enc).unwrap();
+
+        let mut message = [0u8; 128];
+        message[..new_length].copy_from_slice(&new_pin_enc[..new_length]);
+        message[new_length..new_length + hash_length].copy_from_slice(&pin_hash_enc[..hash_length]);
+        let auth = hmac_sha256(shared, &message[..new_length + hash_length]);
+
+        ClientPinRequest {
+            protocol: 1,
+            sub_command: SUB_CHANGE_PIN,
+            key_agreement: Some(platform.public),
+            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth[..16]).unwrap()),
+            new_pin_enc: Some(heapless::Vec::from_slice(&new_pin_enc[..new_length]).unwrap()),
+            pin_hash_enc: Some(heapless::Vec::from_slice(&pin_hash_enc[..hash_length]).unwrap()),
+            permissions: None,
+            rp_id: None,
+        }
+    }
+
+    #[test]
+    fn change_pin_rotates_the_stored_hash() {
+        let mut rng = TestRng(21);
+        let mut authenticator = ClientPin::new();
+        let mut state = TestPinState {
+            hash: Some(pin_hash(b"1234")),
+            retries: 3,
+        };
+        let key_agreement = authenticator.key_agreement(&mut rng).unwrap();
+        let platform = Platform::new(&mut rng);
+        let shared = platform.shared(&key_agreement.key);
+
+        let request = change_pin_request(&platform, &shared, b"1234", b"567890");
+        assert_eq!(authenticator.change_pin(&request, &mut state), Ok(()));
+        assert_eq!(state.hash, Some(pin_hash(b"567890")));
+        // The retry budget is restored and the token is invalidated.
+        assert_eq!(state.retries, DEFAULT_RETRIES);
+        assert!(!authenticator.allows_credential_management());
+
+        // The old PIN no longer opens a token.
+        let hash = pin_hash(b"1234");
+        let mut pin_hash_enc = [0u8; 32];
+        let length = aes_cbc_encrypt(&shared, &hash[..16], &mut pin_hash_enc).unwrap();
+        let auth = hmac_sha256(&shared, &pin_hash_enc[..length]);
+        let request = ClientPinRequest {
+            protocol: 1,
+            sub_command: SUB_GET_PIN_TOKEN,
+            key_agreement: Some(platform.public),
+            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth[..16]).unwrap()),
+            new_pin_enc: None,
+            pin_hash_enc: Some(heapless::Vec::from_slice(&pin_hash_enc[..length]).unwrap()),
+            permissions: None,
+            rp_id: None,
+        };
+        assert_eq!(
+            authenticator.get_pin_token(&request, &mut state, &mut rng),
+            Err(Ctap2Status::PinInvalid)
+        );
+    }
+
+    #[test]
+    fn change_pin_with_a_wrong_current_pin_spends_a_retry() {
+        let mut rng = TestRng(22);
+        let mut authenticator = ClientPin::new();
+        let mut state = TestPinState {
+            hash: Some(pin_hash(b"1234")),
+            retries: 3,
+        };
+        let key_agreement = authenticator.key_agreement(&mut rng).unwrap();
+        let platform = Platform::new(&mut rng);
+        let shared = platform.shared(&key_agreement.key);
+
+        let request = change_pin_request(&platform, &shared, b"9999", b"567890");
+        assert_eq!(
+            authenticator.change_pin(&request, &mut state),
+            Err(Ctap2Status::PinInvalid)
+        );
+        assert_eq!(state.retries, 2);
+        assert_eq!(state.hash, Some(pin_hash(b"1234")));
+    }
+
+    #[test]
+    fn change_pin_requires_a_set_pin_and_rejects_a_short_one() {
+        let mut rng = TestRng(23);
+        let mut authenticator = ClientPin::new();
+        let mut state = TestPinState::default();
+        let key_agreement = authenticator.key_agreement(&mut rng).unwrap();
+        let platform = Platform::new(&mut rng);
+        let shared = platform.shared(&key_agreement.key);
+
+        let request = change_pin_request(&platform, &shared, b"1234", b"567890");
+        assert_eq!(
+            authenticator.change_pin(&request, &mut state),
+            Err(Ctap2Status::PinNotSet)
+        );
+
+        state.hash = Some(pin_hash(b"1234"));
+        state.retries = DEFAULT_RETRIES;
+        let request = change_pin_request(&platform, &shared, b"1234", b"12");
+        assert_eq!(
+            authenticator.change_pin(&request, &mut state),
+            Err(Ctap2Status::PinPolicyViolation)
+        );
+        assert_eq!(state.hash, Some(pin_hash(b"1234")));
+    }
+
+    #[test]
+    fn token_permissions_follow_the_requested_subcommand() {
+        let mut rng = TestRng(24);
+        let mut authenticator = ClientPin::new();
+        let mut state = TestPinState {
+            hash: Some(pin_hash(b"1234")),
+            retries: DEFAULT_RETRIES,
+        };
+        let key_agreement = authenticator.key_agreement(&mut rng).unwrap();
+        let platform = Platform::new(&mut rng);
+        let shared = platform.shared(&key_agreement.key);
+
+        let hash = pin_hash(b"1234");
+        let mut pin_hash_enc = [0u8; 32];
+        let length = aes_cbc_encrypt(&shared, &hash[..16], &mut pin_hash_enc).unwrap();
+        let auth = hmac_sha256(&shared, &pin_hash_enc[..length]);
+
+        // `getPinToken` grants the default permissions; credential management
+        // is still allowed for a legacy token.
+        let request = ClientPinRequest {
+            protocol: 1,
+            sub_command: SUB_GET_PIN_TOKEN,
+            key_agreement: Some(platform.public),
+            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth[..16]).unwrap()),
+            new_pin_enc: None,
+            pin_hash_enc: Some(heapless::Vec::from_slice(&pin_hash_enc[..length]).unwrap()),
+            permissions: None,
+            rp_id: None,
+        };
+        authenticator
+            .get_pin_token(&request, &mut state, &mut rng)
+            .unwrap();
+        assert!(authenticator.allows_credential_management());
+
+        // A token with the `cm` permission is accepted as well.
+        let request = ClientPinRequest {
+            protocol: 1,
+            sub_command: SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS,
+            key_agreement: Some(platform.public),
+            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth[..16]).unwrap()),
+            new_pin_enc: None,
+            pin_hash_enc: Some(heapless::Vec::from_slice(&pin_hash_enc[..length]).unwrap()),
+            permissions: Some(PERMISSION_CM),
+            rp_id: None,
+        };
+        authenticator
+            .get_pin_token(&request, &mut state, &mut rng)
+            .unwrap();
+        assert!(authenticator.allows_credential_management());
+
+        // A token without the `cm` permission is refused.
+        let request = ClientPinRequest {
+            protocol: 1,
+            sub_command: SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS,
+            key_agreement: Some(platform.public),
+            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth[..16]).unwrap()),
+            new_pin_enc: None,
+            pin_hash_enc: Some(heapless::Vec::from_slice(&pin_hash_enc[..length]).unwrap()),
+            permissions: Some(PERMISSION_MC),
+            rp_id: None,
+        };
+        authenticator
+            .get_pin_token(&request, &mut state, &mut rng)
+            .unwrap();
+        assert!(!authenticator.allows_credential_management());
+    }
+
+    #[test]
+    fn token_requests_validate_the_permissions() {
+        let mut rng = TestRng(25);
+        let mut authenticator = ClientPin::new();
+        let mut state = TestPinState {
+            hash: Some(pin_hash(b"1234")),
+            retries: DEFAULT_RETRIES,
+        };
+        let key_agreement = authenticator.key_agreement(&mut rng).unwrap();
+        let platform = Platform::new(&mut rng);
+        let shared = platform.shared(&key_agreement.key);
+
+        let hash = pin_hash(b"1234");
+        let mut pin_hash_enc = [0u8; 32];
+        let length = aes_cbc_encrypt(&shared, &hash[..16], &mut pin_hash_enc).unwrap();
+        let auth = hmac_sha256(&shared, &pin_hash_enc[..length]);
+
+        // Zero permissions are rejected.
+        let request = ClientPinRequest {
+            protocol: 1,
+            sub_command: SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS,
+            key_agreement: Some(platform.public),
+            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth[..16]).unwrap()),
+            new_pin_enc: None,
+            pin_hash_enc: Some(heapless::Vec::from_slice(&pin_hash_enc[..length]).unwrap()),
+            permissions: Some(0),
+            rp_id: None,
+        };
+        assert_eq!(
+            authenticator.get_pin_token(&request, &mut state, &mut rng),
+            Err(Ctap2Status::InvalidParameter)
+        );
+
+        // Unsupported permissions are refused.
+        let request = ClientPinRequest {
+            protocol: 1,
+            sub_command: SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS,
+            key_agreement: Some(platform.public),
+            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth[..16]).unwrap()),
+            new_pin_enc: None,
+            pin_hash_enc: Some(heapless::Vec::from_slice(&pin_hash_enc[..length]).unwrap()),
+            permissions: Some(PERMISSION_BE | PERMISSION_LBW),
+            rp_id: None,
+        };
+        assert_eq!(
+            authenticator.get_pin_token(&request, &mut state, &mut rng),
+            Err(Ctap2Status::UnauthorizedPermission)
+        );
+
+        // The superseded subcommand takes neither parameter.
+        let request = ClientPinRequest {
+            protocol: 1,
+            sub_command: SUB_GET_PIN_TOKEN,
+            key_agreement: Some(platform.public),
+            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth[..16]).unwrap()),
+            new_pin_enc: None,
+            pin_hash_enc: Some(heapless::Vec::from_slice(&pin_hash_enc[..length]).unwrap()),
+            permissions: Some(PERMISSION_CM),
+            rp_id: None,
+        };
+        assert_eq!(
+            authenticator.get_pin_token(&request, &mut state, &mut rng),
+            Err(Ctap2Status::InvalidParameter)
+        );
     }
 }

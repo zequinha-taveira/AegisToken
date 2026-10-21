@@ -36,6 +36,9 @@ board-generic-rp2350 = { path = "crates/board-generic-rp2350", default-features 
 # system library or WinUSB/Zadig driver is required (Windows uses libusb's HID
 # backend, which talks to the device through the inbox HID driver).
 rusb = { version = "0.9", default-features = false, features = ["vendored"] }
+pcsc = "2.9"
+iso7816 = "0.2.2"
+x509-cert = "0.3"
 
 # Host-testable core dependencies (no_std, no alloc).
 minicbor = { version = "2.3", default-features = false, features = ["derive"] }
