@@ -22,6 +22,41 @@ contextual, and secrets are never exported or logged.
   keys: those keys are generated on-device, sealed under the board's
   OTP root key, and do not survive a board swap.
 
+## FIDO PIN/UV invariants (phase 7)
+
+The `pinUvAuthToken` is a live proof of user verification and is scoped:
+
+- **The token is scoped by operation and by relying party.** A token only
+  authorises the operation its permission covers (`mc` for
+  `authenticatorMakeCredential`, `ga` for `authenticatorGetAssertion`) and the
+  relying party it is bound to. A token issued without a permissions RP ID
+  serves every relying party; a token bound to `R` serves only the requests
+  whose `rp.id` is exactly `R` (exact, case-sensitive comparison).
+- **Credential management is scoped too.** `enumerateRPsBegin` requires a
+  token that is not bound to a relying party, because the enumeration of
+  relying parties is global. `enumerateCredentialsBegin` and
+  `deleteCredential` require the `cm` capability and, for a bound token, only
+  the credentials of the bound relying party; a credential of another relying
+  party is refused and preserved in the store.
+- **A missing permission or a diverging relying party is an authentication
+  failure, not an absent proof.** The request is answered with
+  `CTAP2_ERR_PIN_AUTH_INVALID` (`0x33`), the operation is aborted before any
+  effect — no credential is created, no assertion is signed, no credential is
+  removed — and the `UV` flag is not written to the `authenticatorData`.
+  `0x40` (`UnauthorizedPermission`) stays reserved for the token issuance
+  path.
+- **The scope check is pure core logic.** It lives in `aegis-core` (`pin` and
+  `authenticator`), with no HAL, executor or storage dependency; the firmware
+  only hands over the relying party, the credential id and the `rpIdHash` of
+  the request. The FIDO path stays independent from Management, keyboard and
+  CCID. The relying-party comparison is a plain string comparison (the relying
+  party is not a secret); the HMAC comparison stays constant time.
+- **Documented deviations.** The token of the superseded `getPinToken`
+  subcommand keeps its CTAP2.0 semantics: it grants `mc|ga`, it is not bound to
+  a relying party and it still drives credential management. A strict CTAP2.1
+  authenticator would require an explicit `cm` permission there; changing it is
+  a separate slice with a compatibility impact.
+
 ## Applet security invariants (phases 11-17)
 
 The PIV, OpenPGP and OATH applets must preserve the following invariants:

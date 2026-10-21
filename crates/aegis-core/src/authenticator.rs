@@ -13,9 +13,8 @@ use sha2::{Digest, Sha256};
 use crate::codec;
 use crate::configuration::FixedString;
 use crate::ctap2::{
-    AAGUID, COSE_ALG_EDDSA, COSE_ALG_ES256, COSE_CURVE_ED25519, COSE_CURVE_P256,
-    CredentialDescriptor, Ctap2Status, Ec2PublicKey, GetAssertionRequest, MakeCredentialRequest,
-    OkpPublicKey,
+    AAGUID, COSE_ALG_EDDSA, COSE_ALG_ES256, COSE_CURVE_ED25519, COSE_CURVE_P256, Ctap2Status,
+    Ec2PublicKey, GetAssertionRequest, MakeCredentialRequest, OkpPublicKey,
 };
 use crate::error::CoreError;
 
@@ -318,6 +317,11 @@ pub struct GetAssertionResponse {
     pub signature: heapless::Vec<u8, MAX_SIGNATURE>,
     /// User handle.
     pub user_id: heapless::Vec<u8, 64>,
+    /// Total number of credentials matching the request.
+    ///
+    /// The platform fetches the remaining ones with
+    /// `authenticatorGetNextAssertion`.
+    pub number_of_credentials: u32,
 }
 
 impl<C> minicbor::Encode<C> for GetAssertionResponse {
@@ -326,7 +330,7 @@ impl<C> minicbor::Encode<C> for GetAssertionResponse {
         e: &mut Encoder<W>,
         _ctx: &mut C,
     ) -> Result<(), minicbor::encode::Error<W::Error>> {
-        e.map(4)?;
+        e.map(5)?;
         // credential: PublicKeyCredentialDescriptor (text keys, canonical order).
         e.u8(1)?;
         e.map(2)?;
@@ -343,6 +347,8 @@ impl<C> minicbor::Encode<C> for GetAssertionResponse {
         e.map(1)?;
         e.str("id")?;
         e.bytes(&self.user_id)?;
+        e.u8(5)?;
+        e.u32(self.number_of_credentials)?;
         Ok(())
     }
 }
@@ -548,31 +554,90 @@ pub fn get_assertion<S: CredentialStore, R: Rng>(
         return Err(Ctap2Status::PinAuthInvalid);
     }
 
-    let credential = if request.allow_list.is_empty() {
-        store.find_by_rp(request.rp_id.as_str())
+    let candidates = assertion_candidates(store, request);
+    let Some(first) = candidates.first() else {
+        return Err(Ctap2Status::NoCredentials);
+    };
+    let mut response = sign_assertion(
+        store,
+        first,
+        request.rp_id.as_str(),
+        &request.client_data_hash,
+        uv_confirmed,
+    )?;
+    response.number_of_credentials = candidates.len() as u32;
+    Ok(response)
+}
+
+/// The credentials matching an assertion request, in the order the
+/// authenticator must return them.
+///
+/// With an allow list the order follows the list; without one every
+/// discoverable credential of the relying party matches.
+#[must_use]
+pub fn assertion_candidates<S: CredentialStore>(
+    store: &S,
+    request: &GetAssertionRequest,
+) -> heapless::Vec<heapless::Vec<u8, 32>, MAX_CREDENTIALS> {
+    let mut candidates: heapless::Vec<heapless::Vec<u8, 32>, MAX_CREDENTIALS> =
+        heapless::Vec::new();
+    if request.allow_list.is_empty() {
+        for credential in store.list() {
+            if !credential.discoverable {
+                continue;
+            }
+            if credential.rp_id.as_str() != request.rp_id.as_str() {
+                continue;
+            }
+            let _ = candidates.push(credential.id.clone());
+        }
     } else {
-        request
-            .allow_list
-            .iter()
-            .find_map(|descriptor: &CredentialDescriptor| {
-                store
-                    .get(&descriptor.id)
-                    .filter(|credential| credential.rp_id.as_str() == request.rp_id.as_str())
-            })
+        for descriptor in &request.allow_list {
+            let Some(credential) = store.get(&descriptor.id) else {
+                continue;
+            };
+            if credential.rp_id.as_str() != request.rp_id.as_str() {
+                continue;
+            }
+            if candidates
+                .iter()
+                .any(|id| id.as_slice() == descriptor.id.as_slice())
+            {
+                continue;
+            }
+            let _ = candidates.push(credential.id.clone());
+        }
     }
-    .ok_or(Ctap2Status::NoCredentials)?;
+    candidates
+}
+
+/// Sign an assertion for one specific credential.
+///
+/// The authenticator keeps the request parameters between
+/// `authenticatorGetAssertion` and `authenticatorGetNextAssertion`, so the
+/// signature covers the same client data hash.
+pub fn sign_assertion<S: CredentialStore>(
+    store: &mut S,
+    credential_id: &[u8],
+    rp_id: &str,
+    client_data_hash: &[u8; 32],
+    uv_confirmed: bool,
+) -> Result<GetAssertionResponse, Ctap2Status> {
+    let credential = store
+        .get(credential_id)
+        .ok_or(Ctap2Status::InvalidCredential)?;
 
     let sign_count = store
         .next_sign_count(&credential.id)
         .ok_or(Ctap2Status::InvalidCredential)?;
 
     let flags = FLAG_UP | if uv_confirmed { FLAG_UV } else { 0 };
-    let auth_data = build_auth_data(request.rp_id.as_str(), flags, sign_count, None)?;
+    let auth_data = build_auth_data(rp_id, flags, sign_count, None)?;
     let signature = sign(
         &credential.private_key,
         credential.algorithm,
         &auth_data,
-        &request.client_data_hash,
+        client_data_hash,
     )?;
 
     Ok(GetAssertionResponse {
@@ -580,6 +645,7 @@ pub fn get_assertion<S: CredentialStore, R: Rng>(
         auth_data,
         signature,
         user_id: credential.user_id,
+        number_of_credentials: 1,
     })
 }
 
@@ -966,9 +1032,43 @@ pub fn delete_credential<S: CredentialStore>(
     store.remove(credential_id).map_err(|_| Ctap2Status::Other)
 }
 
+/// Whether a relying party is within the scope of the active PIN/UV token.
+///
+/// `bound_rp_id` is the relying party the token is bound to, if any. A token
+/// issued without a permissions RP ID serves every relying party.
+#[must_use]
+pub fn rp_in_scope(rp_id: &str, bound_rp_id: Option<&str>) -> bool {
+    match bound_rp_id {
+        None => true,
+        Some(bound) => bound == rp_id,
+    }
+}
+
+/// Delete a credential, honouring the relying-party scope of the active
+/// PIN/UV token.
+///
+/// The token must carry the `cm` capability and, when it is bound to a
+/// relying party, the credential must belong to that relying party. A
+/// credential of another relying party is refused and preserved.
+pub fn delete_credential_scoped<S: CredentialStore>(
+    store: &mut S,
+    client_pin: &crate::pin::ClientPin,
+    credential_id: &[u8],
+) -> Result<(), Ctap2Status> {
+    if !client_pin.allows_credential_management() {
+        return Err(Ctap2Status::PinAuthInvalid);
+    }
+    let credential = store.get(credential_id).ok_or(Ctap2Status::NoCredentials)?;
+    if !client_pin.allows_delete_credential(credential.rp_id.as_str()) {
+        return Err(Ctap2Status::PinAuthInvalid);
+    }
+    store.remove(credential_id).map_err(|_| Ctap2Status::Other)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ctap2::CredentialDescriptor;
     use p256::ecdsa::signature::Verifier;
 
     struct TestRng(u32);
@@ -1025,6 +1125,100 @@ mod tests {
         // rpIdHash(32) + flags(1) + signCount(4) + aaguid(16) + idLen(2) + id
         let length = u16::from_be_bytes([auth_data[53], auth_data[54]]) as usize;
         heapless::Vec::from_slice(&auth_data[55..55 + length]).unwrap()
+    }
+
+    /// Create a resident credential and return its id.
+    fn resident_credential(
+        store: &mut MemoryCredentialStore,
+        rng: &mut TestRng,
+        rp_id: &str,
+        user_id: &[u8],
+    ) -> heapless::Vec<u8, 32> {
+        let mut request = make_request(rp_id, user_id);
+        request.rk = true;
+        let response = make_credential(store, rng, &request, true, false).unwrap();
+        credential_id_from_auth_data(&response.auth_data)
+    }
+
+    /// Build an allow-list descriptor for a credential id.
+    fn descriptor(id: &heapless::Vec<u8, 32>) -> CredentialDescriptor {
+        CredentialDescriptor {
+            id: heapless::Vec::from_slice(id).unwrap(),
+        }
+    }
+
+    #[test]
+    fn assertion_candidates_follow_the_allow_list() {
+        let mut store = MemoryCredentialStore::new();
+        let mut rng = TestRng(41);
+        let first = resident_credential(&mut store, &mut rng, "example.com", &[1]);
+        let second = resident_credential(&mut store, &mut rng, "example.com", &[2]);
+        let other = resident_credential(&mut store, &mut rng, "other.test", &[3]);
+
+        // Without an allow list every discoverable credential of the RP
+        // matches.
+        let request = assertion_request("example.com");
+        let candidates = assertion_candidates(&store, &request);
+        assert_eq!(candidates.len(), 2);
+
+        // With an allow list the order follows the list.
+        let mut request = assertion_request("example.com");
+        request.allow_list.push(descriptor(&second)).unwrap();
+        request.allow_list.push(descriptor(&first)).unwrap();
+        let candidates = assertion_candidates(&store, &request);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0], second);
+        assert_eq!(candidates[1], first);
+
+        // A credential of another relying party never matches.
+        let mut request = assertion_request("example.com");
+        request.allow_list.push(descriptor(&second)).unwrap();
+        request.allow_list.push(descriptor(&other)).unwrap();
+        let candidates = assertion_candidates(&store, &request);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0], second);
+    }
+
+    #[test]
+    fn assertion_reports_the_number_of_matching_credentials() {
+        let mut store = MemoryCredentialStore::new();
+        let mut rng = TestRng(42);
+        resident_credential(&mut store, &mut rng, "example.com", &[1]);
+        resident_credential(&mut store, &mut rng, "example.com", &[2]);
+
+        let request = assertion_request("example.com");
+        let response = get_assertion(&mut store, &mut rng, &request, true, false).unwrap();
+        assert_eq!(response.number_of_credentials, 2);
+
+        // The remaining credential is served by `authenticatorGetNextAssertion`.
+        let candidates = assertion_candidates(&store, &request);
+        let next = sign_assertion(
+            &mut store,
+            &candidates[1],
+            request.rp_id.as_str(),
+            &request.client_data_hash,
+            false,
+        )
+        .unwrap();
+        assert_ne!(next.credential_id, response.credential_id);
+        let credential = store.get(&next.credential_id).unwrap();
+        assert!(verify(
+            &credential.private_key,
+            &next.auth_data,
+            &request.client_data_hash,
+            &next.signature
+        ));
+    }
+
+    #[test]
+    fn assertion_without_matching_credentials_is_rejected() {
+        let mut store = MemoryCredentialStore::new();
+        let mut rng = TestRng(43);
+        let request = assertion_request("example.com");
+        assert_eq!(
+            get_assertion(&mut store, &mut rng, &request, true, false),
+            Err(Ctap2Status::NoCredentials)
+        );
     }
 
     #[test]
@@ -1498,6 +1692,7 @@ mod tests {
             auth_data: heapless::Vec::from_slice(&[0x11; 37]).unwrap(),
             signature: heapless::Vec::from_slice(&[0x22; 70]).unwrap(),
             user_id: heapless::Vec::from_slice(&[7]).unwrap(),
+            number_of_credentials: 1,
         };
         let mut buf = [0u8; 256];
         let len = crate::codec::encode_into(&response, &mut buf).unwrap();
@@ -1506,5 +1701,80 @@ mod tests {
         assert!(has(b"id"));
         assert!(has(b"type"));
         assert!(has(b"public-key"));
+    }
+
+    #[test]
+    fn delete_credential_is_restricted_to_the_bound_rp() {
+        use crate::pin::PERMISSION_CM;
+        use crate::pin::test_support::issue_token;
+
+        let mut store = MemoryCredentialStore::new();
+        let mut rng = TestRng(51);
+        let bound = credential_id_from_auth_data(
+            &make_credential(
+                &mut store,
+                &mut rng,
+                &make_request("a.test", &[1]),
+                true,
+                false,
+            )
+            .unwrap()
+            .auth_data,
+        );
+        let other = credential_id_from_auth_data(
+            &make_credential(
+                &mut store,
+                &mut rng,
+                &make_request("b.test", &[2]),
+                true,
+                false,
+            )
+            .unwrap()
+            .auth_data,
+        );
+
+        let issued = issue_token(Some(PERMISSION_CM), Some("a.test"));
+        let client_pin = &issued.client_pin;
+
+        // A credential of another relying party is refused and preserved.
+        assert_eq!(
+            delete_credential_scoped(&mut store, client_pin, &other),
+            Err(Ctap2Status::PinAuthInvalid)
+        );
+        assert!(store.get(&other).is_some());
+
+        // The credential of the bound relying party is removed.
+        assert_eq!(
+            delete_credential_scoped(&mut store, client_pin, &bound),
+            Ok(())
+        );
+        assert!(store.get(&bound).is_none());
+    }
+
+    #[test]
+    fn a_token_without_rp_binding_deletes_any_credential() {
+        use crate::pin::PERMISSION_CM;
+        use crate::pin::test_support::issue_token;
+
+        let mut store = MemoryCredentialStore::new();
+        let mut rng = TestRng(52);
+        let id = credential_id_from_auth_data(
+            &make_credential(
+                &mut store,
+                &mut rng,
+                &make_request("b.test", &[1]),
+                true,
+                false,
+            )
+            .unwrap()
+            .auth_data,
+        );
+
+        let issued = issue_token(Some(PERMISSION_CM), None);
+        assert_eq!(
+            delete_credential_scoped(&mut store, &issued.client_pin, &id),
+            Ok(())
+        );
+        assert!(store.get(&id).is_none());
     }
 }

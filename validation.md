@@ -438,6 +438,40 @@ Cobertos por 225 testes de host em `aegis-core` (14 novos) e pelo validador
 
 O status de hardware permanece pendente (sem RP2350 físico nesta sessão).
 
+### Fase 7g — escopo do `pinUvAuthToken` (host; hardware pendente)
+
+Cobertos por 239 testes de host em `aegis-core` (11 novos nesta fatia):
+
+| AC | Critério | Teste de host | Status |
+|----|----------|---------------|--------|
+| AC-1 | Escopo por operação: `mc` não autoriza `getAssertion` e `ga` não autoriza `makeCredential` | `token_with_mc_permission_is_refused_on_get_assertion`, `token_with_ga_permission_is_refused_on_make_credential` | **Verificado** |
+| AC-2 | Escopo por RP: token de `a.test` recusado em `b.test` | `token_bound_to_rp_is_refused_for_another_rp` | **Verificado** |
+| AC-3 | Token sem vínculo de RP serve qualquer RP | `token_without_rp_binding_serves_any_rp` | **Verificado** |
+| AC-4 | Compatibilidade do token legado (`getPinToken`) | `legacy_token_is_accepted_by_make_credential_and_get_assertion` | **Verificado** |
+| AC-5 | `enumerateRPsBegin` exige token sem vínculo de RP | `enumerate_rps_requires_a_token_without_rp_binding` | **Verificado** |
+| AC-6 | `deleteCredential` restrito ao RP vinculado (credencial preservada) | `delete_credential_is_restricted_to_the_bound_rp`, `a_token_without_rp_binding_deletes_any_credential` | **Verificado** |
+| AC-7 | `enumerateCredentialsBegin` restrito ao RP vinculado | `enumerate_credentials_is_restricted_to_the_bound_rp` | **Verificado** |
+| AC-8 | Permissões suportadas preservadas | `supported_permissions_are_still_accepted`, `token_requests_validate_the_permissions` | **Verificado** |
+| AC-9 | Wiring de firmware (permissão por operação + RP da requisição) | `cargo clippy-fw` + `cargo build-fw-release` | **Verificado** (build/alvo) |
+
+Método: testes de host em `aegis-core` (`pin::tests` e `authenticator::tests`).
+A decisão de escopo é lógica pura no núcleo (`aegis-core::pin` e
+`aegis-core::authenticator`), sem HAL, executor ou dependência de storage; o
+firmware apenas repassa o `rp.id`, o `rpIdHash` e o id da credencial.
+
+**Limitação:** a validação de ponta a ponta em dispositivo físico (token com
+permissão ou RP errada contra o firmware flashed) está **pendente** — não há
+RP2350 físico nesta sessão. `scripts/validate_fido.py` é o candidato natural
+para exercitar o novo comportamento.
+
+**Mudança de comportamento observável:** requisições antes aceitas agora
+falham com `PinAuthInvalid` (0x33) — token sem a permissão exigida, token
+vinculado a outro RP, `enumerateRPsBegin` com token vinculado e
+`deleteCredential`/`enumerateCredentialsBegin` fora do RP vinculado. Clientes
+que pedem `cm` **com** `rpId` e depois enumeram os RPs do dispositivo passam a
+receber `PinAuthInvalid`: é o comportamento exigido pela CTAP 2.1, mas pode
+afetar clientes que hoje funcionam.
+
 ### Evidência — Management HID (12/12)
 
 ```
@@ -549,6 +583,19 @@ A validação com um cliente real revelou dois bugs de transporte, já corrigido
   `credMgmt` só é anunciada quando há PIN configurado, porque todo subcomando
   de credential management exige um token com a permissão `cm`. A mutação de
   *user information* e o `largeBlobKey` não são implementados.
+- **PIN obrigatório quando configurado:** com PIN no dispositivo,
+  `makeCredential`/`getAssertion` exigem a prova do PIN (`PinRequired` 0x36) e
+  rejeitam um `pinUvAuthParam` inválido (`PinAuthInvalid` 0x33). O validador
+  precisa ser executado com `--pin <PIN>` nesse caso.
+- **Escopo do `pinUvAuthToken`:** o token é escopado por operação (`mc` para
+  `makeCredential`, `ga` para `getAssertion`) e por RP (o *permissions RP ID*
+  precisa casar com o `rp.id` da requisição); `enumerateRPsBegin` exige token
+  sem vínculo de RP e `deleteCredential`/`enumerateCredentialsBegin` ficam
+  restritos ao RP vinculado. Divergência → `PinAuthInvalid` (0x33), com a
+  operação abortada antes de qualquer efeito. O token legado de
+  `getPinToken` permanece universal (sem vínculo de RP) por compatibilidade
+  CTAP2.0, e a validação em dispositivo físico desse comportamento está
+  pendente.
 - **RSA (AC-021):** RSA-2048/PKCS#1 v1.5 apenas; RSA-3072 e PSS fora de escopo.
   Sem brainpoolP512r1 / X448 / Ed448 (sem aritmética `no_std` madura em Rust).
   Keygen probabilístico (Miller-Rabin 12 rounds, sem certificação FIPS);

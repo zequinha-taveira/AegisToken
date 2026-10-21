@@ -575,12 +575,44 @@ struct EnumerationState {
     credential_index: usize,
 }
 
+/// State of the last assertion, kept for `authenticatorGetNextAssertion`.
+///
+/// The CTAP2.1 flow returns one credential per command: the platform asks
+/// for the next one while the authenticator still remembers the request.
+struct AssertionState {
+    /// Credentials that matched the request, in order.
+    credentials:
+        heapless::Vec<heapless::Vec<u8, 32>, { aegis_core::authenticator::MAX_CREDENTIALS }>,
+    /// Index of the next credential to return.
+    index: usize,
+    /// Relying party of the last assertion.
+    rp_id: aegis_core::configuration::FixedString<64>,
+    /// Client data hash of the last assertion.
+    client_data_hash: [u8; 32],
+    /// Whether user verification was performed.
+    uv: bool,
+}
+
+impl Default for AssertionState {
+    fn default() -> Self {
+        Self {
+            credentials: heapless::Vec::new(),
+            index: 0,
+            rp_id: aegis_core::configuration::FixedString::new("").expect("empty string fits"),
+            client_data_hash: [0u8; 32],
+            uv: false,
+        }
+    }
+}
+
 /// State shared by the CTAP2 commands of one FIDO session.
 struct FidoSession {
     /// PIN/UV auth handler.
     client_pin: ClientPin,
     /// Credential-management enumeration cursor.
     enumeration: EnumerationState,
+    /// Pending assertion, for `authenticatorGetNextAssertion`.
+    assertion: Option<AssertionState>,
 }
 
 impl FidoSession {
@@ -589,6 +621,7 @@ impl FidoSession {
         Self {
             client_pin: ClientPin::new(),
             enumeration: EnumerationState::default(),
+            assertion: None,
         }
     }
 }
@@ -789,9 +822,18 @@ where
             encode_response(&info, out)
         }
         Ok(Ctap2Request::MakeCredential(request)) => {
-            let uv = request.pin_uv_auth_param.as_ref().is_some_and(|param| {
-                client_pin.verify_pin_uv_auth_param(param, &request.client_data_hash)
-            });
+            let uv = match check_user_verification(
+                client_pin,
+                store,
+                request.pin_uv_auth_param.as_ref(),
+                request.uv,
+                &request.client_data_hash,
+                aegis_core::pin::PERMISSION_MC,
+                request.rp_id.as_str(),
+            ) {
+                Ok(uv) => uv,
+                Err(status) => return write_status(status, out),
+            };
             let up = wait_presence_notifying(chan, ctaphid::KEEPALIVE_PROCESSING, presence).await;
             let mut rng = rng.lock().await;
             match authenticator::make_credential(store, &mut *rng, &request, up, uv) {
@@ -800,12 +842,61 @@ where
             }
         }
         Ok(Ctap2Request::GetAssertion(request)) => {
-            let uv = request.pin_uv_auth_param.as_ref().is_some_and(|param| {
-                client_pin.verify_pin_uv_auth_param(param, &request.client_data_hash)
-            });
+            let uv = match check_user_verification(
+                client_pin,
+                store,
+                request.pin_uv_auth_param.as_ref(),
+                request.uv,
+                &request.client_data_hash,
+                aegis_core::pin::PERMISSION_GA,
+                request.rp_id.as_str(),
+            ) {
+                Ok(uv) => uv,
+                Err(status) => return write_status(status, out),
+            };
             let up = wait_presence_notifying(chan, ctaphid::KEEPALIVE_PROCESSING, presence).await;
-            let mut rng = rng.lock().await;
-            match authenticator::get_assertion(store, &mut *rng, &request, up, uv) {
+            if !up {
+                return write_status(ctap2::Ctap2Status::UpRequired, out);
+            }
+            let candidates = authenticator::assertion_candidates(store, &request);
+            let Some(first) = candidates.first().cloned() else {
+                return write_status(ctap2::Ctap2Status::NoCredentials, out);
+            };
+            let response = authenticator::sign_assertion(
+                store,
+                &first,
+                request.rp_id.as_str(),
+                &request.client_data_hash,
+                uv,
+            );
+            // Remember the request so `authenticatorGetNextAssertion` can
+            // serve the remaining credentials.
+            session.assertion = Some(AssertionState {
+                credentials: candidates,
+                index: 1,
+                rp_id: request.rp_id.clone(),
+                client_data_hash: request.client_data_hash,
+                uv,
+            });
+            match response {
+                Ok(response) => encode_response(&response, out),
+                Err(status) => write_status(status, out),
+            }
+        }
+        Ok(Ctap2Request::GetNextAssertion) => {
+            // The presence was already confirmed by the first assertion.
+            let Some(state) = session.assertion.as_mut() else {
+                return write_status(ctap2::Ctap2Status::NoCredentials, out);
+            };
+            let Some(next) = state.credentials.get(state.index).cloned() else {
+                return write_status(ctap2::Ctap2Status::NoCredentials, out);
+            };
+            state.index += 1;
+            let rp_id = state.rp_id.clone();
+            let client_data_hash = state.client_data_hash;
+            let uv = state.uv;
+            match authenticator::sign_assertion(store, &next, rp_id.as_str(), &client_data_hash, uv)
+            {
                 Ok(response) => encode_response(&response, out),
                 Err(status) => write_status(status, out),
             }
@@ -857,6 +948,52 @@ where
     }
 }
 
+/// Validate the user-verification state of a FIDO request.
+///
+/// Returns whether the operation is user verified. A PIN/UV auth parameter
+/// that does not verify against the active token is rejected
+/// (`PinAuthInvalid`); with a PIN configured the platform must prove it
+/// (`PinRequired`), as a real authenticator does. Without a PIN the
+/// operation runs user-presence only.
+///
+/// The token is also checked against the scope of the request: it must carry
+/// the permission the operation needs (`mc` for `authenticatorMakeCredential`,
+/// `ga` for `authenticatorGetAssertion`) and, when it is bound to a relying
+/// party, the request must come from that same relying party.
+fn check_user_verification<S>(
+    client_pin: &ClientPin,
+    store: &S,
+    pin_uv_auth_param: Option<&heapless::Vec<u8, 64>>,
+    uv_requested: bool,
+    client_data_hash: &[u8; 32],
+    required_permission: u8,
+    request_rp_id: &str,
+) -> Result<bool, ctap2::Ctap2Status>
+where
+    S: CredentialStore + aegis_core::pin::PinState,
+{
+    match pin_uv_auth_param {
+        Some(param) => {
+            if !client_pin.verify_scoped_auth_param(
+                param,
+                client_data_hash,
+                required_permission,
+                request_rp_id,
+            ) {
+                return Err(ctap2::Ctap2Status::PinAuthInvalid);
+            }
+            Ok(true)
+        }
+        None => {
+            let pin_is_set = aegis_core::pin::PinState::pin_hash(store).is_some();
+            if uv_requested || pin_is_set {
+                return Err(ctap2::Ctap2Status::PinRequired);
+            }
+            Ok(false)
+        }
+    }
+}
+
 /// Serve an `authenticatorCredentialManagement` request.
 ///
 /// Every subcommand but `getCredsMetadata` requires a PIN/UV auth token with
@@ -882,6 +1019,11 @@ where
             };
             let message = [authenticator::CRED_MGMT_ENUMERATE_RPS];
             if !client_pin.verify_credential_management_param(param, &message) {
+                return write_status(ctap2::Ctap2Status::PinAuthInvalid, out);
+            }
+            // The enumeration of relying parties is global, so a token bound
+            // to a single relying party cannot drive it.
+            if !client_pin.allows_enumerate_rps() {
                 return write_status(ctap2::Ctap2Status::PinAuthInvalid, out);
             }
             let rps = authenticator::list_rps(store);
@@ -922,6 +1064,11 @@ where
             if !client_pin.verify_credential_management_param(param, &message) {
                 return write_status(ctap2::Ctap2Status::PinAuthInvalid, out);
             }
+            // A token bound to a relying party only enumerates the
+            // credentials of that relying party.
+            if !client_pin.allows_enumerate_credentials(&hash) {
+                return write_status(ctap2::Ctap2Status::PinAuthInvalid, out);
+            }
             let ids = authenticator::list_credentials(store, &hash);
             if ids.is_empty() {
                 return write_status(ctap2::Ctap2Status::NoCredentials, out);
@@ -960,7 +1107,9 @@ where
             let Some(id) = request.credential_id.as_ref() else {
                 return write_status(ctap2::Ctap2Status::MissingParameter, out);
             };
-            match authenticator::delete_credential(store, id) {
+            // The credential must belong to the relying party the token is
+            // bound to; the other credentials are preserved.
+            match authenticator::delete_credential_scoped(store, client_pin, id) {
                 Ok(()) => write_status(ctap2::Ctap2Status::Ok, out),
                 Err(status) => write_status(status, out),
             }

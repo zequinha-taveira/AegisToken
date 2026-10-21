@@ -120,6 +120,10 @@ laboratório autorizado: não distribuir essa imagem em releases públicas.
 - **FIDO2/CTAP2**: `authenticatorGetInfo`, `makeCredential`, `getAssertion`,
   `clientPIN` (protocolo v1), `reset` e credential management — ES256 e
   EdDSA (`ed25519-sk`, pronta para SSH/Git; ver `docs/ssh-git.md`).
+  O `pinUvAuthToken` é **escopado**: `makeCredential` exige a permissão `mc`,
+  `getAssertion` a `ga` e o *permissions RP ID* do token precisa casar com o
+  `rp.id` da requisição; falta de permissão ou RP divergente responde
+  `PinAuthInvalid` (0x33) e aborta a operação antes de qualquer efeito.
 - **U2F/CTAP1**: `U2F_VERSION` e `U2F_AUTHENTICATE` (check-only e sign, ES256).
 - **CCID / ISO 7816** (Fases 11–12, 16): transporte CCID (classe `0x0B`), APDU
   ISO 7816-4 (curto e estendido), roteamento por AID e framework de PIN/retry.

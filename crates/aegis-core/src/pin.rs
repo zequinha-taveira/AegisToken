@@ -12,7 +12,7 @@ use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 
-use crate::authenticator::Rng;
+use crate::authenticator::{Rng, rp_id_hash, rp_in_scope};
 use crate::configuration::FixedString;
 use crate::ctap2::Ctap2Status;
 use crate::error::CoreError;
@@ -451,6 +451,80 @@ impl ClientPin {
         self.allows_credential_management() && self.verify_pin_uv_auth_param(param, message)
     }
 
+    /// Permissions granted by the active PIN/UV auth token.
+    ///
+    /// The superseded `getPinToken` subcommand grants `mc` and `ga`.
+    #[must_use]
+    pub fn token_permissions(&self) -> u8 {
+        if self.legacy_token {
+            DEFAULT_PERMISSIONS
+        } else {
+            self.pin_uv_auth_permissions
+        }
+    }
+
+    /// Relying party bound to the active PIN/UV auth token, if any.
+    ///
+    /// A token issued without a permissions RP ID serves every relying party.
+    #[must_use]
+    pub fn token_rp_id(&self) -> Option<&str> {
+        self.pin_uv_auth_rp_id.as_ref().map(|rp_id| rp_id.as_str())
+    }
+
+    /// Verify a `pinUvAuthParam` against the active token within its scope.
+    ///
+    /// On top of the HMAC check, the token must carry the permission the
+    /// operation needs (`PERMISSION_MC` or `PERMISSION_GA`) and, when the
+    /// token is bound to a relying party, the request must come from that
+    /// same relying party.
+    #[must_use]
+    pub fn verify_scoped_auth_param(
+        &self,
+        param: &[u8],
+        message: &[u8],
+        required_permission: u8,
+        request_rp_id: &str,
+    ) -> bool {
+        if self.pin_uv_auth_token.is_none() {
+            return false;
+        }
+        if self.token_permissions() & required_permission == 0 {
+            return false;
+        }
+        if !rp_in_scope(request_rp_id, self.token_rp_id()) {
+            return false;
+        }
+        self.verify_pin_uv_auth_param(param, message)
+    }
+
+    /// Whether the active token may drive `enumerateRPsBegin`.
+    ///
+    /// The enumeration of relying parties is global, so it requires a token
+    /// that is not bound to a single relying party.
+    #[must_use]
+    pub fn allows_enumerate_rps(&self) -> bool {
+        self.allows_credential_management() && self.pin_uv_auth_rp_id.is_none()
+    }
+
+    /// Whether the active token may enumerate the credentials of a relying
+    /// party.
+    ///
+    /// `requested_hash` is the hash of the relying party the client asks for.
+    #[must_use]
+    pub fn allows_enumerate_credentials(&self, requested_hash: &[u8; 32]) -> bool {
+        self.allows_credential_management()
+            && match &self.pin_uv_auth_rp_id {
+                None => true,
+                Some(bound) => &rp_id_hash(bound.as_str()) == requested_hash,
+            }
+    }
+
+    /// Whether the active token may delete a credential of a relying party.
+    #[must_use]
+    pub fn allows_delete_credential(&self, credential_rp_id: &str) -> bool {
+        self.allows_credential_management() && rp_in_scope(credential_rp_id, self.token_rp_id())
+    }
+
     /// `getPINRetries`.
     #[must_use]
     pub fn get_retries(&self, state: &impl PinState) -> GetRetriesResponse {
@@ -746,11 +820,14 @@ impl ClientPin {
     }
 }
 
+/// Helpers shared by the unit tests of this crate.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
 
-    struct TestRng(u32);
+    /// Deterministic randomness for the tests.
+    pub(crate) struct TestRng(pub u32);
+
     impl Rng for TestRng {
         fn fill_bytes(&mut self, dest: &mut [u8]) {
             for byte in dest {
@@ -760,10 +837,13 @@ mod tests {
         }
     }
 
+    /// In-memory PIN state.
     #[derive(Default)]
-    struct TestPinState {
-        hash: Option<[u8; 32]>,
-        retries: u8,
+    pub(crate) struct TestPinState {
+        /// Stored PIN hash.
+        pub(crate) hash: Option<[u8; 32]>,
+        /// Remaining retries.
+        pub(crate) retries: u8,
     }
 
     impl PinState for TestPinState {
@@ -788,14 +868,15 @@ mod tests {
         }
     }
 
-    /// A platform-side helper driving the PIN protocol.
-    struct Platform {
+    /// The platform side of the PIN protocol.
+    pub(crate) struct Platform {
         private: [u8; 32],
-        public: Ec2KeyAgreement,
+        /// The public key of the platform key agreement.
+        pub(crate) public: Ec2KeyAgreement,
     }
 
     impl Platform {
-        fn new(rng: &mut TestRng) -> Self {
+        pub(crate) fn new(rng: &mut TestRng) -> Self {
             let secret = generate_secret_key(rng).unwrap();
             let point = secret.public_key().to_sec1_point(false);
             let mut x = [0u8; 32];
@@ -810,10 +891,109 @@ mod tests {
             }
         }
 
-        fn shared(&self, authenticator: &Ec2KeyAgreement) -> [u8; 32] {
+        pub(crate) fn shared(&self, authenticator: &Ec2KeyAgreement) -> [u8; 32] {
             shared_secret(&self.private, authenticator).unwrap()
         }
     }
+
+    /// A PIN/UV auth token issued by the platform.
+    pub(crate) struct IssuedToken {
+        /// The authenticator handler holding the token.
+        pub(crate) client_pin: ClientPin,
+        /// The PIN state of the authenticator.
+        pub(crate) state: TestPinState,
+        /// The raw token, used to build the `pinUvAuthParam` of a request.
+        pub(crate) token: [u8; 32],
+        /// The platform key agreement key.
+        pub(crate) platform: Platform,
+        /// The shared secret of the key agreement.
+        pub(crate) shared: [u8; 32],
+    }
+
+    /// Provision the PIN and issue a PIN/UV auth token.
+    ///
+    /// The subcommand, the permissions and the permissions RP ID are passed
+    /// verbatim, so the tests can exercise the validation of the issuance
+    /// path.
+    pub(crate) fn try_issue_token(
+        sub_command: u8,
+        permissions: Option<u8>,
+        rp_id: Option<&str>,
+    ) -> Result<IssuedToken, Ctap2Status> {
+        let mut rng = TestRng(1);
+        let mut client_pin = ClientPin::new();
+        let mut state = TestPinState::default();
+        let key_agreement = client_pin.key_agreement(&mut rng).unwrap();
+        let platform = Platform::new(&mut rng);
+        let shared = platform.shared(&key_agreement.key);
+
+        let mut padded = [0u8; 64];
+        padded[..4].copy_from_slice(b"1234");
+        let mut new_pin_enc = [0u8; 64];
+        let length = aes_cbc_encrypt(&shared, &padded, &mut new_pin_enc).unwrap();
+        let auth = hmac_sha256(&shared, &new_pin_enc[..length]);
+        let request = ClientPinRequest {
+            protocol: 1,
+            sub_command: SUB_SET_PIN,
+            key_agreement: Some(platform.public),
+            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
+            new_pin_enc: Some(heapless::Vec::from_slice(&new_pin_enc[..length]).unwrap()),
+            pin_hash_enc: None,
+            permissions: None,
+            rp_id: None,
+        };
+        client_pin.set_pin(&request, &mut state)?;
+
+        let hash = pin_hash(b"1234");
+        let mut pin_hash_enc = [0u8; 16];
+        let length = aes_cbc_encrypt(&shared, &hash[..16], &mut pin_hash_enc).unwrap();
+        let auth = hmac_sha256(&shared, &pin_hash_enc[..length]);
+        let request = ClientPinRequest {
+            protocol: 1,
+            sub_command,
+            key_agreement: Some(platform.public),
+            pin_uv_auth_param: Some(heapless::Vec::from_slice(&auth).unwrap()),
+            new_pin_enc: None,
+            pin_hash_enc: Some(heapless::Vec::from_slice(&pin_hash_enc[..length]).unwrap()),
+            permissions,
+            rp_id: rp_id.map(|id| FixedString::new(id).expect("rp id fits")),
+        };
+        let response = client_pin.get_pin_token(&request, &mut state, &mut rng)?;
+        let mut token = [0u8; 32];
+        let length = aes_cbc_decrypt(&shared, &response.token, &mut token).unwrap();
+        assert_eq!(length, 32);
+        Ok(IssuedToken {
+            client_pin,
+            state,
+            token,
+            platform,
+            shared,
+        })
+    }
+
+    /// Provision the PIN and issue a PIN/UV auth token.
+    ///
+    /// `permissions` selects `getPinUvAuthTokenUsingPinWithPermissions`; `None`
+    /// issues the legacy `getPinToken` token. `rp_id` binds the token to a
+    /// relying party.
+    pub(crate) fn issue_token(permissions: Option<u8>, rp_id: Option<&str>) -> IssuedToken {
+        let sub_command = match permissions {
+            Some(_) => SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS,
+            None => SUB_GET_PIN_TOKEN,
+        };
+        try_issue_token(sub_command, permissions, rp_id).unwrap()
+    }
+
+    /// Build the `pinUvAuthParam` of a request with the issued token.
+    pub(crate) fn auth_param(token: &[u8; 32], message: &[u8]) -> [u8; 32] {
+        hmac_sha256(token, message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{Platform, TestPinState, TestRng};
+    use super::*;
 
     fn set_pin_from_plaintext(
         seed: u32,
@@ -1400,5 +1580,230 @@ mod tests {
             authenticator.get_pin_token(&request, &mut state, &mut rng),
             Err(Ctap2Status::InvalidParameter)
         );
+    }
+
+    #[test]
+    fn token_with_mc_permission_is_refused_on_get_assertion() {
+        use super::test_support::{auth_param, issue_token};
+
+        let issued = issue_token(Some(PERMISSION_MC), None);
+        let message = [0x33u8; 32];
+        let param = auth_param(&issued.token, &message);
+
+        // The `mc` permission does not authorise an assertion.
+        assert!(!issued.client_pin.verify_scoped_auth_param(
+            &param,
+            &message,
+            PERMISSION_GA,
+            "a.test"
+        ));
+        assert!(issued.client_pin.verify_scoped_auth_param(
+            &param,
+            &message,
+            PERMISSION_MC,
+            "a.test"
+        ));
+    }
+
+    #[test]
+    fn token_with_ga_permission_is_refused_on_make_credential() {
+        use super::test_support::{auth_param, issue_token};
+
+        let issued = issue_token(Some(PERMISSION_GA), None);
+        let message = [0x34u8; 32];
+        let param = auth_param(&issued.token, &message);
+
+        // The `ga` permission does not authorise a credential creation.
+        assert!(!issued.client_pin.verify_scoped_auth_param(
+            &param,
+            &message,
+            PERMISSION_MC,
+            "a.test"
+        ));
+        assert!(issued.client_pin.verify_scoped_auth_param(
+            &param,
+            &message,
+            PERMISSION_GA,
+            "a.test"
+        ));
+    }
+
+    #[test]
+    fn token_bound_to_rp_is_refused_for_another_rp() {
+        use super::test_support::{auth_param, issue_token};
+
+        let issued = issue_token(Some(PERMISSION_MC | PERMISSION_GA), Some("a.test"));
+        let message = [0x35u8; 32];
+        let param = auth_param(&issued.token, &message);
+
+        for permission in [PERMISSION_MC, PERMISSION_GA] {
+            assert!(
+                issued
+                    .client_pin
+                    .verify_scoped_auth_param(&param, &message, permission, "a.test")
+            );
+            assert!(
+                !issued
+                    .client_pin
+                    .verify_scoped_auth_param(&param, &message, permission, "b.test")
+            );
+            // The comparison is exact and case sensitive.
+            assert!(
+                !issued
+                    .client_pin
+                    .verify_scoped_auth_param(&param, &message, permission, "A.test")
+            );
+        }
+    }
+
+    #[test]
+    fn token_without_rp_binding_serves_any_rp() {
+        use super::test_support::{auth_param, issue_token};
+
+        let issued = issue_token(Some(PERMISSION_MC | PERMISSION_GA), None);
+        assert_eq!(issued.client_pin.token_rp_id(), None);
+        let message = [0x36u8; 32];
+        let param = auth_param(&issued.token, &message);
+
+        for rp_id in ["a.test", "b.test"] {
+            assert!(issued.client_pin.verify_scoped_auth_param(
+                &param,
+                &message,
+                PERMISSION_MC,
+                rp_id
+            ));
+            assert!(issued.client_pin.verify_scoped_auth_param(
+                &param,
+                &message,
+                PERMISSION_GA,
+                rp_id
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_token_is_accepted_by_make_credential_and_get_assertion() {
+        use super::test_support::{auth_param, issue_token};
+
+        let issued = issue_token(None, None);
+        assert_eq!(issued.client_pin.token_permissions(), DEFAULT_PERMISSIONS);
+        assert_eq!(issued.client_pin.token_rp_id(), None);
+        let message = [0x37u8; 32];
+        let param = auth_param(&issued.token, &message);
+
+        for rp_id in ["a.test", "b.test"] {
+            assert!(issued.client_pin.verify_scoped_auth_param(
+                &param,
+                &message,
+                PERMISSION_MC,
+                rp_id
+            ));
+            assert!(issued.client_pin.verify_scoped_auth_param(
+                &param,
+                &message,
+                PERMISSION_GA,
+                rp_id
+            ));
+        }
+
+        // The legacy token still drives credential management.
+        assert!(issued.client_pin.allows_credential_management());
+        assert!(issued.client_pin.allows_enumerate_rps());
+    }
+
+    #[test]
+    fn enumerate_rps_requires_a_token_without_rp_binding() {
+        use super::test_support::issue_token;
+
+        // A token bound to a relying party cannot enumerate the relying
+        // parties of the device.
+        let bound = issue_token(Some(PERMISSION_CM), Some("a.test"));
+        assert!(!bound.client_pin.allows_enumerate_rps());
+
+        // A token without a binding may.
+        let unbound = issue_token(Some(PERMISSION_CM), None);
+        assert!(unbound.client_pin.allows_enumerate_rps());
+    }
+
+    #[test]
+    fn enumerate_credentials_is_restricted_to_the_bound_rp() {
+        use super::test_support::issue_token;
+
+        let issued = issue_token(Some(PERMISSION_CM), Some("a.test"));
+        let bound = rp_id_hash("a.test");
+        let other = rp_id_hash("b.test");
+
+        assert!(issued.client_pin.allows_enumerate_credentials(&bound));
+        assert!(!issued.client_pin.allows_enumerate_credentials(&other));
+    }
+
+    #[test]
+    fn supported_permissions_are_still_accepted() {
+        use super::test_support::try_issue_token;
+
+        // Every supported permission is granted.
+        for permissions in [
+            PERMISSION_MC,
+            PERMISSION_GA,
+            PERMISSION_CM,
+            SUPPORTED_PERMISSIONS,
+        ] {
+            let issued = try_issue_token(
+                SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS,
+                Some(permissions),
+                None,
+            )
+            .unwrap();
+            assert_eq!(issued.client_pin.token_permissions(), permissions);
+        }
+
+        // Zero permissions are rejected.
+        assert_eq!(
+            try_issue_token(SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS, Some(0), None).err(),
+            Some(Ctap2Status::InvalidParameter)
+        );
+
+        // Unsupported permissions are rejected.
+        assert_eq!(
+            try_issue_token(
+                SUB_GET_PIN_UV_AUTH_TOKEN_WITH_PERMISSIONS,
+                Some(PERMISSION_BE | PERMISSION_LBW),
+                None
+            )
+            .err(),
+            Some(Ctap2Status::UnauthorizedPermission)
+        );
+
+        // The superseded subcommand takes neither parameter.
+        assert_eq!(
+            try_issue_token(SUB_GET_PIN_TOKEN, Some(PERMISSION_CM), None).err(),
+            Some(Ctap2Status::InvalidParameter)
+        );
+        assert_eq!(
+            try_issue_token(SUB_GET_PIN_TOKEN, None, Some("a.test")).err(),
+            Some(Ctap2Status::InvalidParameter)
+        );
+    }
+
+    #[test]
+    fn change_pin_invalidates_token_scopes() {
+        use super::test_support::issue_token;
+
+        let mut issued = issue_token(Some(PERMISSION_MC | PERMISSION_CM), Some("a.test"));
+        assert_eq!(
+            issued.client_pin.token_permissions(),
+            PERMISSION_MC | PERMISSION_CM
+        );
+        assert_eq!(issued.client_pin.token_rp_id(), Some("a.test"));
+
+        let request = change_pin_request(&issued.platform, &issued.shared, b"1234", b"567890");
+        assert_eq!(
+            issued.client_pin.change_pin(&request, &mut issued.state),
+            Ok(())
+        );
+        assert_eq!(issued.client_pin.token_permissions(), 0);
+        assert_eq!(issued.client_pin.token_rp_id(), None);
+        assert!(!issued.client_pin.allows_credential_management());
+        assert!(!issued.client_pin.allows_enumerate_rps());
     }
 }

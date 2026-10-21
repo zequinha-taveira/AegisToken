@@ -14,7 +14,7 @@ Documento vivo: cada fase é marcada conforme concluída e verificada.
 | 4 | Protocolo Management HID | Concluída |
 | 5 | Storage persistente + armazenamento seguro | Concluída |
 | 6 | User Presence contextual (BOOTSEL) | Concluída |
-| 7 | FIDO (CTAP1/U2F + CTAP2) | Concluída (7a–7e) |
+| 7 | FIDO (CTAP1/U2F + CTAP2) | Concluída (7a–7g) |
 | 8 | Atualização segura de firmware | Concluída |
 | 9 | Recovery + lifecycle completo | Concluída |
 | 10 | Validação de hardware (AC-001..AC-015) | Concluída (bootrom/OTP pendentes) |
@@ -119,24 +119,24 @@ dispositivo (composite) com funções independentes:
 
 - **HID FIDO** (usage page `0xF1D0`): destinada exclusivamente à autenticação —
   CTAP1/U2F e CTAP2/FIDO2 (WebAuthn, passkeys).
-- **HID Keyboard** (HID Keyboard convencional): permite ao firmware emitir
-  eventos de teclado ao host quando uma funcionalidade específica do produto
-  solicitar.
 - **HID Management** (vendor-defined `0xFF00`): gestão, configuração,
   diagnóstico e atualização de firmware.
+- **HID OTP Lab** (vendor-defined `0xFF51`, só no perfil `yubikey5-lab`):
+  diagnóstico experimental; não emite teclas nem manipula segredos.
 
 **Invariantes**
 
 - As interfaces devem permanecer **logicamente separadas**.
-- Operações FIDO **nunca** dependem da interface Keyboard nem da Management.
-- A interface HID Keyboard é **opcional e desabilitada por padrão**; sua
-  habilitação é governada pelo lifecycle e por User Presence e nunca é
-  alcançável a partir do caminho de entrada FIDO. (Uma interface de teclado ao
-  lado de um autenticador FIDO reproduz a forma de um ataque *BadUSB*; a
-  separação lógica sozinha não basta.)
+- Operações FIDO **nunca** dependem da interface Management ou OTP Lab.
+- **Nenhuma interface de teclado é exposta.** O PRD previa uma HID Keyboard
+  opcional, mas o produto decide não expô-la: uma interface de teclado ao
+  lado de um autenticador FIDO reproduz a forma de um ataque *BadUSB*, e a
+  separação lógica sozinha não basta. Se um dia existir, ela será opcional,
+  desabilitada por padrão, governada pelo lifecycle e por User Presence, e
+  nunca alcançável a partir do caminho de entrada FIDO.
 
-**Estado:** HID FIDO e HID Management implementadas na Fase 3. HID Keyboard
-planejada (ainda não implementada).
+**Estado:** HID FIDO, HID Management e HID OTP Lab implementadas (Fases 3 e
+11). Nenhuma interface de teclado.
 
 ## Gates de verificação (todas as fases)
 
@@ -483,8 +483,89 @@ adiado.
 - O firmware anuncia `FIDO_2_0` (não `FIDO_2_1`): `makeCredential` com a opção
   `uv` não é exigida, e a mutação de *user information* (0x07) e o
   `largeBlobKey` (0x0B) não são implementados.
-- O par RP/credencial da plataforma é verificado pela permissão `cm` e, para
-  tokens com `rpId` associado, apenas o escopo do RP é considerado.
+- ~~O par RP/credencial da plataforma é verificado pela permissão `cm` e, para
+  tokens com `rpId` associado, apenas o escopo do RP é considerado.~~
+  **Entregue na fatia 7g:** o token passa a ser escopado por operação e por
+  RP (`enumerateRPsBegin` exige token sem vínculo; `deleteCredential` e
+  `enumerateCredentialsBegin` ficam restritos ao RP vinculado).
+
+### 7f — `getNextAssertion` e regra de User Verification (concluída)
+
+**Entregue**
+
+- `authenticatorGetNextAssertion` (0x08): a resposta de `getAssertion` passa a
+  informar `numberOfCredentials` (0x05) e o firmware guarda os candidatos
+  (credencial, RP e *client data hash*) para servir os demais, um por
+  comando, como a CTAP2.1 determina. Sem estado anterior, o comando responde
+  `NoCredentials`.
+- `aegis-core::authenticator`: `assertion_candidates` (ordem da allow list;
+  sem allow list, todas as credenciais residentes do RP) e `sign_assertion`
+  (assinatura de uma credencial específica).
+- **Correção de segurança e de conformidade:** o `pinUvAuthParam` inválido
+  passou a ser rejeitado (`PinAuthInvalid` 0x33) em vez de ser ignorado
+  silenciosamente, e, com PIN configurado, `makeCredential`/`getAssertion`
+  exigem a prova do PIN (`PinRequired` 0x36) — como em um autenticador real.
+  Sem PIN, o fluxo continua somente com User Presence.
+
+**Verificação**
+
+- 228 testes de host em `aegis-core` (3 novos: ordem dos candidatos, contagem
+  de credenciais e assinatura do próximo candidato), clippy limpo em host e
+  alvo, build de firmware e UF2 gerados.
+- `scripts/validate_fido.py --pin <PIN>` prova o PIN em todas as operações e
+  exercita a rotação e a enumeração em hardware.
+
+**Limitações registradas**
+
+- Com PIN configurado, clientes que não provem o PIN recebem `PinRequired`:
+  é o comportamento esperado, mas exige que o validador use `--pin`.
+
+### 7g — Escopo do `pinUvAuthToken` (permissão por operação + vínculo por RP) (concluída)
+
+**Entregue**
+
+- **Correção de segurança:** o `pinUvAuthToken` passa a ser escopado. A
+  verificação usada em `makeCredential`/`getAssertion` combina o HMAC do
+  `clientDataHash`, a **permissão exigida pela operação** (`mc` em
+  `makeCredential`, `ga` em `getAssertion`) e a comparação do *permissions RP
+  ID* com o `rp.id` da requisição. Token sem vínculo de RP serve qualquer RP;
+  token vinculado a `R` serve apenas `R` (comparação exata e sensível a
+  caixa). Falha → `PinAuthInvalid` (0x33), **abortando a operação antes de
+  qualquer efeito**: nenhuma credencial criada, nenhuma asserção assinada,
+  nenhuma credencial removida e a flag `UV` não gravada no `authenticatorData`.
+- `aegis-core::pin`: `token_permissions`, `token_rp_id`,
+  `verify_scoped_auth_param`, `allows_enumerate_rps`,
+  `allows_enumerate_credentials` e `allows_delete_credential`. As primitivas
+  `verify_pin_uv_auth_param` (verificação pura do HMAC) e
+  `allows_credential_management` (capacidade `cm`) permanecem com a semântica
+  anterior.
+- `aegis-core::authenticator`: `rp_in_scope` e `delete_credential_scoped` — a
+  credencial apagada precisa pertencer ao RP vinculado ao token; credencial de
+  outro RP é recusada e **preservada** no store.
+- `enumerateRPsBegin` passa a exigir token com capacidade `cm` **sem** RP
+  vinculado (a enumeração de RPs é global); `enumerateCredentialsBegin` exige
+  que o `rpIdHash` pedido seja o do RP vinculado.
+
+**Verificação**
+
+- 239 testes de host em `aegis-core` (11 novos: escopo por operação, escopo
+  por RP, token sem vínculo, compatibilidade do token legado, `enumerateRPs`,
+  `enumerateCredentials`, `deleteCredential`, permissões suportadas e
+  invalidação pelo `changePIN`), clippy limpo em host e alvo, build de firmware
+  e UF2 gerados.
+
+**Limitações registradas**
+
+- O token do `getPinToken` legado continua sem vínculo de RP e concede
+  `mc|ga`: a proteção de escopo por RP só existe para tokens emitidos por
+  `getPinUvAuthTokenUsingPinWithPermissions` com `rpId` (compatibilidade
+  CTAP2.0). Desvio documentado em `docs/security-model.md`.
+- O token legado continua autorizando credential management (o PIN já foi
+  provado); a CTAP2.1 estrita exigiria `cm` explícito — slice própria, com
+  impacto de compatibilidade.
+- A validação de ponta a ponta em dispositivo físico (token com permissão ou
+  RP errada contra o firmware flashed) está pendente: não há RP2350 físico
+  nesta sessão. `scripts/validate_fido.py` é o candidato natural.
 
 ### 7d — CTAP1/U2F (concluída)
 

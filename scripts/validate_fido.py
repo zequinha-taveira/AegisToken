@@ -20,6 +20,7 @@ Exit code is 0 when every check passes, 1 otherwise.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import sys
 
@@ -46,6 +47,21 @@ def record(ac: str, passed: bool, detail: str = "") -> None:
 def find_device():
     devices = list(CtapHidDevice.list_devices())
     return devices[0] if devices else None
+
+
+def pin_uv_auth(token: bytes, client_data_hash: bytes) -> bytes:
+    """PIN/UV auth parameter: LEFT(HMAC-SHA-256(token, clientDataHash), 16)."""
+    return hmac.new(token, client_data_hash, hashlib.sha256).digest()[:16]
+
+
+def pin_uv_params(token: bytes | None, client_data_hash: bytes) -> dict:
+    """Parameters that prove the PIN to the authenticator."""
+    if token is None:
+        return {}
+    return {
+        "pin_uv_param": pin_uv_auth(token, client_data_hash),
+        "pin_uv_protocol": 1,
+    }
 
 
 def check_fido(device) -> bool:
@@ -76,14 +92,16 @@ def check_u2f(device) -> None:
         record("U2F VERSION", False, str(exc))
 
 
-def check_make_credential(device) -> bool:
+def check_make_credential(device, token: bytes | None = None) -> bool:
     print(">>> Press BOOTSEL within 15s to approve makeCredential")
     try:
+        client_data_hash = hashlib.sha256(os.urandom(32)).digest()
         attestation = Ctap2(device).make_credential(
-            hashlib.sha256(os.urandom(32)).digest(),
+            client_data_hash,
             {"id": "example.com", "name": "Example"},
             {"id": os.urandom(16), "name": "user@example.com"},
             [{"type": "public-key", "alg": -7}],
+            **pin_uv_params(token, client_data_hash),
         )
         record("AC-011 makeCredential (UP)", True, f"fmt={attestation.fmt}")
         return True
@@ -92,14 +110,16 @@ def check_make_credential(device) -> bool:
         return False
 
 
-def check_make_credential_eddsa(device) -> bool:
+def check_make_credential_eddsa(device, token: bytes | None = None) -> bool:
     print(">>> Press BOOTSEL within 15s to approve makeCredential (EdDSA)")
     try:
+        client_data_hash = hashlib.sha256(os.urandom(32)).digest()
         attestation = Ctap2(device).make_credential(
-            hashlib.sha256(os.urandom(32)).digest(),
+            client_data_hash,
             {"id": "example.com", "name": "Example"},
             {"id": os.urandom(16), "name": "user@example.com"},
             [{"type": "public-key", "alg": -8}],
+            **pin_uv_params(token, client_data_hash),
         )
         key = attestation.auth_data.credential_data.public_key
         alg = getattr(key, "ALGORITHM", None)
@@ -110,11 +130,14 @@ def check_make_credential_eddsa(device) -> bool:
         return False
 
 
-def check_get_assertion_eddsa(device) -> None:
+def check_get_assertion_eddsa(device, token: bytes | None = None) -> None:
     print(">>> Press BOOTSEL within 15s to approve getAssertion (EdDSA)")
     try:
+        client_data_hash = hashlib.sha256(os.urandom(32)).digest()
         assertion = Ctap2(device).get_assertion(
-            "example.com", hashlib.sha256(os.urandom(32)).digest()
+            "example.com",
+            client_data_hash,
+            **pin_uv_params(token, client_data_hash),
         )
         record(
             "AC-020 getAssertion Ed25519 (UP)",
@@ -125,11 +148,14 @@ def check_get_assertion_eddsa(device) -> None:
         record("AC-020 getAssertion Ed25519 (UP)", False, str(exc))
 
 
-def check_get_assertion(device) -> None:
+def check_get_assertion(device, token: bytes | None = None) -> None:
     print(">>> Press BOOTSEL within 15s to approve getAssertion")
     try:
+        client_data_hash = hashlib.sha256(os.urandom(32)).digest()
         assertion = Ctap2(device).get_assertion(
-            "example.com", hashlib.sha256(os.urandom(32)).digest()
+            "example.com",
+            client_data_hash,
+            **pin_uv_params(token, client_data_hash),
         )
         record("AC-011 getAssertion (UP)", True, f"sig={len(assertion.signature)}B")
     except Exception as exc:  # noqa: BLE001
@@ -201,16 +227,18 @@ def check_credential_management(device, pin_value: str) -> None:
         record("CTAP2 credMgmt enumerateCredentials", False, str(exc))
 
 
-def check_resident_credential(device) -> None:
+def check_resident_credential(device, token: bytes | None = None) -> None:
     """Create a discoverable credential so the enumeration has content."""
     print(">>> Press BOOTSEL within 15s to approve makeCredential (resident)")
     try:
+        client_data_hash = hashlib.sha256(os.urandom(32)).digest()
         Ctap2(device).make_credential(
-            hashlib.sha256(os.urandom(32)).digest(),
+            client_data_hash,
             {"id": "example.com", "name": "Example"},
             {"id": os.urandom(16), "name": "user@example.com"},
             [{"type": "public-key", "alg": -7}],
-            rk=True,
+            options={"rk": True},
+            **pin_uv_params(token, client_data_hash),
         )
         record("AC-011 makeCredential resident (UP)", True)
     except Exception as exc:  # noqa: BLE001
@@ -260,16 +288,27 @@ def main() -> int:
     if not check_fido(device):
         return summarize()
 
-    if check_make_credential(device):
-        check_get_assertion(device)
-    if check_make_credential_eddsa(device):
-        check_get_assertion_eddsa(device)
+    # A PIN on the device means every FIDO operation must prove it.
+    token = None
+    if pin_value is not None:
+        try:
+            token = ClientPin(Ctap2(device)).get_pin_token(pin_value)
+            record("clientPIN getPinToken", True)
+        except Exception as exc:  # noqa: BLE001
+            record("clientPIN getPinToken", False, str(exc))
+            token = None
+
+    if check_make_credential(device, token):
+        check_get_assertion(device, token)
+    if check_make_credential_eddsa(device, token):
+        check_get_assertion_eddsa(device, token)
     check_client_pin(device)
 
     if pin_value is not None:
-        check_change_pin(device, pin_value)
-        check_resident_credential(device)
+        check_resident_credential(device, token)
         check_credential_management(device, pin_value)
+        # The rotation invalidates every issued token, so it runs last.
+        check_change_pin(device, pin_value)
 
     # AC-013: the FIDO protocol exposes no credential or key export operation.
     record("AC-013 no credential export API", True, "protocol has no export command")
