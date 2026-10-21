@@ -432,6 +432,9 @@ pub struct ManagementService {
 impl ManagementService {
     /// Create a service for a device with the given capabilities, board
     /// identity and initial configuration.
+    ///
+    /// The boot plan starts closed (no FIDO, no CCID): the firmware records
+    /// the real plan with [`ManagementService::set_boot_plan`] at boot.
     #[must_use]
     pub const fn new(
         capabilities: DeviceCapabilities,
@@ -445,7 +448,7 @@ impl ManagementService {
             lifecycle: LifecycleManager::new(lifecycle),
             config,
             staged: None,
-            boot_plan: BootPlan::for_destination(ExecutionState::Active),
+            boot_plan: BootPlan::for_destination(ExecutionState::Boot),
         }
     }
 
@@ -866,6 +869,33 @@ mod tests {
         let report: DiagnosticsReport = codec::decode_from(&response.payload).unwrap();
         assert_eq!(report.lifecycle, LifecycleState::Factory as u8);
         assert_eq!(report.gpio_count, 30);
+    }
+
+    #[test]
+    fn diagnostics_report_shows_the_boot_plan() {
+        let mut service = service();
+        // Without a plan the report is closed: a caller that forgets to
+        // record it must not claim that the device is serving FIDO.
+        let response = service.handle(ManagementCommand::GetDiagnostics, &[]);
+        let report: DiagnosticsReport = codec::decode_from(&response.payload).unwrap();
+        assert!(!report.fido_enabled);
+        assert!(!report.ccid_enabled);
+
+        // A device muted by the boot plan must be distinguishable from a
+        // broken one through the Management path.
+        service.set_boot_plan(BootPlan::for_destination(ExecutionState::Recovery));
+        let response = service.handle(ManagementCommand::GetDiagnostics, &[]);
+        let report: DiagnosticsReport = codec::decode_from(&response.payload).unwrap();
+        assert_eq!(report.boot_destination, ExecutionState::Recovery as u8);
+        assert!(!report.fido_enabled);
+        assert!(!report.ccid_enabled);
+
+        service.set_boot_plan(BootPlan::for_destination(ExecutionState::Active));
+        let response = service.handle(ManagementCommand::GetDiagnostics, &[]);
+        let report: DiagnosticsReport = codec::decode_from(&response.payload).unwrap();
+        assert_eq!(report.boot_destination, ExecutionState::Active as u8);
+        assert!(report.fido_enabled);
+        assert!(report.ccid_enabled);
     }
 
     #[test]

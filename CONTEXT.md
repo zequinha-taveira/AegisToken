@@ -6,7 +6,7 @@ Universal firmware for the RP2350 family (RP2350A/B + RP2354A/B, one binary with
 
 - USB product: `AegisToken FIDO2 USB Authenticator`, VID `0x1209` PID `0x0001` (generic profile). Third-party boards use VID `0x2E8A` + allocated PID (see `README.md` table).
 - Release artifact: `rp2350-universal.uf2` via `scripts/build-uf2.ps1`.
-- Status: phases 0–15 done; 16 (RSA-2048) and 17 (applet conformance) in firmware, hardware validation pending. FIDO slices 7a–7g done (sealed credential store, CTAPHID keepalive, CTAP2.1 credential management + `changePIN`, `getNextAssertion`, PIN enforcement, scoped `pinUvAuthToken`). See `roadmap.md` and `validation.md` (AC-001..AC-021).
+- Status: phases 0–15 done; 16 (RSA-2048) and 17 (applet conformance) in firmware, hardware validation pending. FIDO slices 7a–7h done (sealed credential store, CTAPHID keepalive, CTAP2.1 credential management + `changePIN`, `getNextAssertion`, PIN enforcement, scoped `pinUvAuthToken`, boot-plan gating). See `roadmap.md` and `validation.md` (AC-001..AC-021).
 
 ## USB interfaces (strictly separated)
 
