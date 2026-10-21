@@ -28,6 +28,7 @@ pub mod aid;
 pub mod apdu;
 pub mod card;
 pub mod ccid;
+pub mod ecdh;
 pub mod oath;
 pub mod openpgp;
 pub mod pin;

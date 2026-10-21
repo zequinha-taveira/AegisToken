@@ -80,6 +80,13 @@ The `pinUvAuthToken` is a live proof of user verification and is scoped:
   never asked for, and receives no credential id or user handle. The state is
   only created for a request that produced a signature
   (`aegis-core::assertion`, host-tested).
+- **The credential count follows the CTAP 2.1 rules and is never truncated.**
+  `numberOfCredentials` is present only when more than one credential matched
+  and the request carried no allow list; it is absent with an allow list, with
+  a single match and in the continuation responses. A store holding more
+  matching credentials than the limit is reported as `LimitExceeded` instead
+  of silently dropping a credential, so the count can never understate the
+  number of candidates (`aegis-core::authenticator`, host-tested).
 - **The scope check is pure core logic.** It lives in `aegis-core` (`pin` and
   `authenticator`), with no HAL, executor or storage dependency; the firmware
   only hands over the relying party, the credential id and the `rpIdHash` of
@@ -133,6 +140,14 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
 - **Secrets are sealed at rest.** Credential keys, OATH secrets, PIN-derived
   values and data objects are stored in sealed records (AES-256-GCM under the
   OTP root key); no applet response can export them.
+- **The ECDH shared secret never leaves the card.** The OpenPGP decryption
+  path follows RFC 6637: the card derives the key-encryption key from the
+  shared point (KDF of RFC 6637 §7) and unwraps the session key (AES key wrap
+  of RFC 3394) itself. While that material is not provisioned, `PSO:DECIPHER`
+  fails closed with `6A81` instead of returning the shared secret — a
+  decryption card must be the only authority that can decrypt. The primitives
+  live in `aegis-applets::ecdh`, covered by the RFC 3394 test vectors and a
+  reference value of the KDF.
 - **Each signing operation honours its touch policy.** When a slot or
   credential requires touch, the applet arms the contextual presence machine
   and fails with the applet's standard error on absence or timeout.

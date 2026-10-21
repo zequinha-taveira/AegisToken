@@ -320,8 +320,10 @@ pub struct GetAssertionResponse {
     /// Total number of credentials matching the request.
     ///
     /// The platform fetches the remaining ones with
-    /// `authenticatorGetNextAssertion`.
-    pub number_of_credentials: u32,
+    /// `authenticatorGetNextAssertion`. The CTAP 2.1 rules forbid the member
+    /// when the request carried an allow list, when the count is one, and in
+    /// the continuation responses: it is absent in those cases.
+    pub number_of_credentials: Option<u32>,
 }
 
 impl<C> minicbor::Encode<C> for GetAssertionResponse {
@@ -330,7 +332,11 @@ impl<C> minicbor::Encode<C> for GetAssertionResponse {
         e: &mut Encoder<W>,
         _ctx: &mut C,
     ) -> Result<(), minicbor::encode::Error<W::Error>> {
-        e.map(5)?;
+        e.map(if self.number_of_credentials.is_some() {
+            5
+        } else {
+            4
+        })?;
         // credential: PublicKeyCredentialDescriptor (text keys, canonical order).
         e.u8(1)?;
         e.map(2)?;
@@ -347,10 +353,25 @@ impl<C> minicbor::Encode<C> for GetAssertionResponse {
         e.map(1)?;
         e.str("id")?;
         e.bytes(&self.user_id)?;
-        e.u8(5)?;
-        e.u32(self.number_of_credentials)?;
+        if let Some(count) = self.number_of_credentials {
+            e.u8(5)?;
+            e.u32(count)?;
+        }
         Ok(())
     }
+}
+
+/// The `numberOfCredentials` member of an assertion response.
+///
+/// The CTAP 2.1 rules: the member is absent when the request carried an allow
+/// list (the platform knows the candidates), absent when a single credential
+/// matched, and absent in the `authenticatorGetNextAssertion` responses.
+#[must_use]
+pub fn number_of_credentials(count: usize, has_allow_list: bool) -> Option<u32> {
+    if has_allow_list || count <= 1 {
+        return None;
+    }
+    Some(count as u32)
 }
 
 fn generate_signing_key<R: Rng>(rng: &mut R) -> Result<SigningKey, Ctap2Status> {
@@ -554,7 +575,7 @@ pub fn get_assertion<S: CredentialStore, R: Rng>(
         return Err(Ctap2Status::PinAuthInvalid);
     }
 
-    let candidates = assertion_candidates(store, request);
+    let candidates = assertion_candidates(store, request)?;
     let Some(first) = candidates.first() else {
         return Err(Ctap2Status::NoCredentials);
     };
@@ -565,7 +586,8 @@ pub fn get_assertion<S: CredentialStore, R: Rng>(
         &request.client_data_hash,
         uv_confirmed,
     )?;
-    response.number_of_credentials = candidates.len() as u32;
+    response.number_of_credentials =
+        number_of_credentials(candidates.len(), !request.allow_list.is_empty());
     Ok(response)
 }
 
@@ -574,11 +596,13 @@ pub fn get_assertion<S: CredentialStore, R: Rng>(
 ///
 /// With an allow list the order follows the list; without one every
 /// discoverable credential of the relying party matches.
-#[must_use]
+///
+/// The list is never truncated silently: a store with more matching
+/// credentials than the limit is reported as `LimitExceeded`.
 pub fn assertion_candidates<S: CredentialStore>(
     store: &S,
     request: &GetAssertionRequest,
-) -> heapless::Vec<heapless::Vec<u8, 32>, MAX_CREDENTIALS> {
+) -> Result<heapless::Vec<heapless::Vec<u8, 32>, MAX_CREDENTIALS>, Ctap2Status> {
     let mut candidates: heapless::Vec<heapless::Vec<u8, 32>, MAX_CREDENTIALS> =
         heapless::Vec::new();
     if request.allow_list.is_empty() {
@@ -589,7 +613,9 @@ pub fn assertion_candidates<S: CredentialStore>(
             if credential.rp_id.as_str() != request.rp_id.as_str() {
                 continue;
             }
-            let _ = candidates.push(credential.id.clone());
+            candidates
+                .push(credential.id.clone())
+                .map_err(|_| Ctap2Status::LimitExceeded)?;
         }
     } else {
         for descriptor in &request.allow_list {
@@ -605,10 +631,12 @@ pub fn assertion_candidates<S: CredentialStore>(
             {
                 continue;
             }
-            let _ = candidates.push(credential.id.clone());
+            candidates
+                .push(credential.id.clone())
+                .map_err(|_| Ctap2Status::LimitExceeded)?;
         }
     }
-    candidates
+    Ok(candidates)
 }
 
 /// Sign an assertion for one specific credential.
@@ -645,7 +673,9 @@ pub fn sign_assertion<S: CredentialStore>(
         auth_data,
         signature,
         user_id: credential.user_id,
-        number_of_credentials: 1,
+        // The count belongs to the response of the first assertion; the
+        // continuation responses never carry it.
+        number_of_credentials: None,
     })
 }
 
@@ -1169,6 +1199,27 @@ mod tests {
         }
     }
 
+    /// Encode an assertion response.
+    fn encode_response(response: &GetAssertionResponse) -> heapless::Vec<u8, 256> {
+        let mut buf = [0u8; 256];
+        let len = crate::codec::encode_into(response, &mut buf).unwrap();
+        heapless::Vec::from_slice(&buf[..len]).unwrap()
+    }
+
+    /// Whether the CBOR map of a response carries the given integer key.
+    fn has_member(encoded: &[u8], key: u8) -> bool {
+        let mut decoder = minicbor::Decoder::new(encoded);
+        let members = decoder.map().expect("map").unwrap_or(0);
+        let mut found = false;
+        for _ in 0..members {
+            if decoder.i64().expect("key") == i64::from(key) {
+                found = true;
+            }
+            decoder.skip().expect("value");
+        }
+        found
+    }
+
     #[test]
     fn assertion_candidates_follow_the_allow_list() {
         let mut store = MemoryCredentialStore::new();
@@ -1180,14 +1231,14 @@ mod tests {
         // Without an allow list every discoverable credential of the RP
         // matches.
         let request = assertion_request("example.com");
-        let candidates = assertion_candidates(&store, &request);
+        let candidates = assertion_candidates(&store, &request).unwrap();
         assert_eq!(candidates.len(), 2);
 
         // With an allow list the order follows the list.
         let mut request = assertion_request("example.com");
         request.allow_list.push(descriptor(&second)).unwrap();
         request.allow_list.push(descriptor(&first)).unwrap();
-        let candidates = assertion_candidates(&store, &request);
+        let candidates = assertion_candidates(&store, &request).unwrap();
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0], second);
         assert_eq!(candidates[1], first);
@@ -1196,7 +1247,7 @@ mod tests {
         let mut request = assertion_request("example.com");
         request.allow_list.push(descriptor(&second)).unwrap();
         request.allow_list.push(descriptor(&other)).unwrap();
-        let candidates = assertion_candidates(&store, &request);
+        let candidates = assertion_candidates(&store, &request).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0], second);
     }
@@ -1210,10 +1261,10 @@ mod tests {
 
         let request = assertion_request("example.com");
         let response = get_assertion(&mut store, &mut rng, &request, true, false).unwrap();
-        assert_eq!(response.number_of_credentials, 2);
+        assert_eq!(response.number_of_credentials, Some(2));
 
         // The remaining credential is served by `authenticatorGetNextAssertion`.
-        let candidates = assertion_candidates(&store, &request);
+        let candidates = assertion_candidates(&store, &request).unwrap();
         let next = sign_assertion(
             &mut store,
             &candidates[1],
@@ -1706,6 +1757,123 @@ mod tests {
     }
 
     #[test]
+    fn number_of_credentials_follows_the_ctap21_rules() {
+        // Without an allow list and more than one match, the count is sent.
+        assert_eq!(number_of_credentials(2, false), Some(2));
+        assert_eq!(number_of_credentials(8, false), Some(8));
+        // A single credential needs no count.
+        assert_eq!(number_of_credentials(1, false), None);
+        assert_eq!(number_of_credentials(0, false), None);
+        // With an allow list the platform knows the candidates.
+        assert_eq!(number_of_credentials(2, true), None);
+    }
+
+    #[test]
+    fn the_count_member_is_absent_when_the_rules_forbid_it() {
+        let mut store = MemoryCredentialStore::new();
+        let mut rng = TestRng(43);
+        let first = resident_credential(&mut store, &mut rng, "example.com", &[1]);
+        let second = resident_credential(&mut store, &mut rng, "example.com", &[2]);
+
+        // Two matches without an allow list: the count is present.
+        let request = assertion_request("example.com");
+        let response = get_assertion(&mut store, &mut rng, &request, true, false).unwrap();
+        let encoded = encode_response(&response);
+        assert!(has_member(&encoded, 5));
+
+        // The same request with an allow list: the member is absent.
+        let mut request = assertion_request("example.com");
+        request.allow_list.push(descriptor(&first)).unwrap();
+        request.allow_list.push(descriptor(&second)).unwrap();
+        let response = get_assertion(&mut store, &mut rng, &request, true, false).unwrap();
+        let encoded = encode_response(&response);
+        assert!(!has_member(&encoded, 5));
+
+        // A single match: the member is absent.
+        let mut store = MemoryCredentialStore::new();
+        resident_credential(&mut store, &mut rng, "example.com", &[1]);
+        let request = assertion_request("example.com");
+        let response = get_assertion(&mut store, &mut rng, &request, true, false).unwrap();
+        let encoded = encode_response(&response);
+        assert!(!has_member(&encoded, 5));
+
+        // The continuation response never carries the member.
+        let candidates = assertion_candidates(&store, &request).unwrap();
+        let next = sign_assertion(
+            &mut store,
+            &candidates[0],
+            request.rp_id.as_str(),
+            &request.client_data_hash,
+            false,
+        )
+        .unwrap();
+        let encoded = encode_response(&next);
+        assert!(!has_member(&encoded, 5));
+    }
+
+    #[test]
+    fn a_candidate_list_over_the_limit_is_not_truncated_silently() {
+        // A store with more credentials than the candidate list holds: the
+        // overflow is reported instead of dropping a credential.
+        struct OverflowStore {
+            credentials: heapless::Vec<Credential, 12>,
+        }
+        impl CredentialStore for OverflowStore {
+            fn get(&self, credential_id: &[u8]) -> Option<Credential> {
+                self.credentials
+                    .iter()
+                    .find(|credential| credential.id.as_slice() == credential_id)
+                    .cloned()
+            }
+            fn find_by_rp(&self, _rp_id: &str) -> Option<Credential> {
+                None
+            }
+            fn insert(&mut self, _credential: Credential) -> Result<(), CoreError> {
+                Ok(())
+            }
+            fn next_sign_count(&mut self, _credential_id: &[u8]) -> Option<u32> {
+                Some(0)
+            }
+            fn remove(&mut self, _credential_id: &[u8]) -> Result<(), CoreError> {
+                Ok(())
+            }
+            fn count(&self) -> usize {
+                self.credentials.len()
+            }
+            fn list(&self) -> &[Credential] {
+                &self.credentials
+            }
+            fn clear(&mut self) {}
+        }
+
+        let mut store = OverflowStore {
+            credentials: heapless::Vec::new(),
+        };
+        for index in 0..(MAX_CREDENTIALS + 1) {
+            let mut id = [0u8; 32];
+            id[0] = index as u8;
+            store
+                .credentials
+                .push(Credential {
+                    id: heapless::Vec::from_slice(&id).unwrap(),
+                    rp_id: crate::configuration::FixedString::new("example.com").unwrap(),
+                    user_id: heapless::Vec::from_slice(&[index as u8]).unwrap(),
+                    private_key: [0x11; 32],
+                    algorithm: COSE_ALG_ES256,
+                    sign_count: 0,
+                    discoverable: true,
+                })
+                .unwrap();
+        }
+
+        let request = assertion_request("example.com");
+        assert_eq!(
+            assertion_candidates(&store, &request),
+            Err(Ctap2Status::LimitExceeded)
+        );
+    }
+
+    #[test]
     fn get_assertion_response_uses_text_key_entities() {
         // Regression: the WebAuthn-derived `credential` and `user` maps must use
         // text keys ("id"/"type"), not integer keys.
@@ -1714,7 +1882,7 @@ mod tests {
             auth_data: heapless::Vec::from_slice(&[0x11; 37]).unwrap(),
             signature: heapless::Vec::from_slice(&[0x22; 70]).unwrap(),
             user_id: heapless::Vec::from_slice(&[7]).unwrap(),
-            number_of_credentials: 1,
+            number_of_credentials: None,
         };
         let mut buf = [0u8; 256];
         let len = crate::codec::encode_into(&response, &mut buf).unwrap();

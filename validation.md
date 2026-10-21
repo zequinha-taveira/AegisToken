@@ -440,8 +440,9 @@ O status de hardware permanece pendente (sem RP2350 físico nesta sessão).
 
 ### Fase 7g — escopo e ciclo de vida do `pinUvAuthToken` (host; hardware pendente)
 
-Cobertos por 254 testes de host em `aegis-core` (16 novos nesta fatia: 13 em
-`pin.rs` e 3 em `authenticator.rs`; nenhuma remoção). A especificação da
+Cobertos por 258 testes de host em `aegis-core` (16 novos nesta fatia: 13 em
+`pin.rs` e 3 em `authenticator.rs`; 6 testes antigos de escopo foram
+substituídos pelos novos). A especificação da
 fatia é `specs/ctap2-token-scope.md` (AC1..AC15).
 
 | AC | Critério | Teste de host | Status |
@@ -487,7 +488,8 @@ usado numa operação com User Presence bem-sucedida perde as permissões
 
 ### Fase 7h — Recovery/Locked não servem FIDO/CCID (host; hardware pendente)
 
-Cobertos por 254 testes de host em `aegis-core` (8 novos nesta fatia) e por
+Cobertos por 258 testes de host em `aegis-core` (10 novos nesta fatia: 8 em
+`aegis-core::state`, 1 em `recovery.rs` e 1 em `management_protocol.rs`) e por
 `cargo clippy-fw` + `cargo build-fw-release` (verificação estática do wiring):
 
 | AC | Critério | Teste de host / verificação | Status |
@@ -561,6 +563,58 @@ um `clientDataHash` que não enviou.
 
 **Limitação:** a validação em hardware (dois canais CTAPHID contra o firmware
 flashado) permanece pendente — não há RP2350 físico nesta sessão.
+
+### OpenPGP ECDH: o segredo compartilhado não sai do cartão (RFC 6637, etapa S1)
+
+O applet OpenPGP **não devolve mais** o segredo ECDH ao host: `PSO:DECIPHER`
+passa a falhar fechada (`6A81`) para slots ECDH sem material RFC 6637
+provisionado. As primitivas (KDF da RFC 6637 §7, AES Key Wrap da RFC 3394 e o
+bloco de parâmetros do §8) estão em `aegis-applets::ecdh`. Spec:
+`specs/openpgp-rfc6637-ecdh.md`.
+
+| AC | Verificação | Resultado |
+|----|-------------|-----------|
+| AC-1 | KDF reproduz o vetor de referência (`SHA-256(00 00 00 01 \|\| ZB \|\| Param)`) | **Verificado** (`the_kdf_matches_the_reference_value`) |
+| AC-2 | Desembrulho reproduz os quatro vetores da RFC 3394 §4 (KEK de 128/192/256 bits, dados de 128 e 192 bits) | **Verificado** (`unwraps_the_rfc3394_vectors`) |
+| AC-3 | Embrulho adulterado e comprimento inválido são recusados, sem devolver parte da chave | **Verificado** (`rejects_a_tampered_wrapping`, `rejects_invalid_lengths`) |
+| AC-4 | `Param` do §8 com o layout exato (tamanho 54 para P-256) | **Verificado** (`the_parameters_follow_the_rfc_layout`) |
+| AC-5 | `PSO:DECIPHER` em slot ECDH P-256 responde erro e **não** devolve o segredo | **Verificado** (`pso_decipher_refuses_to_leak_the_shared_secret`) |
+| AC-6 | O mesmo para o slot X25519 (sem `Param` normado na RFC 6637) | **Verificado** (`x25519_decipher_fails_closed_without_rfc6637_material`) |
+| AC-7 | O caminho RSA de `PSO:DECIPHER` continua devolvendo o bloco decifrado | **Verificado** (suíte do applet verde) |
+| AC-8 | `GENERATE`, `READ PUBLIC`, `INTERNAL AUTHENTICATE` e as assinaturas inalterados | **Verificado** (suíte do applet verde) |
+
+**Mudança de comportamento observável:** a decifra ECDH deixa de funcionar
+até a etapa S2 (material provisionado, desembrulho da chave de sessão e decifra
+do texto no cartão). É uma regressão funcional deliberada: o comportamento
+anterior expunha o segredo compartilhado ao host, o que anulava o cartão como
+autoridade de decifra.
+
+**Limitação:** o `Param` da §8 (bloco `0x03 0x01` e impressão digital do
+destinatário) só pode ser confirmado contra o GnuPG em placa; a etapa S2
+depende de hardware e de provisionamento.
+
+### Contagem de credenciais conforme a CTAP 2.1 (host)
+
+O membro `numberOfCredentials` (chave CBOR 5) segue as regras da CTAP 2.1:
+presente apenas quando mais de uma credencial correspondeu e a requisição **não**
+trouxe `allowList`; ausente com `allowList`, com uma única credencial e nas
+respostas de `authenticatorGetNextAssertion`. A lista de candidatos deixou de
+ser truncada em silêncio: um store com mais credenciais que o limite responde
+`LimitExceeded` (0x15). Spec: `specs/ctap2-number-of-credentials.md`.
+
+| AC | Verificação | Resultado |
+|----|-------------|-----------|
+| AC-1 | Sem `allowList` e 2 credenciais → membro presente com o valor 2 | **Verificado** (`number_of_credentials_follows_the_ctap21_rules`, `the_count_member_is_absent_when_the_rules_forbid_it`) |
+| AC-2 | Com `allowList` e 2 correspondências → membro ausente | **Verificado** |
+| AC-3 | Com 1 credencial → membro ausente | **Verificado** |
+| AC-4 | Resposta de continuação → membro ausente | **Verificado** |
+| AC-5 | Caminho do firmware informa a contagem real e a omite quando a norma exige | `cargo clippy-fw` + `cargo build-fw-release` (build/alvo) |
+| AC-6 | Estouro do limite → `LimitExceeded`, sem truncamento | **Verificado** (`a_candidate_list_over_the_limit_is_not_truncated_silently`) |
+| AC-7 | Regressão de `getAssertion` (assinatura, `authData` com UP/UV) | **Verificado** (suíte de `aegis-core` verde) |
+
+**Limitação:** a validação em hardware (enumeração com duas contas do mesmo RP
+contra o firmware flashado) permanece pendente — não há RP2350 físico nesta
+sessão.
 
 ### Gate de release: a chave de update de desenvolvimento nunca é distribuída (host)
 Verificado por testes de host em `crates/aegis-build-support` e por execução
