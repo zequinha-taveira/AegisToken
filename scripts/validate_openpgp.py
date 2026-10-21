@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AegisToken — Phase 14/15 OpenPGP Card validation (AC-019) + Phase 16 RSA.
+"""AegisToken â€” Phase 14/15 OpenPGP Card validation (AC-019) + Phase 16 RSA.
 
 Requires ``pyscard`` and ``cryptography``. The validator exercises the P-256
 and Ed25519/X25519 OpenPGP Card slices plus RSA-2048: application data,
@@ -17,19 +17,49 @@ import sys
 
 try:
     from pcsc_transport import readers
+    from openpgp_ecdh_sender import (
+        HASH_SHA256,
+        KEK_AES128,
+        ephemeral_key,
+        kdf,
+        kdf_parameters,
+        shared_secret,
+        wrap_session_key,
+        build_message,
+    )
 except ImportError:
     try:
         from scripts.pcsc_transport import readers
+        from scripts.openpgp_ecdh_sender import (
+            HASH_SHA256,
+            KEK_AES128,
+            ephemeral_key,
+            kdf,
+            kdf_parameters,
+            shared_secret,
+            wrap_session_key,
+            build_message,
+        )
     except ImportError:
         try:
             from smartcard.System import readers
+            from scripts.openpgp_ecdh_sender import (
+                HASH_SHA256,
+                KEK_AES128,
+                ephemeral_key,
+                kdf,
+                kdf_parameters,
+                shared_secret,
+                wrap_session_key,
+                build_message,
+            )
         except ImportError as exc:  # pragma: no cover - tooling dependency
             print("PC/SC transport is required: scripts/pcsc_transport.py (built-in) or pyscard")
             print(exc)
             sys.exit(2)
 
 try:
-    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
     from cryptography.hazmat.primitives.asymmetric import rsa as rsa_mod
@@ -51,6 +81,7 @@ PW1 = b"123456"
 PW3 = b"12345678"
 
 ATTRS_ECDSA_P256 = bytes.fromhex("132A8648CE3D030107")
+ATTRS_ECDH_P256 = bytes.fromhex("122A8648CE3D030107")
 ATTRS_ED25519 = bytes.fromhex("162B06010401DA470F01")
 ATTRS_X25519 = bytes.fromhex("122B060104019755010501")
 ATTRS_RSA2048 = bytes.fromhex("0108000020")
@@ -60,7 +91,7 @@ ATTRS_RSA2048_STORED = bytes.fromhex("010800002000")
 def record(name: str, passed: bool, detail: str = "") -> None:
     RESULTS.append((name, passed, detail))
     flag = "PASS" if passed else "FAIL"
-    print(f"[{flag}] {name}" + (f" — {detail}" if detail else ""))
+    print(f"[{flag}] {name}" + (f" â€” {detail}" if detail else ""))
 
 
 def transmit(connection, apdu: list[int]) -> tuple[bytes, int]:
@@ -282,6 +313,77 @@ def main() -> int:
     except Exception:
         x_ok = False
     record("AC-019 PSO X25519 shared secret agrees", x_ok, f"sw={sw:04X}")
+
+    # --- Phase 17: ECDH P-256 (RFC 6637) -----------------------------------
+    _, sw = transmit(
+        connection,
+        [0x00, 0xDA, 0x00, 0xC2, len(ATTRS_ECDH_P256), *ATTRS_ECDH_P256],
+    )
+    record("AC-019 PUT DATA C2 ECDH P-256 attrs", sw == 0x9000, f"sw={sw:04X}")
+
+    data, sw = transmit(connection, [0x00, 0x47, 0x80, 0x00, 0x02, 0xB8, 0x00])
+    public_template = find_tlv(data, 0x7F49) if sw == 0x9000 else None
+    ec_point = find_tlv(public_template, 0x86) if public_template is not None else None
+    record(
+        "AC-019 GENERATE ECDH P-256 decryption key",
+        ec_point is not None and len(ec_point) == 65,
+        f"sw={sw:04X}",
+    )
+    if ec_point is None:
+        return summarize()
+
+    # The fingerprint of the decryption slot is the KDF parameter of RFC 6637 Â§8.
+    data, sw = transmit(connection, [0x00, 0xCA, 0x00, 0xC8, 0x00])
+    fingerprint = data if sw == 0x9000 and len(data) == 20 else None
+    record("AC-019 GET DATA C8 DEC fingerprint", fingerprint is not None, f"sw={sw:04X}")
+
+    _, sw = transmit(connection, [0x00, 0x20, 0x00, 0x82, len(PW1), *PW1])
+    record("AC-019 VERIFY PW1 (decipher)", sw == 0x9000, f"sw={sw:04X}")
+
+    # The partial decrypt of the OpenPGP card specification: the card returns
+    # the shared secret, which the host cannot compute by itself.
+    ephemeral = sender.ephemeral_key()
+    peer_point = ephemeral.public_key().public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+    )
+    cipher = tlv(0xA6, tlv(0x7F49, tlv(0x86, peer_point)))
+    data, sw = transmit(connection, [0x00, 0x2A, 0x80, 0x86, len(cipher), *cipher])
+    try:
+        expected_secret = sender.shared_secret(ephemeral, ec_point)
+        secret_ok = sw == 0x9000 and data == expected_secret
+    except Exception:
+        secret_ok = False
+    record("AC-019 PSO ECDH P-256 shared secret agrees", secret_ok, f"sw={sw:04X}")
+
+    # The card-side mode: the host provisions the session key already wrapped
+    # and the card decrypts on its own (RFC 6637 Â§8).
+    if fingerprint is not None and secret_ok:
+        param = sender.kdf_parameters(fingerprint)
+        kek = sender.kdf(param, expected_secret, 16)
+        session_key = bytes([0x5A]) * 16
+        wrapped = sender.wrap_session_key(kek, session_key)
+        import_data = (
+            bytes([len(wrapped)])
+            + wrapped
+            + bytes([sender.HASH_SHA256, sender.KEK_AES128])
+        )
+        _, sw = transmit(
+            connection,
+            [0x00, 0xDA, 0x00, 0xD2, len(import_data), *import_data],
+        )
+        record("AC-019 PUT DATA D2 wrapped session key", sw == 0x9000, f"sw={sw:04X}")
+
+        message = b"AegisToken ECDH card side"
+        _, ciphertext = sender.build_message(session_key, message)
+        command = tlv(0x86, peer_point) + tlv(0x80, ciphertext)
+        data, sw = transmit(
+            connection, [0x00, 0x2A, 0x80, 0x86, len(command), *command]
+        )
+        record(
+            "AC-019 PSO ECDH card side decrypts",
+            sw == 0x9000 and data == message,
+            f"sw={sw:04X}",
+        )
 
     # --- Phase 16: RSA-2048 (AC-021, application data path) -----------------
     _, sw = transmit(connection, [0x00, 0xDA, 0x00, 0xC1, len(ATTRS_RSA2048), *ATTRS_RSA2048])

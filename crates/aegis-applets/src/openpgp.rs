@@ -743,7 +743,13 @@ impl<S: OpenPgpStore> OpenPgp<S> {
         if let Some(algo) = Self::parse_rsa_attrs(value) {
             return Some(algo);
         }
+        // The import format byte (00 or FF) is optional in the algorithm
+        // attributes of the OpenPGP card specification.
         let (&id, oid) = value.split_first()?;
+        let oid = match oid {
+            [rest @ .., 0x00] | [rest @ .., 0xFF] => rest,
+            other => other,
+        };
         if id == ALGO_ECDSA && oid == OID_P256 {
             Some(KEY_ALGO_ECDSA_P256)
         } else if id == ALGO_ECDH && oid == OID_P256 {
