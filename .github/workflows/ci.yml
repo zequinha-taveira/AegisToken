@@ -63,7 +63,7 @@ jobs:
           AEGIS_RELEASE: "1"
           # Format-valid but not a curve point: disposable public material,
           # used only to check that the gate lets a non-development key pass.
-          AEGIS_UPDATE_VENDOR_PUBKEY: "04a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+          AEGIS_UPDATE_VENDOR_PUBKEY: "04a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
         run: cargo check -p firmware-universal-rp2350 --target thumbv8m.main-none-eabihf
 
   host-tool:
@@ -72,7 +72,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install components
-        run: rustup component add clippy
+        run: |
+          rustup component add clippy
+          # The `pcsc` crate links against the system PC/SC library on Linux.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkgconf libpcsclite-dev
       - name: Clippy
         run: cargo clippy -p aegistoken-host --all-targets -- -D warnings
       - name: Test
