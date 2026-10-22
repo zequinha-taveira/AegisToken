@@ -1095,20 +1095,27 @@ adiado.
   precisam de validação externa.
 - **Cripto fora desta slice:** RSA, Ed25519/EdDSA e X25519/KDF OpenPGP ficam
   para as Fases 15–16.
-- **ECDH OpenPGP (S1 e S2 entregues, interop pendente):** o *partial decrypt*
-  da OpenPGP Card 3.4.1 §4.4.3.8 foi **mantido** (o cartão devolve o segredo
-  compartilhado, como a especificação define — a chave efêmera foi escolhida
-  pelo remetente, e a liberação é condicionada a PW1 modo 82), e o cartão
-  **ganhou** o modo em que decifra sozinho pela RFC 6637 §8, ativado quando o
-  host provisiona a chave de sessão embrulhada. As primitivas (KDF da §7, AES
-  Key Wrap da RFC 3394, camada simétrica da RFC 4880 §13.9 com *resync*,
-  *quick check* e MDC) estão em `aegis-applets::ecdh` e
-  `aegis-applets::pgp_sym`, com os vetores da RFC 3394, um vetor de referência
-  da KDF e uma implementação de referência independente da camada simétrica
-  (`tests/openpgp_sym_reference.py`). O material importado é cifrado; a chave
-  privada do slot nunca é importada. **Pendente:** o formato do
-  provisionamento é **provisório** (`PUT DATA 0xD2`) e a validação `gpg -d`
-  exige hardware. Spec: `specs/openpgp-rfc6637-ecdh.md`.
+- **ECDH OpenPGP (S1-S3 entregues, interop com o GnuPG verificada em host):**
+  o *partial decrypt* da OpenPGP Card 3.4.1 §4.4.3.8 foi **mantido** (o cartão
+  devolve o segredo compartilhado, como a especificação define — a chave
+  efêmera foi escolhida pelo remetente, e a liberação é condicionada a PW1 modo
+  82), e o cartão **ganhou** o modo em que decifra sozinho pela RFC 6637 §8,
+  ativado quando o host provisiona a chave de sessão embrulhada (mais o
+  fingerprint do destinatário, porque o `ctime` da chave não existe sem
+  relógio). As primitivas (KDF da §7, AES Key Wrap da RFC 3394, camada
+  simétrica da RFC 4880 §13.9 com *quick check* e MDC) estão em
+  `aegis-applets::ecdh` e `aegis-applets::pgp_sym`. A interop é exercida de
+  ponta a ponta com um GnuPG real
+  (`openpgp::tests::gnupg_interop`): o GnuPG gera a chave ECDH P-256, cifra uma
+  mensagem e o applet a decifra pelo caminho APDU; a mesma mensagem fixa o
+  vetor da camada simétrica nos dois sentidos. O material importado é cifrado;
+  a chave privada do slot nunca é importada. A interop também achou e corrigiu
+  dois desvios de conformidade: o ponto EC saía sob a tag `81` (a especificação
+  manda `86`) e o CFB tratava os dois octetos de *quick check* como ponto de
+  ressincronização (a cadeia é contínua com IV zero). **Pendente:** o formato
+  do provisionamento é **provisório** (`PUT DATA 0xD2`) e o ensaio `gpg -d`
+  contra o cartão físico exige hardware. Spec:
+  `specs/openpgp-rfc6637-ecdh.md`.
 
 ## Persistência selada dos applets (entregue)
 

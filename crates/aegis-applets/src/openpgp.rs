@@ -181,8 +181,9 @@ const ECDH_WRAPPED_MAX: usize = 48;
 
 /// The size of the RFC 6637 material that follows the private key in the
 /// slot: the length of the wrapped key, the wrapped key itself, the hash id
-/// of the KDF and the id of the key encryption algorithm.
-const ECDH_MATERIAL_BYTES: usize = 1 + ECDH_WRAPPED_MAX + 2;
+/// of the KDF, the id of the key encryption algorithm, a presence flag and the
+/// recipient fingerprint that the sender used.
+const ECDH_MATERIAL_BYTES: usize = 1 + ECDH_WRAPPED_MAX + 2 + 1 + 20;
 
 /// The RFC 6637 material of a decryption slot.
 ///
@@ -192,11 +193,19 @@ const ECDH_MATERIAL_BYTES: usize = 1 + ECDH_WRAPPED_MAX + 2;
 struct EcdhMaterial {
     /// The session key wrapped with the key encryption key.
     wrapped: Vec<u8, ECDH_WRAPPED_MAX>,
-    /// The hash id used by the KDF of RFC 6637 ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§7.
+    /// The hash id used by the KDF of RFC 6637 section 7.
     kdf_hash: u8,
     /// The id of the key encryption algorithm (7 = AES-128, 8 = AES-192,
     /// 9 = AES-256).
     kek_alg: u8,
+    /// The fingerprint of the recipient key as the sender used it.
+    ///
+    /// The RFC 6637 section 8 parameters carry the fingerprint of the key, and
+    /// a fingerprint includes the creation time of the key: the card has no
+    /// clock and computes its own fingerprints with a zero creation time, so
+    /// the sender has to provision the value it used. Without it the card
+    /// falls back to the computed fingerprint.
+    fingerprint: Option<[u8; 20]>,
 }
 
 impl EcdhMaterial {
@@ -214,10 +223,18 @@ impl EcdhMaterial {
         wrapped
             .extend_from_slice(&material[1..1 + wrapped_len])
             .ok()?;
+        let mut fingerprint = None;
+        let flag = material[3 + ECDH_WRAPPED_MAX];
+        if flag == 1 {
+            let mut value = [0u8; 20];
+            value.copy_from_slice(&material[4 + ECDH_WRAPPED_MAX..][..20]);
+            fingerprint = Some(value);
+        }
         Some(Self {
             wrapped,
             kdf_hash: material[1 + ECDH_WRAPPED_MAX],
             kek_alg: material[2 + ECDH_WRAPPED_MAX],
+            fingerprint,
         })
     }
 
@@ -228,6 +245,10 @@ impl EcdhMaterial {
         material[1..1 + self.wrapped.len()].copy_from_slice(&self.wrapped);
         material[1 + ECDH_WRAPPED_MAX] = self.kdf_hash;
         material[2 + ECDH_WRAPPED_MAX] = self.kek_alg;
+        if let Some(fingerprint) = self.fingerprint {
+            material[3 + ECDH_WRAPPED_MAX] = 1;
+            material[4 + ECDH_WRAPPED_MAX..].copy_from_slice(&fingerprint);
+        }
         slot.material[ECDH_KEY_BYTES..ECDH_KEY_BYTES + ECDH_MATERIAL_BYTES]
             .copy_from_slice(&material);
         slot.len = ECDH_KEY_BYTES + ECDH_MATERIAL_BYTES;
@@ -252,9 +273,9 @@ fn external_public_key(input: &[u8]) -> Option<&[u8]> {
 
 /// The session key of a wrapped OpenPGP session key.
 ///
-/// RFC 6637 ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§8 wraps `m = symm_alg_ID || session key || checksum ||
+/// RFC 6637 section 8 wraps `m = symm_alg_ID || session key || checksum ||
 /// PKCS#5 padding`; the checksum is the sum of the session key octets modulo
-/// 65536 (RFC 4880 ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§5.1).
+/// 65536 (RFC 4880 section 5.1).
 fn session_key_from_wrapped(unwrapped: &[u8]) -> Option<heapless::Vec<u8, 32>> {
     if unwrapped.len() < 8 {
         return None;
@@ -295,7 +316,7 @@ impl KeySlot {
     /// RSA private key parsed from the material, or `None`.
     ///
     /// RSA slots always carry the explicit algorithm code (set by
-    /// `PUT DATA C1`ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ`C3` before `GENERATE`), so no slot default applies.
+    /// `PUT DATA C1`/`C3` before `GENERATE`), so no slot default applies.
     fn rsa_key(&self) -> Option<rsa::Rsa2048PrivateKey> {
         if self.algo != KEY_ALGO_RSA2048 {
             return None;
@@ -735,9 +756,9 @@ impl<S: OpenPgpStore> OpenPgp<S> {
 
     /// Parse algorithm attributes into a key algorithm code.
     ///
-    /// RSA follows OpenPGP Card spec ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§7.2.9: `01 || nbits || ebits`
+    /// RSA follows OpenPGP Card spec section 7.2.9: `01 || nbits || ebits`
     /// (`0800`/`0020` for RSA-2048/`e` = 65537, minimal `0011` accepted
-    /// too), with the optional import-format byte ignored ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â keys are
+    /// too), with the optional import-format byte ignored; imported keys are
     /// generated on-card, never imported.
     fn parse_attrs(value: &[u8]) -> Option<u8> {
         if let Some(algo) = Self::parse_rsa_attrs(value) {
@@ -763,7 +784,7 @@ impl<S: OpenPgpStore> OpenPgp<S> {
         }
     }
 
-    /// Canonical RSA-2048 attributes reported by `GET DATA C1`ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ`C3`:
+    /// Canonical RSA-2048 attributes reported by `GET DATA C1`/`C3`:
     /// `01 || 0800 (n, 2048 bit) || 0020 (e, 32 bit) || 00 (import fmt)`.
     const RSA_ATTRS: [u8; 6] = [ALGO_RSA, 0x08, 0x00, 0x00, 0x20, 0x00];
 
@@ -810,7 +831,7 @@ impl<S: OpenPgpStore> OpenPgp<S> {
         ]
     }
 
-    /// RFC 4880 ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§12.2 v4 fingerprint for a slot's public key.
+    /// RFC 4880 section 12.2 v4 fingerprint for a slot's public key.
     ///
     /// Packet: version, zero creation time (no RTC on device), algorithm ID,
     /// curve OID, MPI public key, plus KDF parameters for ECDH. Returns
@@ -883,7 +904,7 @@ impl<S: OpenPgpStore> OpenPgp<S> {
         Some(out)
     }
 
-    /// RFC 4880 ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§12.2 v4 fingerprint of an RSA slot: `SHA1(99 || len ||
+    /// RFC 4880 section 12.2 v4 fingerprint of an RSA slot: `SHA1(99 || len ||
     /// version || ctime || 01 || MPI(n) || MPI(e))`.
     fn rsa_fingerprint(&self, slot: usize) -> Option<[u8; 20]> {
         use sha1::Digest as _;
@@ -973,7 +994,9 @@ impl<S: OpenPgpStore> OpenPgp<S> {
     ///
     /// The format is provisional: it still has to be aligned with the key
     /// import of the OpenPGP card specification, which needs a host that
-    /// speaks it (GnuPG) to be validated.
+    /// speaks it (GnuPG) to be validated. The optional trailing 20 octets are
+    /// the fingerprint of the key that the sender used in the KDF parameters;
+    /// without them the card uses the fingerprint it computes itself.
     fn put_ecdh_material(&mut self, value: &[u8]) -> bool {
         if self.keys[1].effective_algo(1) != KEY_ALGO_ECDH_P256 || !self.keys[1].present {
             return false;
@@ -982,7 +1005,10 @@ impl<S: OpenPgpStore> OpenPgp<S> {
             return false;
         }
         let wrapped_len = usize::from(value[0]);
-        if wrapped_len == 0 || wrapped_len > ECDH_WRAPPED_MAX || value.len() != 1 + wrapped_len + 2
+        let base = 1 + wrapped_len + 2;
+        if wrapped_len == 0
+            || wrapped_len > ECDH_WRAPPED_MAX
+            || value.len() != base && value.len() != base + 20
         {
             return false;
         }
@@ -993,10 +1019,17 @@ impl<S: OpenPgpStore> OpenPgp<S> {
         {
             return false;
         }
+        let mut fingerprint = None;
+        if value.len() == base + 20 {
+            let mut fpr = [0u8; 20];
+            fpr.copy_from_slice(&value[base..]);
+            fingerprint = Some(fpr);
+        }
         let material = EcdhMaterial {
             wrapped,
             kdf_hash: value[1 + wrapped_len],
             kek_alg: value[2 + wrapped_len],
+            fingerprint,
         };
         // The key encryption algorithm must be one the card supports.
         if !(7..=9).contains(&material.kek_alg) {
@@ -1374,16 +1407,16 @@ impl<S: OpenPgpStore> OpenPgp<S> {
         Response::status(Sw::FUNCTION_NOT_SUPPORTED)
     }
 
-    /// Decrypt with the card-side ECDH flow of RFC 6637 §8.
+    /// Decrypt with the card-side ECDH flow of RFC 6637 section 8.
     ///
     /// The command carries the ephemeral public key of the sender (`86`) and
     /// the encrypted data (`80`). The card computes the shared point with its
-    /// own private key, derives the key encryption key with the KDF of §7,
+    /// own private key, derives the key encryption key with the KDF of section 7,
     /// unwraps the session key wrapped by the sender (RFC 3394) and decrypts
     /// the data with the OpenPGP symmetric layer.
     ///
     /// When the slot has no RFC 6637 material, the card falls back to the
-    /// partial decrypt of the OpenPGP card specification (§4.4.3.8): the
+    /// partial decrypt of the OpenPGP card specification (section 4.4.3.8): the
     /// shared secret is returned and the host does the rest. The release of
     /// the shared secret is gated by the verification of PW1 in mode 82.
     fn decipher_ecdh(&mut self, input: &[u8]) -> Response<'_> {
@@ -1412,7 +1445,8 @@ impl<S: OpenPgpStore> OpenPgp<S> {
             return Response::status(Sw::NO_PRECISE_DIAGNOSIS);
         };
         let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
-        let Some(fingerprint) = self.fingerprint(1) else {
+        let fingerprint = material.fingerprint.or_else(|| self.fingerprint(1));
+        let Some(fingerprint) = fingerprint else {
             return Response::status(Sw::NO_PRECISE_DIAGNOSIS);
         };
         let Some(param) = ecdh::param(
@@ -1462,7 +1496,7 @@ impl<S: OpenPgpStore> OpenPgp<S> {
         EcdhMaterial::from_slot(&self.keys[1])
     }
 
-    /// The partial decrypt of the OpenPGP card specification (§4.4.3.8).
+    /// The partial decrypt of the OpenPGP card specification (section 4.4.3.8).
     ///
     /// The card calculates the shared secret with its own private key and the
     /// external public key of the command, and returns it: the host derives
@@ -1617,7 +1651,7 @@ fn replace_vec<const N: usize>(target: &mut Vec<u8, N>, value: &[u8], max: usize
     target.extend_from_slice(value).is_ok()
 }
 
-/// Exact bit length of an MPI body (RFC 4880 ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.2).
+/// Exact bit length of an MPI body (RFC 4880 section 3.2).
 fn mpi_bits(octets: &[u8]) -> u16 {
     let mut bits = octets.len() * 8;
     for byte in octets {
@@ -1633,7 +1667,9 @@ fn mpi_bits(octets: &[u8]) -> u16 {
 
 fn public_key_response<'a>(out: &'a mut Vec<u8, 2048>, point: &[u8]) -> Response<'a> {
     let mut body = Vec::<u8, 128>::new();
-    append_tlv(&mut body, 0x81, point);
+    // The public key of an EC key is the tag 86 (the tag 81 carries the
+    // modulus of an RSA key).
+    append_tlv(&mut body, 0x86, point);
     out.clear();
     if !append_tlv(out, 0x7F49, &body) {
         return Response::status(Sw::NOT_ENOUGH_MEMORY);
@@ -1734,6 +1770,21 @@ fn decode_len_bytes<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Option<
 mod tests {
     use super::*;
     use p256::ecdsa::signature::hazmat::PrehashVerifier;
+
+    mod gnupg_interop;
+
+    /// The OpenPGP Card 3.4.1 section 4.4.3.10 returns the public key of an EC key
+    /// under the tag 86; the tag 81 carries the modulus of an RSA key.
+    #[test]
+    fn ec_public_key_response_uses_the_spec_tag() {
+        let mut out = Vec::<u8, 2048>::new();
+        let response = public_key_response(&mut out, &[0x04; 65]);
+        assert_eq!(response.sw, Sw::OK);
+        assert_eq!(&response.data[..2], &[0x7F, 0x49]);
+        let template = tlv::find(response.data, 0x7F49).unwrap();
+        assert_eq!(tlv::find(template, 0x86).unwrap().len(), 65);
+        assert_eq!(tlv::find(template, 0x81), None);
+    }
 
     struct TestRng(u64);
 
@@ -1869,7 +1920,7 @@ mod tests {
         verify_pw3(&mut applet, &mut rng);
         let public = generate(&mut applet, &mut rng, 0xB6);
         let public_template = tlv::find(&public, 0x7F49).unwrap();
-        let point = tlv::find(public_template, 0x81).unwrap();
+        let point = tlv::find(public_template, 0x86).unwrap();
         assert_eq!(point.len(), 65);
 
         verify_pw1_sig(&mut applet, &mut rng);
@@ -1890,7 +1941,7 @@ mod tests {
         verify_pw3(&mut applet, &mut rng);
         let public = generate(&mut applet, &mut rng, 0xA4);
         let public_template = tlv::find(&public, 0x7F49).unwrap();
-        let point = tlv::find(public_template, 0x81).unwrap();
+        let point = tlv::find(public_template, 0x86).unwrap();
         assert_eq!(
             run(
                 &mut applet,
@@ -1922,7 +1973,7 @@ mod tests {
         let mut rng = TestRng(5);
         verify_pw3(&mut applet, &mut rng);
         let public = generate(&mut applet, &mut rng, 0xB8);
-        let card_point = tlv::find(tlv::find(&public, 0x7F49).unwrap(), 0x81).unwrap();
+        let card_point = tlv::find(tlv::find(&public, 0x7F49).unwrap(), 0x86).unwrap();
         assert_eq!(card_point.len(), 65);
         assert_eq!(
             run(
@@ -1941,7 +1992,14 @@ mod tests {
         let card_public = p256::PublicKey::from_sec1_bytes(card_point).unwrap();
         let shared =
             p256::ecdh::diffie_hellman(ephemeral.to_nonzero_scalar(), card_public.as_affine());
-        let fingerprint = applet.fingerprint(1).expect("the slot has a fingerprint");
+        // The fingerprint of the recipient as the sender sees it. The RFC 4880
+        // section 12.2 fingerprint covers the creation time of the key, which
+        // the card cannot know: the value the sender used is provisioned next
+        // to the wrapped key, and it is deliberately not the fingerprint the
+        // card computes, so the decryption below only succeeds if the card
+        // feeds the provisioned value to the KDF.
+        let mut fingerprint = applet.fingerprint(1).expect("the slot has a fingerprint");
+        fingerprint[0] ^= 0xFF;
         let param = ecdh::param(
             ecdh::CURVE_OID_P256,
             ecdh::ALG_ECDH,
@@ -1971,6 +2029,7 @@ mod tests {
         import.extend_from_slice(&wrapped).unwrap();
         import.push(ecdh::HASH_SHA256).unwrap();
         import.push(ecdh::KEK_AES128).unwrap();
+        import.extend_from_slice(&fingerprint).unwrap();
         assert_eq!(
             run(
                 &mut applet,
@@ -2006,6 +2065,53 @@ mod tests {
         let (plain, status) = run(&mut applet, &mut rng, &frame(INS_PSO, 0x80, 0x86, &command));
         assert_eq!(status, Sw::OK);
         assert_eq!(&plain[..], data);
+    }
+
+    #[test]
+    fn the_fingerprint_is_an_optional_part_of_the_provisioning() {
+        let mut applet = applet();
+        let mut rng = TestRng(5);
+        verify_pw3(&mut applet, &mut rng);
+        let _ = generate(&mut applet, &mut rng, 0xB8);
+
+        // The wrapped session key alone: the card falls back to the
+        // fingerprint it computes itself.
+        let wrapped = [0x11u8; 24];
+        let mut import: Vec<u8, 64> = Vec::new();
+        import.push(wrapped.len() as u8).unwrap();
+        import.extend_from_slice(&wrapped).unwrap();
+        import.push(ecdh::HASH_SHA256).unwrap();
+        import.push(ecdh::KEK_AES128).unwrap();
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0xD2, &import)
+            )
+            .1,
+            Sw::OK
+        );
+        let material = applet.ecdh_material().expect("the material is provisioned");
+        assert_eq!(material.fingerprint, None, "no fingerprint was provisioned");
+
+        // With the 20 octets of the sender the card keeps the value the
+        // sender used in the KDF (the end-to-end check is in
+        // `pso_decipher_unwraps_the_session_key_and_decrypts`).
+        let mut recipient = [0x22u8; 20];
+        recipient[0] = 0x01;
+        import.extend_from_slice(&recipient).unwrap();
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0xD2, &import)
+            )
+            .1,
+            Sw::OK
+        );
+        let material = applet.ecdh_material().expect("the material is provisioned");
+        assert_eq!(material.fingerprint, Some(recipient));
+        assert_eq!(material.wrapped.as_slice(), &wrapped);
     }
 
     #[test]
@@ -2162,7 +2268,7 @@ mod tests {
         assert_eq!(get_do(&mut applet, &mut rng, 0xC2), ATTRS_X25519);
     }
 
-    /// DER DigestInfo for SHA-256 (RFC 8017 ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§9.2) over `message`.
+    /// DER DigestInfo for SHA-256 (RFC 8017 section 9.2) over `message`.
     fn digestinfo_sha256(message: &[u8]) -> Vec<u8, 64> {
         use sha2::Digest as _;
         let hash = sha2::Sha256::digest(message);
@@ -2367,7 +2473,7 @@ mod tests {
             Sw::OK
         );
         let public = generate(&mut applet, &mut rng, 0xB6);
-        let point = tlv::find(tlv::find(&public, 0x7F49).unwrap(), 0x81).unwrap();
+        let point = tlv::find(tlv::find(&public, 0x7F49).unwrap(), 0x86).unwrap();
         assert_eq!(point.len(), 32);
 
         verify_pw1_sig(&mut applet, &mut rng);
@@ -2393,7 +2499,7 @@ mod tests {
             Sw::OK
         );
         let public = generate(&mut applet, &mut rng, 0xA4);
-        let point = tlv::find(tlv::find(&public, 0x7F49).unwrap(), 0x81).unwrap();
+        let point = tlv::find(tlv::find(&public, 0x7F49).unwrap(), 0x86).unwrap();
         assert_eq!(
             run(
                 &mut applet,
@@ -2424,7 +2530,7 @@ mod tests {
         verify_pw3(&mut applet, &mut rng);
         assert_eq!(put_attrs(&mut applet, &mut rng, 0xC2, ATTRS_X25519), Sw::OK);
         let public = generate(&mut applet, &mut rng, 0xB8);
-        let card_point = tlv::find(tlv::find(&public, 0x7F49).unwrap(), 0x81).unwrap();
+        let card_point = tlv::find(tlv::find(&public, 0x7F49).unwrap(), 0x86).unwrap();
         assert_eq!(card_point.len(), 32);
         assert_eq!(
             run(
@@ -2484,7 +2590,7 @@ mod tests {
         let mut rng = TestRng(13);
         verify_pw3(&mut applet, &mut rng);
         let public = generate(&mut applet, &mut rng, 0xB6);
-        let point = tlv::find(tlv::find(&public, 0x7F49).unwrap(), 0x81).unwrap();
+        let point = tlv::find(tlv::find(&public, 0x7F49).unwrap(), 0x86).unwrap();
 
         // Independently rebuild the hashed packet: version, zero ctime,
         // ECDSA algorithm, P-256 OID, MPI of the uncompressed point.

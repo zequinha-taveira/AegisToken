@@ -593,7 +593,7 @@ autoridade de decifra.
 destinatário) só pode ser confirmado contra o GnuPG em placa; a etapa S2
 depende de hardware e de provisionamento.
 
-### OpenPGP ECDH: decifra no cartão pela RFC 6637 (etapa S2, interop pendente)
+### OpenPGP ECDH: decifra no cartão e interop com o GnuPG (RFC 6637, S1-S3)
 
 **Correção de premissa:** a OpenPGP Card 3.4.1 §4.4.3.8 define o ECDH do
 `PSO:DECIPHER` como um ***partial decrypt*** — o cartão calcula o segredo
@@ -604,23 +604,47 @@ verificação de PW1 no modo 82. O cartão **mantém** esse comportamento (para 
 interoperabilidade com o GnuPG) e **acrescenta** o modo em que decifra sozinho
 (RFC 6637 §8), ativado quando o host provisiona a chave de sessão embrulhada.
 
+**Interop real:** o teste `gnupg_encrypts_and_the_card_decrypts` cria uma home
+temporária do GnuPG, deixa o **GnuPG** gerar a chave ECDH P-256 no formato do
+cartão, extrai a chave privada do *export* (S2K sem proteção) e a injeta no slot
+de decifra do applet (só no teste: o applet não importa chave privada). O GnuPG
+cifra uma mensagem de verdade para essa chave e o applet a decifra pelo caminho
+APDU real (`PUT DATA 0xD2` + `PSO:DECIPHER`), com PW1/PW3 verificados. O lado do
+remetente é 100% GnuPG (KDF, *key wrap*, MFX).
+
 | AC | Verificação | Resultado |
 |----|-------------|-----------|
 | AC-1 | A KDF da §7 reproduz o vetor de referência e o `Param` tem o layout da §8 (54 bytes para P-256) | **Verificado** (`the_kdf_matches_the_reference_value`, `the_parameters_follow_the_rfc_layout`) |
 | AC-2 | O *key wrap* da RFC 3394 reproduz os quatro vetores da RFC, nos dois sentidos | **Verificado** (`unwraps_the_rfc3394_vectors`, `wraps_to_the_rfc3394_vectors`) |
-| AC-3 | A camada simétrica reproduz o vetor de referência da RFC 4880 §13.9 nos dois sentidos, com *quick check* e MDC | **Verificado** (`decrypts_the_reference_vector`, `encrypts_to_the_reference_ciphertext`, `a_wrong_key_fails_the_quick_check`, `a_tampered_ciphertext_fails_the_modification_code`) |
+| AC-3 | A camada simétrica reproduz uma mensagem **real do GnuPG** nos dois sentidos, com *quick check* e MDC | **Verificado** (`decrypts_a_message_encrypted_by_gnupg`, `encrypts_to_the_gnupg_ciphertext`, `a_wrong_key_fails_the_quick_check`, `a_tampered_ciphertext_fails_the_modification_code`) |
 | AC-4 | Com material provisionado, o cartão decifra uma mensagem real: o teste faz o papel do remetente (chave efêmera, segredo compartilhado, chave de sessão embrulhada, mensagem cifrada) e o cartão devolve o texto claro | **Verificado** (`pso_decipher_unwraps_the_session_key_and_decrypts`) |
 | AC-5 | Sem material provisionado, o cartão devolve o segredo compartilhado (*partial decrypt* da especificação), com PW1 modo 82 exigido | **Verificado** (`pso_decipher_returns_the_shared_secret_per_the_card_spec`) |
 | AC-6 | O mesmo para X25519, com a simetria DH conferida | **Verificado** (`x25519_decipher_returns_the_shared_secret`) |
-| AC-7 | O caminho RSA de `PSO:DECIPHER` e o resto da suíte do applet seguem verdes | **Verificado** (169 testes) |
+| AC-7 | O caminho RSA de `PSO:DECIPHER` e o resto da suíte do applet seguem verdes | **Verificado** (172 testes) |
+| AC-8 | **Interop fim a fim com o GnuPG**: a mensagem que o GnuPG cifra para a chave do cartão é decifrada pelo `PSO:DECIPHER` do applet, e o GnuPG decifra a mesma mensagem com a própria chave | **Verificado** (`gnupg_interop::gnupg_encrypts_and_the_card_decrypts`) |
+| AC-9 | O fingerprint do destinatário que o remetente usou na KDF chega pelo provisionamento e o cartão o usa em vez do que calcula (sem relógio, `ctime = 0`); sem ele, se o fingerprint próprio não casar, a decifra falha fechada | **Verificado** (o próprio teste de interop, mais `pso_decipher_unwraps_the_session_key_and_decrypts` e `the_fingerprint_is_an_optional_part_of_the_provisioning`) |
+| AC-10 | `GENERATE`/`READ PUBLIC KEY` devolvem o ponto EC sob a tag `86` da OpenPGP Card 3.4.1 §4.4.3.10, nunca `81` | **Verificado** (`ec_public_key_response_uses_the_spec_tag`) |
 
-**Limitação (interop pendente):** o formato do provisionamento da chave de
-sessão embrulhada é **provisório** (`PUT DATA 0xD2`); o *key import* da
-OpenPGP Card 3.4 importa a **chave privada**, o que contraria a regra do
-projeto de não importar chave privada — daí o caminho próprio. A validação
-`gpg -d` contra o cartão continua pendente de hardware (não há RP2350 físico
-nem GnuPG neste ambiente). A referência independente da camada simétrica está
-em `tests/openpgp_sym_reference.py`.
+**Três divergências reais que a interop achou (e o que ficou):**
+
+1. O ponto EC saía sob a tag `81` (que é o módulo RSA) em vez de `86`: corrigido
+   em `public_key_response` e em `scripts/validate_openpgp.py`.
+2. O fingerprint da RFC 4880 §12.2 cobre o **tempo de criação** da chave; o
+   cartão não tem relógio e calcula fingerprints com `ctime = 0`, então a KDF da
+   §8 não fechava com a do remetente. O provisionamento `PUT DATA 0xD2` passou a
+   aceitar os 20 octetos do fingerprint do destinatário (opcionais; sem eles o
+   cartão cai no fingerprint que calcula).
+3. A camada simétrica tratava os dois octetos de *quick check* como um ponto de
+   ressincronização do CFB. O GnuPG mantém a cadeia **contínua** com IV zero
+   (RFC 4880 §13.9): os octetos repetidos fazem parte do fluxo. Com a
+   ressincronização errada o MDC da mensagem real nunca fechava.
+
+**Limitação (hardware):** o formato do provisionamento da chave de sessão
+embrulhada continua **provisório** (`PUT DATA 0xD2`); o *key import* da OpenPGP
+Card 3.4 importa a **chave privada**, o que contraria a regra do projeto de não
+importar chave privada — daí o caminho próprio. A validação `gpg -d` contra o
+cartão físico segue pendente (não há RP2350 nem leitor PC/SC nesta sessão); o
+que está verificado é a cadeia completa em software contra o GnuPG real.
 
 ### Contagem de credenciais conforme a CTAP 2.1 (host)
 

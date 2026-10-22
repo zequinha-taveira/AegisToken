@@ -18,6 +18,8 @@ jobs:
         run: |
           rustup target add thumbv8m.main-none-eabihf
           rustup component add rustfmt clippy
+      - name: Install GnuPG for the OpenPGP interoperability test
+        run: sudo apt-get update && sudo apt-get install -y gnupg
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy (core)

@@ -7,6 +7,10 @@ como única autoridade de decifra. **Escopo:** `crates/aegis-applets`
 **Norma de referência:** RFC 6637 (ECC in OpenPGP) §7 (KDF), §8 (ECDH), §9
 (encoding das chaves), §11 (OID das curvas), §13 (perfil OpenPGP); RFC 3394
 (AES Key Wrap); RFC 4880 §5.1 (PKESK), §13.9 (MDC); ISO 7816-4 para o APDU.
+**Estado:** S1-S3 entregues — a decifra no cartão e a interop com o GnuPG estão
+verificadas em host (`cargo test -p aegis-applets`, 172 testes, incluindo o
+teste de interop); falta apenas o ensaio em hardware (`gpg -d` com leitor
+PC/SC).
 
 ---
 
@@ -104,8 +108,9 @@ padrão para a interoperabilidade com o GnuPG.
 
 ## 3. Escopo
 
-A fatia é **dividida em duas etapas**, porque a etapa 2 depende de
-provisionamento e de interop que não podem ser validados sem placa:
+A fatia foi **dividida em etapas**, porque a interop real depende de um
+provisionamento que o *key import* do OpenPGP Card 3.4 não oferece (ele importa
+a chave privada) e de um host que fale o protocolo:
 
 ### 3.1 Etapa S1 — primitivas da RFC 6637
 
@@ -136,7 +141,7 @@ provisionamento e de interop que não podem ser validados sem placa:
    `INTERNAL AUTHENTICATE` e no caminho RSA de `PSO:DECIPHER` (que continua
    devolvendo o bloco decifrado por operação privada, como manda a Yubico).
 
-### 3.2 Etapa S2 — decifra completa no cartão (implementada; interop pendente)
+### 3.2 Etapa S2 — decifra completa no cartão (implementada e verificada com o GnuPG)
 
 - **Material no slot de decifra:** a chave privada `r` continua no dispositivo
   (gerada on-device) e passa a ser acompanhada do material RFC 6637: a chave de
@@ -146,20 +151,27 @@ provisionamento e de interop que não podem ser validados sem placa:
   (material de 32 bytes) é simplesmente "não provisionado" e continua falhando
   fechado.
 - **Provisionamento:** `PUT DATA` com a tag `0x00D2` (o DO de chave privada da
-  chave 2) e o corpo `len || C || hash id da KDF || id da KEK`. O material
-  importado é **cifrado**; a chave privada nunca é importada. O formato é
-  **provisório**: ainda precisa ser alinhado ao *key import* do OpenPGP Card
-  3.4, o que só pode ser conferido contra um host que fale o protocolo.
+  chave 2) e o corpo `len || C || hash id da KDF || id da KEK`, com 20 octetos
+  opcionais no fim: o **fingerprint do destinatário** que o remetente usou. O
+  fingerprint da RFC 4880 §12.2 cobre o **tempo de criação** da chave, que o
+  cartão não tem (ele calcula fingerprints com `ctime = 0`, sem relógio): sem
+  os 20 octetos o cartão cai no fingerprint que ele mesmo calcula e a KDF não
+  fecha com a do remetente. O material importado é **cifrado**; a chave privada
+  nunca é importada. O formato é **provisório**: ainda precisa ser alinhado ao
+  *key import* do OpenPGP Card 3.4, o que só pode ser conferido contra um host
+  que fale o protocolo.
 - **`PSO:DECIPHER`:** o comando traz a chave pública efêmera do remetente
   (`86`) e os dados cifrados (`80`); o cartão calcula `S = r·V`, deriva a KEK
   com a KDF da §7, desembrulha `C` (RFC 3394), confere o *checksum* da chave de
   sessão e decifra os dados com a camada simétrica do OpenPGP, verificando o
   *modification detection code*.
 - **Camada simétrica (`aegis-applets::pgp_sym`):** o CFB da RFC 4880 §13.9 com
-  o *resync* após o prefixo, o *quick check* da chave e a verificação do MDC
-  (§5.14). Validada contra uma implementação de referência independente
-  (`tests/openpgp_sym_reference.py`), que produz o mesmo texto cifrado e o
-  mesmo texto claro.
+  o IV zero e a cadeia **contínua** (os dois octetos repetidos do prefixo fazem
+  parte do fluxo: são o *quick check* da chave, não um ponto de
+  ressincronização), o *quick check* e a verificação do MDC (§5.14). Validada
+  contra uma implementação de referência independente
+  (`tests/openpgp_sym_reference.py`) e contra uma mensagem **real do GnuPG**
+  (o vetor de `--show-session-key`, nos dois sentidos).
 - **Dois modos convivem:** sem material provisionado, o cartão faz o
   *partial decrypt* da especificação (devolve `Z`); com material provisionado,
   o cartão decifra sozinho (nunca libera `Z`). O modo mais forte é **opt-in**
@@ -168,7 +180,7 @@ provisionamento e de interop que não podem ser validados sem placa:
   define os parâmetros de KDF para essa curva, então o cartão não decifra
   sozinho nesse caso.
 
-**O que falta para a interoperabilidade (S3):**
+**O que falta (residual):**
 
 1. O *key import* no formato do OpenPGP Card 3.4 (que importa a **chave
    privada**, e não a chave de sessão embrulhada): o modelo do cartão que
@@ -177,8 +189,9 @@ provisionamento e de interop que não podem ser validados sem placa:
    privada do slot contraria a regra de "sem importação de chave privada" do
    projeto. O formato provisório (`PUT DATA 0xD2`, chave de sessão embrulhada)
    é a alternativa coerente com essa regra, e continua **provisório**.
-2. A validação em hardware: `gpg -d` contra o cartão, o que exige um RP2350
-   físico e um GnuPG instalado.
+2. O ensaio em hardware: `gpg -d` contra o cartão, o que exige um RP2350
+   físico e um leitor PC/SC. A cadeia completa (KDF, *key wrap*, CFB+MDC) já
+   está verificada em software contra o GnuPG real (AC-9/AC-12).
 
 ### 3.3 Não-objetivos
 
@@ -197,34 +210,57 @@ provisionamento e de interop que não podem ser validados sem placa:
 |---|---|---|---|
 | decifra | RSA-2048 | — | bloco decifrado (inalterado) |
 | decifra | ECDH P-256 | nenhum (estado atual) | segredo compartilhado (*partial decrypt* da especificação) |
-| decifra | ECDH P-256 | material RFC 6637 (etapa S2) | texto claro decifrado (o segredo não sai) |
+| decifra | ECDH P-256 | material RFC 6637 provisionado | texto claro decifrado (o segredo não sai) |
 | decifra | ECDH X25519 | qualquer | segredo compartilhado (*partial decrypt*) |
 | assinatura | qualquer | — | inalterado |
 
 ## 5. Critérios de aceitação
 
-- [ ] **AC-1** — `kdf` reproduz o vetor de referência do NIST SP 800-56A
+- [x] **AC-1** — `kdf` reproduz o vetor de referência do NIST SP 800-56A
       (KDF, alternativa 1) para `Param` e `ZB` conhecidos: o resultado é
       `SHA-256(00 00 00 01 || ZB || Param)`, conferido contra um valor
       calculado por uma implementação independente (referência em Python
       escrita a partir do texto da RFC 6637 §7) e embutido no teste.
-- [ ] **AC-2** — `aes_key_unwrap` desembrulha os **vetores de teste da
+- [x] **AC-2** — `aes_key_unwrap` desembrulha os **vetores de teste da
       RFC 3394 §4** (128, 192 e 256 bits) e reproduz a chave de sessão
       original.
-- [ ] **AC-3** — `aes_key_unwrap` **rejeita** (devolve `None`) um embrulho
+- [x] **AC-3** — `aes_key_unwrap` **rejeita** (devolve `None`) um embrulho
       adulterado (integrity check errado) e um comprimento inválido; o
       desempacotamento **não** devolve parte da chave quando falha.
-- [ ] **AC-4** — `param` monta exatamente o `Param` da §8: tamanho e OID da
+- [x] **AC-4** — `param` monta exatamente o `Param` da §8: tamanho e OID da
       curva, `public_key_alg_ID`, `0x03 0x01`, hash da KDF, algoritmo da KEK,
       `"Anonymous Sender    "` e a impressão digital do destinatário.
-- [ ] **AC-5** — `PSO:DECIPHER` em um slot ECDH **sem** material RFC 6637
+- [x] **AC-5** — `PSO:DECIPHER` em um slot ECDH **sem** material RFC 6637
       responde **erro** e **não** devolve o segredo compartilhado (o teste
       verifica o corpo da resposta: não contém os bytes do segredo).
-- [ ] **AC-6** — O mesmo para o slot X25519.
-- [ ] **AC-7** — O caminho RSA de `PSO:DECIPHER` continua devolvendo o bloco
+- [x] **AC-6** — O mesmo para o slot X25519.
+- [x] **AC-7** — O caminho RSA de `PSO:DECIPHER` continua devolvendo o bloco
       decifrado (regressão).
-- [ ] **AC-8** — `GENERATE`, `READ PUBLIC`, `INTERNAL AUTHENTICATE` e as
+- [x] **AC-8** — `GENERATE`, `READ PUBLIC`, `INTERNAL AUTHENTICATE` e as
       assinaturas continuam inalterados (regressão da suíte do applet).
+- [x] **AC-9** — **Interop fim a fim com o GnuPG**: uma mensagem que o GnuPG
+      cifra para a chave ECDH P-256 do cartão é decifrada pelo `PSO:DECIPHER`
+      do applet (KDF, *key wrap* e CFB+MDC reais do GnuPG), e o GnuPG decifra a
+      mesma mensagem com a própria chave. Teste
+      `openpgp::tests::gnupg_interop::gnupg_encrypts_and_the_card_decrypts`.
+- [x] **AC-10** — O fingerprint que o remetente usou na KDF da §8 (que cobre o
+      `ctime` da chave) chega pelo provisionamento `PUT DATA 0xD2`, e o cartão o
+      usa em vez do que calcula (sem relógio, com `ctime = 0`); sem os 20
+      octetos o cartão cai no fingerprint próprio e, se ele não casar, a
+      decifra falha fechada (o *unwrap* da RFC 3394 não fecha). Testes de
+      interop, `the_fingerprint_is_an_optional_part_of_the_provisioning` e
+      `pso_decipher_unwraps_the_session_key_and_decrypts`.
+- [x] **AC-11** — `GENERATE`/`READ PUBLIC KEY` devolvem o ponto EC sob a tag
+      `86` (OpenPGP Card 3.4.1 §4.4.3.10), nunca `81`, que é o módulo RSA.
+      Teste `ec_public_key_response_uses_the_spec_tag`.
+- [x] **AC-12** — A camada simétrica decifra e cifra uma mensagem **real do
+      GnuPG** byte a byte (CFB contínuo com IV zero, *quick check* e MDC da
+      RFC 4880 §13.9). Testes `decrypts_a_message_encrypted_by_gnupg` e
+      `encrypts_to_the_gnupg_ciphertext`, com o mesmo vetor em
+      `tests/test_openpgp_sym_reference.py`.
+
+Todos os AC acima foram verificados por `cargo test -p aegis-applets`
+(172 testes) e por `python -m pytest tests`.
 
 ## 6. Plano de teste
 
@@ -239,7 +275,23 @@ provisionamento e de interop que não podem ser validados sem placa:
   - AC-5/AC-6: o teste `pso_decipher_returns_the_p256_shared_secret` é
     **substituído** por `pso_decipher_refuses_to_leak_the_shared_secret`, que
     exige status de erro e confere que o corpo **não** contém o segredo;
-  - AC-7/AC-8: a suíte existente permanece verde.
+  - AC-7/AC-8: a suíte existente permanece verde;
+  - AC-10: `the_fingerprint_is_an_optional_part_of_the_provisioning` e o
+    fingerprint do remetente em
+    `pso_decipher_unwraps_the_session_key_and_decrypts`;
+  - AC-11: `ec_public_key_response_uses_the_spec_tag`.
+- `crates/aegis-applets/src/openpgp/tests/gnupg_interop.rs` (novo, declarado
+  dentro do módulo de testes do applet porque injeta a chave privada do slot):
+  - AC-9/AC-10: o GnuPG gera a chave ECDH P-256, cifra uma mensagem e o applet
+    a decifra pelo caminho APDU real; sem o fingerprint provisionado o cartão
+    falha fechado. O teste é **ignorado** quando o GnuPG não está instalado
+    (`AEGIS_GPG` aponta o binário; o CI instala `gnupg`).
+- `crates/aegis-applets/src/pgp_sym.rs` (módulo de testes):
+  - AC-12: o vetor real do GnuPG (chave de sessão do `--show-session-key`,
+    ciphertext e plaintext), nos dois sentidos.
+- `tests/openpgp_sym_reference.py` + `tests/test_openpgp_sym_reference.py`:
+  a mesma mensagem do GnuPG pela referência independente em Python, com o
+  *quick check* e o MDC conferidos.
 - Comandos: `cargo test -p aegis-applets`, `cargo clippy -p aegis-applets
   --all-targets -- -D warnings`, `cargo fmt --all --check`.
 
@@ -249,38 +301,47 @@ provisionamento e de interop que não podem ser validados sem placa:
 |---|---|
 | `crates/aegis-applets/src/ecdh.rs` (novo) | KDF (§7), AES Key Wrap (§8/RFC 3394), montagem do `Param` (§8), OID da curva (§11) + testes |
 | `crates/aegis-applets/src/lib.rs` | registra o módulo `ecdh` |
-| `crates/aegis-applets/src/openpgp.rs` | `PSO:DECIPHER` falha fechada para ECDH sem material RFC 6637 (P-256 e X25519); testes |
-| `roadmap.md` | marca a pendência "OpenPGP KDF+AES RFC 6637" como **parcialmente** entregue (S1) e registra a etapa S2 |
-| `validation.md` | matriz de host dos AC-1..AC-8 e a limitação de interop |
+| `crates/aegis-applets/src/openpgp.rs` | `PSO:DECIPHER` com material RFC 6637 (P-256 e X25519), fingerprint no provisionamento, ponto EC sob a tag `86`; testes |
+| `crates/aegis-applets/src/openpgp/tests/gnupg_interop.rs` (novo) | interop fim a fim com o GnuPG (chave, cifra, provisionamento e `PSO:DECIPHER`) |
+| `crates/aegis-applets/src/pgp_sym.rs` | CFB contínuo da RFC 4880 §13.9 (corrigido pela interop) + vetor real do GnuPG |
+| `scripts/openpgp_ecdh_sender.py`, `scripts/validate_openpgp.py` | lado remetente em Python (CFB contínuo), tag `86` e provisioning com fingerprint |
+| `tests/openpgp_sym_reference.py`, `tests/test_openpgp_sym_reference.py` | referência independente da camada simétrica + o vetor real do GnuPG |
+| `.github/workflows/ci.yml` | o job de host instala o GnuPG (`gnupg`) para o teste de interop |
+| `roadmap.md` | marca a pendência "OpenPGP KDF+AES RFC 6637" como **entregue** (S1-S3) |
+| `validation.md` | matriz de host dos AC-1..AC-10, evidência da interop e a limitação de hardware |
 | `docs/security-model.md` | invariante: o segredo compartilhado do ECDH não sai do cartão |
 | `docs/architecture.md`, `docs/yubico-compatibility.md` | ajuste da descrição do caminho ECDH |
 
 ## 8. Documentação
 
-- `docs/security-model.md`: nova invariante — *"O segredo compartilhado do
-  ECDH não sai do cartão: enquanto o material RFC 6637 não estiver
-  provisionado, `PSO:DECIPHER` falha fechada em vez de devolver `Z`."*
-- `validation.md`: tabela dos ACs com o método (testes de host) e a
-  limitação explícita de que a interop com o GnuPG (`gpg -d`) depende de
-  placa e da etapa S2.
+- `docs/security-model.md`: invariante — *"O segredo compartilhado do ECDH não
+  sai do cartão por padrão: sem o material RFC 6637 provisionado,
+  `PSO:DECIPHER` falha fechada em vez de devolver `Z`; com o material, o cartão
+  devolve o texto claro."*
+- `validation.md`: tabela dos ACs com o método (testes de host), a evidência da
+  interop com o GnuPG em software e a limitação explícita de que o `gpg -d`
+  contra o cartão físico depende de placa.
 - `roadmap.md` (Fase 14, "Cripto fora desta slice"): o item deixa de ser
-  "não implementado" e passa a "S1 entregue (primitivas + falha fechada);
-  S2 pendente (decifra completa no cartão, exige provisionamento e
-  hardware)".
-- `production.md`: nada muda nesta etapa (o provisionamento é da etapa S2).
+  "não implementado" e passa a **entregue** (S1-S3: primitivas, decifra no
+  cartão, interop real com o GnuPG; hardware pendente).
+- `production.md`: nada muda (o provisionamento da chave de sessão embrulhada
+  é do host; o cartão não importa chave privada).
 
 ## 9. Riscos e limitações
 
-1. **Perda de funcionalidade até a etapa S2.** Depois desta fatia, a decifra
-   ECDH **não funciona** — o cartão recusa. É uma regressão funcional
-   deliberada: o comportamento anterior expunha o segredo, e não havia
-   interop real com o GnuPG (o teste existente fixava um segredo bruto
-   "para testes de transporte"). A decisão precisa de comunicação explícita
-   nas notas de release.
-2. **Risco de interop do `Param`.** A construção do `Param` (em especial o
-   bloco `0x03 0x01` e a impressão digital) só pode ser confirmada contra o
-   GnuPG em placa. Se divergir, a etapa S2 falha na interoperabilidade — e
-   não há como detectar isso em host.
+1. **Janela de regressão funcional (S1 → S2).** Na etapa S1 a decifra ECDH
+   passou a recusar; a S2 devolve a funcionalidade no modelo da RFC 6637 (o
+   cartão decifra e nunca libera `Z`). O comportamento antigo, que devolvia o
+   segredo bruto, não volta: era o achado que originou a fatia. A nota de
+   release precisa explicitar que o host agora provisiona a chave de sessão
+   embrulhada (mais o fingerprint) antes de usar `PSO:DECIPHER` no modo
+   completo.
+2. **Risco de interop do `Param` e do fingerprint.** A construção do `Param`
+   (em especial o bloco `0x03 0x01` e a impressão digital) foi confirmada
+   contra o GnuPG real em software (AC-9). O residual é o fingerprint: o
+   cartão não tem relógio e a RFC 4880 §12.2 inclui o `ctime` da chave, então
+   o host precisa provisionar o fingerprint do destinatário junto com a chave
+   de sessão embrulhada; sem ele o cartão falha fechado (não adivinha).
 3. **A KDF exige SHA-256** (RFC 6637 §13: "SHA-1 MUST NOT be used with the
    ECDSA or the KDF in the ECDH method"). O `sha2` já é dependência do crate;
    `sha1` existe para o MDC do OpenPGP — cuidado para não misturar.
@@ -288,8 +349,10 @@ provisionamento e de interop que não podem ser validados sem placa:
    RFC 3394 é implementado no módulo (o `aes` do workspace expõe o bloco
    primitivo; o KW é uma construção de 6 blocos com XOR). O custo é ~40
    linhas e é coberto pelos vetores da RFC.
-5. **A etapa S2 é a maior**: migração de estado, importação de material
-   cifrado, CFB+MDC do OpenPGP e interop — precisa de hardware.
+5. **A etapa S2/S3 é a maior**: migração de estado, importação de material
+   cifrado, CFB+MDC do OpenPGP e interop. A interop com o GnuPG já está
+   verificada em software (AC-9/AC-12); o que falta é o ensaio no cartão
+   físico (`gpg -d` com um leitor PC/SC).
 6. **Endpoint mais lento?** Não: o caminho ECDH passa a falhar antes, o que é
    mais rápido.
 7. **Estado antigo**: slots ECDH já gerados continuam no cartão com a chave
