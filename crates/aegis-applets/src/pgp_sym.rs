@@ -7,6 +7,7 @@
 //! prefix, the quick check of the key and the verification of the
 //! modification detection code.
 
+use crate::pin::constant_time_eq;
 use heapless::Vec;
 use sha1::{Digest, Sha1};
 
@@ -67,23 +68,31 @@ pub fn decrypt_aes(session_key: &[u8], ciphertext: &[u8]) -> Option<Decrypted> {
         fr[..block.len()].copy_from_slice(block);
     }
 
-    // The quick check: the last two octets of the prefix replicate the two
-    // before them, which is a cheap check for a correct key.
-    if plaintext[BS] != plaintext[BS - 2] || plaintext[BS + 1] != plaintext[BS - 1] {
-        return None;
-    }
-
-    // The modification detection code packet is the last one: its tag and
-    // length octets followed by the SHA-1 hash.
+    // The quick check (the last two octets of the prefix replicate the two
+    // before them) and the MDC packet structure (tag and length) are
+    // key-dependent decisions, so they are absorbed by a constant-time
+    // accumulator — the discipline of `constant_time_eq` — and decided once,
+    // at the end: no early exit reveals which octet failed. The MDC
+    // verification uses the `constant_time_eq` comparator itself, and the
+    // SHA-1 over the message runs on every path, so the running time of the
+    // failure classes does not depend on which check failed.
     let mdc_start = plaintext.len().checked_sub(MDC_PACKET)?;
-    if plaintext[mdc_start] != MDC_TAG || plaintext[mdc_start + 1] != MDC_LENGTH {
-        return None;
-    }
+    let mut diff = 0u8;
+    diff |= plaintext[BS] ^ plaintext[BS - 2];
+    diff |= plaintext[BS + 1] ^ plaintext[BS - 1];
+    diff |= plaintext[mdc_start] ^ MDC_TAG;
+    diff |= plaintext[mdc_start + 1] ^ MDC_LENGTH;
+    let structure_ok = core::hint::black_box(diff) == 0;
+
     let mdc = &plaintext[mdc_start + 2..];
     let mut digest = Sha1::new();
     digest.update(&plaintext[..mdc_start + 2]);
     let expected = digest.finalize();
-    let mdc_verified = mdc == expected.as_slice();
+    let mdc_verified = constant_time_eq(expected.as_slice(), mdc);
+
+    if !structure_ok {
+        return None;
+    }
 
     let mut data = Vec::new();
     // The prefix is not part of the data; the modification detection code
@@ -229,5 +238,81 @@ mod tests {
     fn rejects_short_or_invalid_inputs() {
         assert!(decrypt_aes(&KEY, &CIPHERTEXT[..10]).is_none());
         assert!(decrypt_aes(&[0u8; 15], &CIPHERTEXT).is_none());
+    }
+
+    /// A synthetic message of the symmetric layer: the random prefix with the
+    /// two repeated quick-check octets, the literal data and the modification
+    /// detection code packet, as the local sender side would produce it.
+    fn synthetic_plaintext() -> Vec<u8, MAX_DATA> {
+        let mut prefix = [0x11u8; BS];
+        prefix[14] = prefix[12];
+        prefix[15] = prefix[13];
+        let mut plaintext: Vec<u8, MAX_DATA> = Vec::new();
+        plaintext.extend_from_slice(&prefix).unwrap();
+        plaintext
+            .extend_from_slice(&[prefix[14], prefix[15]])
+            .unwrap();
+        plaintext
+            .extend_from_slice(b"AegisToken synthetic message")
+            .unwrap();
+        plaintext.extend_from_slice(&[MDC_TAG, MDC_LENGTH]).unwrap();
+        let mut digest = Sha1::new();
+        digest.update(plaintext.as_slice());
+        let mdc = digest.finalize();
+        plaintext.extend_from_slice(&mdc).unwrap();
+        plaintext
+    }
+
+    #[test]
+    fn wrong_quick_check_byte_is_rejected_for_every_position() {
+        for width in [16usize, 24, 32] {
+            for position in [0, width / 2, width - 1] {
+                let mut key = KEY;
+                key[position] ^= 0x01;
+                assert!(
+                    decrypt_aes(&key[..width], &CIPHERTEXT).is_none(),
+                    "a flipped session key byte at {position} of {width} octets"
+                );
+            }
+            for octet in [BS, BS + 1] {
+                let mut plaintext = synthetic_plaintext();
+                plaintext[octet] ^= 0x01;
+                let ciphertext = encrypt_aes(&KEY[..width], &plaintext).expect("encrypts");
+                assert!(
+                    decrypt_aes(&KEY[..width], &ciphertext).is_none(),
+                    "a broken quick-check octet at {octet} of {width} octets"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_mdc_byte_flip_still_fails_the_verification_with_unchanged_data() {
+        let baseline = decrypt_aes(&KEY, &CIPHERTEXT).expect("decrypts");
+        for byte in 0..MDC_SIZE {
+            let mut ciphertext = CIPHERTEXT;
+            ciphertext[ciphertext.len() - MDC_SIZE + byte] ^= 0x01;
+            let decrypted = decrypt_aes(&KEY, &ciphertext).expect("decrypts");
+            assert!(
+                !decrypted.mdc_verified,
+                "the flipped modification code byte {byte}"
+            );
+            assert_eq!(decrypted.data, baseline.data, "the data is untouched");
+        }
+    }
+
+    #[test]
+    fn corrupted_mdc_tag_or_length_is_rejected() {
+        let cases: [&[usize]; 3] = [&[0], &[1], &[0, 1]];
+        for corruption in cases {
+            let mut ciphertext = CIPHERTEXT;
+            for offset in corruption {
+                ciphertext[ciphertext.len() - MDC_PACKET + offset] ^= 0x01;
+            }
+            assert!(
+                decrypt_aes(&KEY, &ciphertext).is_none(),
+                "the corrupted packet structure {corruption:?}"
+            );
+        }
     }
 }

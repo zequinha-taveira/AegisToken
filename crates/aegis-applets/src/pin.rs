@@ -145,7 +145,7 @@ impl core::fmt::Debug for PinHash {
 
 /// The crate-wide constant-time comparator: every comparison of
 /// key-derived material (`PinHash`, OATH HMAC, OpenPGP MDC) goes through it.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

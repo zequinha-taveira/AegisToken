@@ -2142,6 +2142,25 @@ mod tests {
 
     #[test]
     fn pso_decipher_unwraps_the_session_key_and_decrypts() {
+        let (mut applet, mut rng, command, plaintext) = decipher_fixture();
+        let (plain, status) = run(&mut applet, &mut rng, &frame(INS_PSO, 0x80, 0x86, &command));
+        assert_eq!(status, Sw::OK);
+        assert_eq!(&plain[..], &plaintext[18..plaintext.len() - 22]);
+    }
+
+    /// An applet provisioned exactly as the full decipher flow above: the
+    /// card has an ECDH P-256 key, the sender wrapped its session key with
+    /// the KDF parameters of an imported fingerprint and the message is the
+    /// prefix, the literal data and the modification detection code.
+    ///
+    /// Returns the applet, its RNG and the `PSO: DECIPHER` command with the
+    /// well-formed ciphertext.
+    fn decipher_fixture() -> (
+        OpenPgp<MemoryOpenPgpStore>,
+        TestRng,
+        Vec<u8, 512>,
+        Vec<u8, 256>,
+    ) {
         use p256::elliptic_curve::sec1::ToSec1Point;
         use sha1::Digest as _;
 
@@ -2161,19 +2180,11 @@ mod tests {
             Sw::OK
         );
 
-        // The sender: an ephemeral key pair, the shared secret with the card's
-        // public key, and the session key wrapped for the card.
         let ephemeral = p256::SecretKey::from_slice(&[9u8; 32]).unwrap();
         let ephemeral_point = ephemeral.public_key().to_sec1_point(false);
         let card_public = p256::PublicKey::from_sec1_bytes(card_point).unwrap();
         let shared =
             p256::ecdh::diffie_hellman(ephemeral.to_nonzero_scalar(), card_public.as_affine());
-        // The fingerprint of the recipient as the sender sees it. The RFC 4880
-        // section 12.2 fingerprint covers the creation time of the key, which
-        // the card cannot know: the value the sender used is provisioned next
-        // to the wrapped key, and it is deliberately not the fingerprint the
-        // card computes, so the decryption below only succeeds if the card
-        // feeds the provisioned value to the KDF.
         let mut fingerprint = applet.fingerprint(1).expect("the slot has a fingerprint");
         fingerprint[0] ^= 0xFF;
         let param = ecdh::param(
@@ -2186,7 +2197,6 @@ mod tests {
         .unwrap();
         let kek = ecdh::kdf(&param, shared.raw_secret_bytes().as_slice(), 16).unwrap();
 
-        // m = symm_alg_ID || session key || checksum || padding.
         let session_key = [0x5Au8; 16];
         let checksum = session_key
             .iter()
@@ -2198,8 +2208,6 @@ mod tests {
         m.resize(24, 0x05).unwrap();
         let wrapped = ecdh::aes_key_wrap(&kek, &m).unwrap();
 
-        // The import of the wrapped session key (ciphertext, never a private
-        // key).
         let mut import: Vec<u8, 64> = Vec::new();
         import.push(wrapped.len() as u8).unwrap();
         import.extend_from_slice(&wrapped).unwrap();
@@ -2216,8 +2224,6 @@ mod tests {
             Sw::OK
         );
 
-        // The encrypted message: the OpenPGP prefix, the data and the
-        // modification detection code packet.
         let data = b"AegisToken card side ECDH";
         let mut prefix = [0x11u8; 16];
         prefix[14] = prefix[12];
@@ -2234,13 +2240,42 @@ mod tests {
         plaintext.extend_from_slice(&digest.finalize()).unwrap();
         let ciphertext = pgp_sym::encrypt_aes(&session_key, &plaintext).unwrap();
 
-        // The command carries the ephemeral public key and the encrypted data.
         let mut command: Vec<u8, 512> = Vec::new();
         append_tlv(&mut command, 0x86, ephemeral_point.as_bytes());
         append_tlv(&mut command, 0x80, &ciphertext);
-        let (plain, status) = run(&mut applet, &mut rng, &frame(INS_PSO, 0x80, 0x86, &command));
-        assert_eq!(status, Sw::OK);
-        assert_eq!(&plain[..], data);
+        (applet, rng, command, plaintext)
+    }
+
+    #[test]
+    fn decipher_reports_pro_sw_for_quick_check_mdc_and_success() {
+        let (mut applet, mut rng, command, plaintext) = decipher_fixture();
+
+        // The TLV of the ciphertext inside the command: the tag, the length
+        // and the 65 bytes of the ephemeral point before it.
+        let cipher_start = 1 + 1 + 66 + 2;
+
+        // The happy path: the literal data comes back under 9000.
+        let (plain, sw) = run(&mut applet, &mut rng, &frame(INS_PSO, 0x80, 0x86, &command));
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(plain.as_slice(), &plaintext[18..plaintext.len() - 22]);
+
+        // A broken quick-check octet: no diagnosis, like every other
+        // structural refusal of the decipher.
+        let mut broken = command.clone();
+        broken[cipher_start] ^= 0x01;
+        let (_, sw) = run(&mut applet, &mut rng, &frame(INS_PSO, 0x80, 0x86, &broken));
+        assert_eq!(sw, Sw::NO_PRECISE_DIAGNOSIS);
+
+        // A corrupted modification detection code: the data is recognized,
+        // the integrity check fails with the dedicated status.
+        let mut corrupted = command.clone();
+        corrupted[command.len() - 1] ^= 0x01;
+        let (_, sw) = run(
+            &mut applet,
+            &mut rng,
+            &frame(INS_PSO, 0x80, 0x86, &corrupted),
+        );
+        assert_eq!(sw, Sw::WRONG_DATA);
     }
 
     #[test]
