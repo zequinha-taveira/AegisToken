@@ -1259,6 +1259,32 @@ adiado.
   `gpg --card-edit` em RP2350; registrado em `validation.md`. Spec:
   `specs/openpgp-pw3-change-authority.md`.
 
+- **OpenPGP S11 — troca do PW1 com corpo de comprimento variável
+  (entregue):** fechou o gap L4 da S10 (interop com viés administrativo, não
+  escaleração): `CHANGE REFERENCE DATA` do PW1 (`0x81`/`0x82`) aceita agora
+  o corpo `atual‖novo` da card spec §7.2.3 — concatenação exata, sem
+  delimitador nem padding (caminho real do scdaemon verificado no
+  código-fonte, `app-openpgp.c::do_change_pin` + `iso7816.c`) com
+  `12 ≤ Lc ≤ 254`; fora do intervalo → `6A80` antes de qualquer interação
+  com o slot (nenhuma tentativa consumida, nenhum save). A delimitação do
+  corrente ("o comprimento conhecido no cartão") é resolvida pelo **hash
+  armazenado**: nova capacidade read-only `PinSlot::resolve_change` em
+  `pin.rs` — a varredura dos candidatos `L` não consome tentativa, o match
+  alimenta o `slot.change` de sempre e a negativa consome **exatamente uma**
+  tentativa (`63Cx` com persist), o mesmo preço que o corpo fixo 16 já
+  cobrava por corrente errado. Sem bump de `PIN_STATE_VERSION`, sem
+  delimitador, sem novo segredo. PW3 (`0x83`) intocado: gate S10 + corpo
+  fixo 16. Piso S5 preservado (`6A84` na falha de gravação, piso sticky). O
+  default de fábrica (`123456`, 6 octetos) é finalmente trocável pela porta
+  pública `0x24`. 7 testes novos + comentário do teste S10 atualizado
+  (corpos de 11/15 octetos: `< 12` continua recusa de formato, `15`
+  in-intervalo com corrente errado passa a sem-match `63Cx` — contradição
+  interna da spec registrada em `validation.md`) em `openpgp.rs`. Suite em
+  **224 testes** de host em `aegis-applets`. Física de hardware pendente:
+  extensão do `validate_openpgp.py` (troca do default de 6 → corpo 12 →
+  `9000` + fluxo `gpg --card-edit` → `passwd`) em RP2350; registrado em
+  `validation.md`. Spec: `specs/openpgp-pw1-min-length-change.md`.
+
 ## Persistência selada dos applets (entregue)
 
 - `aegis-applets::sealed`: `SealedCell` (um registro selado por shard),

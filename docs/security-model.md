@@ -153,7 +153,14 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   persists); the current PIN in the command body remains a second factor
   (`slot.change` still verifies it) and the session survives the swap (only
   `select()` clears it). The **PW1** change (`P2=0x81`/`0x82`) keeps the
-  current-PIN-in-data authority — card-spec/ecosystem behavior.
+  current-PIN-in-data authority — card-spec/ecosystem behavior. The body is
+  the card-spec one, the exact concatenation `current‖new` with no delimiter
+  (`Lnew = Lc − Lold`): a body outside the format window `12 ≤ Lc ≤ 254` is
+  refused with `6A80` before touching the slot (no attempt consumed, no
+  save), and inside it the length known in the card is resolved by scanning
+  the slot's stored hash — a read that consumes no attempt; a body no
+  candidate delimits costs exactly one attempt (`63Cx` persisted), the same
+  price a fixed-width change already charged for a wrong current PIN.
   A failed save in a PIN-mutating OpenPGP handler is **observable**: `VERIFY`
   (when it consumes an attempt), `CHANGE REFERENCE DATA`, `RESET RETRY
   COUNTER` and an accepted `PUT DATA` answer `6A84` instead of confirming a

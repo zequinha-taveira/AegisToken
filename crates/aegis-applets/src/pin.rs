@@ -218,6 +218,13 @@ impl PinSlot {
     /// OpenPGP `reset_retry` and its `verify_change` for the admin slot
     /// (`P2=0x83`) both require the admin PIN already verified in the
     /// session, like the callers of [`Self::unblock`].
+    ///
+    /// OpenPGP `CHANGE REFERENCE DATA` carries the two PINs as the exact
+    /// concatenation `current‖new` with no delimiter and no padding, so when
+    /// the current PIN's length is not known up front the caller uses
+    /// [`Self::resolve_change`] first: the delimitation by the
+    /// known-in-card length is a read of the slot, and the presentation of
+    /// `current‖new` here stays a plain change authorized by the caller.
     pub fn change(&mut self, current: &[u8], new: &[u8]) -> Result<(), Sw> {
         self.verify(current)?;
         self.set(new)
@@ -239,6 +246,56 @@ impl PinSlot {
         }
         self.retries_remaining -= 1;
         Err(Sw::retries_left(self.retries_remaining))
+    }
+
+    /// Resolve the current half of a `current‖new` change body by the length
+    /// the card knows of the stored PIN — the OpenPGP Card 7.2.3 contract
+    /// (`Lnew = Lc − Lold`): the body carries the pins concatenated with no
+    /// delimiter and no padding, and the slot holds only their hash, so the
+    /// caller offers the whole body and the slot finds the split.
+    ///
+    /// The scan is a read of the slot: it never consumes an attempt on its
+    /// own, and the non-consuming diagnostics of [`Self::verify`] apply
+    /// unchanged (`CONDITIONS_NOT_SATISFIED` when unset,
+    /// `AUTHENTICATION_BLOCKED` when exhausted). Precondition: the caller has
+    /// already checked the body against the format window
+    /// `2·policy.min_len ≤ body.len() ≤ 2·policy.max_len` — the same refusal
+    /// a caller owning the format order must answer before any slot work.
+    ///
+    /// `Ok(Some(split))` reports the single candidate length that verifies
+    /// against the stored hash, fed back through [`Self::change`] — the
+    /// authorization stays with the caller. `Ok(None)` says no candidate
+    /// verifies and consumes exactly one attempt — the same price a
+    /// fixed-width change charges for presenting a wrong current PIN — so a
+    /// scanning change cannot walk the attempt budget wider than the plain
+    /// change already does.
+    pub fn resolve_change(&mut self, body: &[u8]) -> Result<Option<usize>, Sw> {
+        let Some(hash) = &self.hash else {
+            return Err(Sw::CONDITIONS_NOT_SATISFIED);
+        };
+        if self.retries_remaining == 0 {
+            return Err(Sw::AUTHENTICATION_BLOCKED);
+        }
+        let format = self.policy.format;
+        let low = core::cmp::max(
+            self.policy.min_len,
+            body.len().saturating_sub(self.policy.max_len),
+        );
+        let high = core::cmp::min(self.policy.max_len, body.len() - self.policy.min_len);
+        // Every split left is admitted by the policy window both halves must
+        // satisfy; the whole window is hashed once per command, so the work
+        // does not depend on where (or whether) a candidate matches.
+        let mut matched = None;
+        for split in low..=high {
+            if hash.verify(&body[..split], format) {
+                matched.get_or_insert(split);
+            }
+        }
+        if matched.is_some() {
+            return Ok(matched);
+        }
+        self.retries_remaining -= 1;
+        Ok(None)
     }
 
     /// Unblock the slot with a new PIN, restoring the retry counter.

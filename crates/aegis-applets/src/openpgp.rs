@@ -1654,11 +1654,44 @@ impl<S: OpenPgpStore> OpenPgp<S> {
         if admin && !self.pw3_verified {
             return Response::status(Sw::SECURITY_STATUS_NOT_SATISFIED);
         }
-        if apdu.data.len() != 16 {
+        if admin {
+            if apdu.data.len() != 16 {
+                return Response::status(Sw::WRONG_DATA);
+            }
+            let result = self.pw3.change(&apdu.data[..8], &apdu.data[8..]);
+            return self.finish_change(result);
+        }
+        // The user slot accepts the body shape the OpenPGP Card 7.2.3
+        // defines: `current‖new` concatenated with no delimiter, `Lnew =
+        // Lc − Lold`, each half inside the slot's policy window. Outside
+        // the window the format is refused without touching the slot — no
+        // attempt consumed and no save.
+        if !(2 * PW_POLICY.min_len..=2 * PW_POLICY.max_len).contains(&apdu.data.len()) {
             return Response::status(Sw::WRONG_DATA);
         }
-        let slot = if admin { &mut self.pw3 } else { &mut self.pw1 };
-        let result = slot.change(&apdu.data[..8], &apdu.data[8..]);
+        let result = self.change_pw1(apdu.data);
+        self.finish_change(result)
+    }
+
+    /// The user-slot change: the slot delimits the current half by its own
+    /// stored hash (the length of the current PIN is known in the card), and
+    /// a body no candidate can delimit costs one attempt — the same price a
+    /// wrong current PIN on a fixed-width shape always paid.
+    fn change_pw1(&mut self, body: &[u8]) -> Result<(), Sw> {
+        let split = match self.pw1.resolve_change(body) {
+            Ok(Some(split)) => split,
+            Ok(None) => {
+                return Err(Sw::retries_left(self.pw1.retries_remaining()));
+            }
+            Err(sw) => return Err(sw),
+        };
+        self.pw1.change(&body[..split], &body[split..])
+    }
+
+    /// The shared tail of both slots: persist under the fail-closed floor
+    /// rules and map the change result, so a failed save is never confirmed
+    /// as a successful change.
+    fn finish_change(&mut self, result: Result<(), Sw>) -> Response<'_> {
         if self.persist_state() {
             Response::status(result.err().unwrap_or(Sw::OK))
         } else {
@@ -4297,8 +4330,9 @@ mod tests {
     fn pw1_change_still_works_without_a_session() {
         let mut applet = applet();
         let mut rng = TestRng(65);
-        // Install an 8-byte PW1 through the admin door (the 6-byte default
-        // cannot go through a 16-byte CHANGE body yet).
+        // The 6-byte default is changeable on the public path now; an
+        // 8-byte current installed through the admin door keeps exercising
+        // the fixed 8+8 shape against a slot that is not 6 bytes.
         verify_pw3(&mut applet, &mut rng);
         assert_eq!(
             run(
@@ -4310,12 +4344,12 @@ mod tests {
             Sw::OK
         );
         assert_eq!(applet.select().sw, Sw::OK);
-        // A wrong-length body is refused regardless.
+        // An out-of-format body is refused regardless.
         assert_eq!(
             run(
                 &mut applet,
                 &mut rng,
-                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, b"AAAAAAAAAAAAAAA")
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, b"AAAAAAAAAAA")
             )
             .1,
             Sw::WRONG_DATA
@@ -4389,6 +4423,365 @@ mod tests {
             )
             .1,
             Sw::OK
+        );
+    }
+
+    #[test]
+    fn pw1_default_of_six_octets_is_changeable_on_the_public_path() {
+        let mut applet = applet();
+        let mut rng = TestRng(67);
+        // The factory PIN changes on the public path: no admin session and
+        // no unblock, just the 12-octet body the scdaemon actually sends.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, b"123456654321")
+            )
+            .1,
+            Sw::OK
+        );
+        // A successful change refills the retry counter.
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
+            Sw::retries_left(3)
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"654321")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"123456")
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        // The change was persisted: a re-select keeps the new PIN usable.
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"654321")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn pw1_change_follows_the_exact_lengths_of_the_command_body() {
+        let mut rng = TestRng(68);
+        let mut applet = applet();
+        // 6-byte current, 8-byte new: a 14-octet body.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, b"12345688888888")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"88888888")
+            )
+            .1,
+            Sw::OK
+        );
+        // Same 14-octet shape with an 8-byte current installed through the
+        // admin door: the delimitation follows the stored hash, not a fixed
+        // index, so Lnew = Lc − Lold holds in both directions.
+        let mut applet = OpenPgp::new(MemoryOpenPgpStore::new());
+        assert_eq!(applet.select().sw, Sw::OK);
+        verify_pw3(&mut applet, &mut rng);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x81, b"99999999")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, b"99999999777777")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"777777")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn pw1_change_rejects_bodies_outside_the_policy_range_without_tuning() {
+        let mut rng = TestRng(69);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        assert_eq!(applet.select().sw, Sw::OK);
+        let baseline = applet.store.save_calls;
+        // 0, 11 and 255 octets sit outside the `2·6 ≤ Lc ≤ 2·127` format
+        // window: refused before any slot work.
+        let oversized = [b'A'; 255];
+        for body in [&b""[..], &b"AAAAAAAAAAA"[..], &oversized[..]] {
+            assert_eq!(
+                run(
+                    &mut applet,
+                    &mut rng,
+                    &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, body)
+                )
+                .1,
+                Sw::WRONG_DATA
+            );
+        }
+        // No attempt was consumed and no save was emitted.
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
+            Sw::retries_left(3)
+        );
+        assert_eq!(applet.store.save_calls, baseline);
+    }
+
+    #[test]
+    fn pw1_change_consumes_one_attempt_per_mismatched_body() {
+        let mut applet = applet();
+        let mut rng = TestRng(70);
+        // No candidate length of these in-format bodies hashes to the
+        // stored 6-byte current: one attempt per command, exactly as a
+        // fixed-width change always charged for a wrong current PIN —
+        // including shapes the previous fixed 8+8 oracle refused outright.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, b"111111888888")
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x82, b"111111888888")
+            )
+            .1,
+            Sw::retries_left(1)
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, b"111111888888888")
+            )
+            .1,
+            Sw::retries_left(0)
+        );
+        // The new hash was never installed, and once the counter is spent
+        // the change refuses without touching anything.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, b"111111888888")
+            )
+            .1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"123456")
+            )
+            .1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+    }
+
+    #[test]
+    fn pw1_change_fail_closed_on_failing_store() {
+        let mut rng = TestRng(71);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        assert_eq!(applet.select().sw, Sw::OK);
+        applet.store.set_save_fails(true);
+        // A valid 6-byte change with a failing store reports the memory
+        // error, never a faked `9000`.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, b"123456654321")
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        // The new PIN lives in RAM until the save succeeds.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"654321")
+            )
+            .1,
+            Sw::OK
+        );
+        // After a re-select the persisted state governs: the ghost upgrade
+        // is gone and the old PIN governs again.
+        applet.store.set_save_fails(false);
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"654321")
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"123456")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn pw3_change_body_format_is_unchanged() {
+        let mut applet = applet();
+        let mut rng = TestRng(72);
+        // No session: the gate fires before the slot is touched, regardless
+        // of the body length.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"123456654321")
+            )
+            .1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x83, &[])).1,
+            Sw::retries_left(3)
+        );
+        verify_pw3(&mut applet, &mut rng);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"1234567899999999")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"99999999")
+            )
+            .1,
+            Sw::OK
+        );
+        // The variable-length body rule does not extend to the admin slot:
+        // with a session open, anything that is not 16 octets stays a
+        // format refusal.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"123456789999")
+            )
+            .1,
+            Sw::WRONG_DATA
+        );
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x83, &[])).1,
+            Sw::retries_left(3)
+        );
+    }
+
+    #[test]
+    fn sticky_floor_survives_pw1_variable_length_change() {
+        let mut rng = TestRng(73);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        assert_eq!(applet.select().sw, Sw::OK);
+        applet.store.set_save_fails(true);
+        // A mismatched body consumes its attempt; with a failing store the
+        // consumption is still reported as the save error, never masked.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, b"111111888888")
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        // The floor keeps the counter across a re-select.
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
+            Sw::retries_left(2)
+        );
+        // Once the store accepts saves again, a legitimate change persists
+        // and the new PIN is pinned on the public path.
+        applet.store.set_save_fails(false);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, b"123456654321")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"654321")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"123456")
+            )
+            .1,
+            Sw::retries_left(2)
         );
     }
 }

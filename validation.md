@@ -433,20 +433,66 @@ spec (o scdaemon só pre-verifica o admin para `chvno == 3` — verificado em
 | AC-2 | `VERIFY` PW1 (mod 81 e 82, `9000`) não estabelece autoridade: `CHANGE` 0x83 → `6982` | `pw1_verification_does_not_authorize_the_pw3_change` | **Verificado em host** |
 | AC-3 | Com sessão: `CHANGE` 0x83 → `9000`; `PUT DATA` responde sem novo `VERIFY` (sessão mantida); corrente errado com sessão segue o contrato do slot (`63Cx` persistido) e a sessão sobrevive | `pw3_change_with_session_swaps_the_pin_and_keeps_the_session` | **Verificado em host** |
 | AC-4 | `select()` recomeça o ciclo: `CHANGE` 0x83 → `6982` até um novo `VERIFY` 0x83 reabrir a sessão | `select_clears_pw3_and_change_requires_it_again` | **Verificado em host** |
-| AC-5 | PW1 sem regressão: troca sem sessão nos modos 81/82 com PIN de 8 bytes → `9000`; `len != 16` → `6A80` nos três modos | `pw1_change_still_works_without_a_session` | **Verificado em host** |
+| AC-5 | PW1 sem regressão: troca sem sessão nos modos 81/82 com PIN de 8 bytes → `9000`; corpo fora do intervalo de formato → `6A80` nos três modos | `pw1_change_still_works_without_a_session` | **Verificado em host** |
 | AC-6 | Piso S5: `CHANGE` 0x83 autenticado com store flaky → `6A84` (nunca `9000` falso) e o PIN novo não sobrevive ao re-`select`; os dois testes S5 existentes passam a pre-verificar o admin e seguem verdes | `change_with_failing_store_reports_the_save_error_and_never_fakes_success`, `happy_path_persists_assertions_are_unchanged_under_a_healthy_store` | **Verificado em host** |
 | AC-7 | A recusa sem sessão não consome tentativa do PW3 nem vira verify de graça: contador cheio no `VERIFY` vazio e o original ainda `9000` | `refused_pw3_change_never_consumes_a_retry` | **Verificado em host** |
 | AC-8 | Interop GnuPG (`VERIFY` 0x83 → `CHANGE` 0x83) e suítes S8/S9 sem regressão: suíte toda verde | `cargo test -p aegis-applets` (217 testes) | **Verificado em host** |
 
-Limitação registrada (L4): o PW1 default de 6 octetos (`123456`) não pode ser
-trocado via `0x24` hoje — o corpo da instrução é fixo `atual(8)+novo(8)`;
-PINs de comprimento variável (o correto da card spec/ecossistema) ficam para
-uma fatia própria. O AC-5 usa o PW1 de 8 bytes instalado pela porta admin da
-casa (`RESET RETRY COUNTER`).
+Limitação registrada (L4): ~~o PW1 default de 6 octetos (`123456`) não pode
+ser trocado via `0x24` hoje~~ — **resolvida pela fatia S11** (sub-seção a
+seguir): o default de fábrica agora é trocável pela porta pública. O AC-5
+da S10 segue usando o PW1 de 8 bytes instalado pela porta admin da casa
+(`RESET RETRY COUNTER`) para exercitar o corpo fixo 16 contra um slot de 8.
 
 Pendência física: estender `scripts/validate_openpgp.py` com o caso
 "`CHANGE` 0x83 sem `VERIFY` → `6982`" e conferir o fluxo real
 `gpg --card-edit` → `passwd` → "change Admin PIN" em RP2350 disponível.
+
+### OpenPGP: troca do PW1 default com corpo de comprimento variável (fatia S11, host)
+
+Fecha o gap L4 da S10: o caminho real do scdaemon
+(`app-openpgp.c::do_change_pin` + `iso7816.c::iso7816_change_reference_data`,
+verificados no código-fonte) monta o corpo de `CHANGE REFERENCE DATA` como a
+**concatenação exata** `atual‖novo`, sem delimitador e sem padding, com
+`Lc = oldlen + newlen` — com o default de fábrica, `Lc = 12`, que o filtro
+antigo (`len != 16`) recusava: o PW1 de fábrica era imutável pela porta
+pública. O `verify_change` agora aplica a regra da card spec §7.2.3
+("the length of the existing password is known in the card", `Lnew =
+Lc − Lold`): intervalo de formato `2·min ≤ Lc ≤ 2·max` (`12 ≤ Lc ≤ 254`;
+fora disso → `6A80` **antes de qualquer interação com o slot** — nenhuma
+tentativa consumida, nenhum save) e **delimitação pelo hash armazenado** —
+nova capacidade read-only `PinSlot::resolve_change` (`pin.rs`) escaneia os
+candidatos `L` da janela de política sem consumir tentativa; o match alimenta
+o `slot.change` de sempre (que restaura o contador e persiste sob o piso S5:
+`6A84` na falha de gravação) e a negativa consome **exatamente uma tentativa**
+(`63Cx` com persist) — o mesmo preço que o corpo fixo 16 já cobrava por
+corrente errado, sem ampliar o orçamento de bruteforça. Slot esgotado →
+`6983` sem tocar nada. O formato persistente não muda (sem bump de
+`PIN_STATE_VERSION`); `0x83` intocado (gate S10 + corpo fixo 16).
+
+| AC | Critério | Teste de host (`aegis-applets::openpgp`) | Status |
+|----|----------|------------------------------------------|--------|
+| AC-1 | Fresh `applet()`, sem `VERIFY` admin nem `RESET RETRY`: `CHANGE` 0x81 corpo 6+6 → `9000`; `VERIFY` 0x81 com o novo → `9000`, com o antigo → `63Cx`; contador restaurado (vazio → `63C3`) e persistido (após `select()`, o novo re-verifica) | `pw1_default_of_six_octets_is_changeable_on_the_public_path` | **Verificado em host** |
+| AC-2 | Comprimentos mistos: com PW1 de 6, `6+8` → `9000` + novo `9000`; com PW1 de 8 instalado via `RESET RETRY`, `8+6` → `9000` + novo `9000` — a delimitação segue o hash por candidato (`Lnew = Lc − Lold`), não um índice fixo | `pw1_change_follows_the_exact_lengths_of_the_command_body` | **Verificado em host** |
+| AC-3 | formato fora do intervalo (0, 11, 255 octetos) → `6A80` sem decremento (vazio → `63C3` depois) e sem gravação (`save_calls` intocado); corpo de 16 com corrente de 6 e corpo incompatível → semântica de sem-match do AC-4 (não mais rejeição de formato) | `pw1_change_rejects_bodies_outside_the_policy_range_without_tuning` | **Verificado em host** |
+| AC-4 | corrente errado (corpo no intervalo, nenhum split bate: 12, 14 e 15 octetos) → `63Cx` com **um único** decremento por comando (`63C2`→`63C1`→`63C0`) e persist; o hash novo nunca é instalado; esgotado → `6983` sem tocar nada | `pw1_change_consumes_one_attempt_per_mismatched_body` | **Verificado em host** |
+| AC-5 | Piso S5: troca válida 6+6 com store flaky → `6A84` (nunca `9000` falso); re-`select` → o novo não sobrevive e o antigo re-verifica | `pw1_change_fail_closed_on_failing_store` | **Verificado em host** |
+| AC-6 | PW3 intocado: sem sessão `0x83` (corpo de 12) → `6982` antes de tocar slot/contador/store; com sessão, corpo 16 → `9000` + novo `9000`; com sessão e `Lc≠16` (inclusive 12) → `6A80` sem consumo | `pw3_change_body_format_is_unchanged` | **Verificado em host** |
+| AC-7 | Suítes intactas: `gnupg_interop.rs` (sem `0x24`), `adversarial_apdu.rs` e `state_roundtrip.rs` sem edição; os dois testes de persistência S5 verdes; `pw1_change_still_works_without_a_session` continua verde com o comentário obsoleto atualizado (o corpo de 11 octetos mantém a recusa de formato do teste) | `cargo test -p aegis-applets` (224 testes) | **Verificado em host** |
+| AC-8 | Contratos documentados em `pin.rs`: delimitação por comprimento conhecido como **leitura** do slot (não decrementa; diagnósticos de unset/blocked idênticos aos do `verify`); autorização no chamador; sem mudança de encoding (`PIN_STATE_VERSION` intacto, testes de encoding existentes verdes) | doc-comments de `pin.rs` (revisão estática) | **Verificado** |
+
+Nota de resolução da spec: a spec da fatia lista o corpo de 15 octetos do
+teste da S10 entre os "recusados como hoje" (`6A80`); com a janela
+normativa `12 ≤ Lc ≤ 254` ele entra no escaneamento e, sem split que bate
+com o corrente, responde `63Cx` (um consumo), como qualquer corpo
+in-definido no intervalo — a recusa de formato fica para `Lc < 12` ou
+`> 254`. O teste da S10 usa um corpo de 11 octetos para manter a recusa
+sem consumo, e o caso de 15 octetos com corrente errado está coberto pelo
+AC-4. Contradição interna da spec registrada aqui para o review.
+
+Pendência física: estender `scripts/validate_openpgp.py` com o caso
+"troca do PW1 default de 6 → corpo 12 → `9000`" e o fluxo
+`gpg --card-edit` → `passwd` → "change PIN" em RP2350 disponível.
 
 ## SSH / Git signing (Fase 15, AC-020)
 
@@ -651,6 +697,7 @@ acessível via `hidraw`.
 | AC-025 | OpenPGP: frames malformados de DECIPHER e corpos D2 fora de domínio → SW fechado único, corpo vazio, sem pânico/gravar/eco de material; fronteiras 24/32/40/48 aceitas; fallback parcial documentado; limite de resposta 2048 registrado; ponto zero X25519 = comportamento da curva | Testes de host `aegis-applets::openpgp` (fatia S8) | **Verificado em host** (8 testes novos); sem pendência de hardware |
 | AC-026 | OpenPGP: o estado gravado por um comando aceito sobrevive à sessão — `decode_state` aceita exatamente a geometria que o writer produz (slot de decifra, UNSET/ECDH P-256, `len` 104), larguras desconhecidas fail-closed, sem bump de versão (livro-in do blob v3) | Testes de host `aegis-applets::openpgp` (fatia S9, `state_roundtrip`) | **Verificado em host** (5 testes novos + inversão do teste S8); power cycle físico + GnuPG em hardware pendente |
 | AC-027 | OpenPGP: `CHANGE REFERENCE DATA` do PW3 (`P2=0x83`) exige a sessão de admin (`6982` sem tocar estado, contador ou store); o PW1 (`0x81`/`0x82`) mantém a autoridade do corrente no corpo; sessão mantida pela troca | Testes de host `aegis-applets::openpgp` (fatia S10) | **Verificado em host** (6 testes novos + 2 S5 atualizados); extensão do `validate_openpgp.py` + interop `gpg` físicos pendentes |
+| AC-028 | OpenPGP: `CHANGE REFERENCE DATA` do PW1 aceita o corpo variável `atual‖novo` da card spec (`12 ≤ Lc ≤ 254`; fora → `6A80` sem tocar slot/contador/store; delimitação pelo hash armazenado — varredura read-only `PinSlot::resolve_change`; corrente errado → exatamente **uma** tentativa `63Cx` com persist; piso S5 com `6A84` na falha de gravação; `0x83` mantém corpo fixo 16 + gate da S10; sem bump de `PIN_STATE_VERSION`) | Testes de host `aegis-applets::openpgp` (fatia S11) | **Verificado em host** (7 testes novos + comentário do teste S10 atualizado); `validate_openpgp.py` + interop `gpg --card-edit` físicos pendentes |
 
 ### Fases 7e — credential management e `changePIN` (host; hardware pendente)
 
