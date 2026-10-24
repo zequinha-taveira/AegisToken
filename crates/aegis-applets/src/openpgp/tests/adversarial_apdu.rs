@@ -132,7 +132,15 @@ fn assert_never_leaks<S: OpenPgpStore>(
 /// it. Returns the card point of the decryption key (the `86` DO of
 /// `GENERATE`) so tests build expected values independently of the applet.
 pub(crate) fn ecdh_p256_applet(seed: u64) -> (OpenPgp<MemoryOpenPgpStore>, TestRng, [u8; 65]) {
-    let mut applet = applet();
+    ecdh_p256_applet_over(MemoryOpenPgpStore::new(), seed)
+}
+
+/// The same fixture over a store the caller supplies, so a test that counts
+/// the saves (or failures) the provisioning performs can sit inside the same
+/// session.
+fn ecdh_p256_applet_over<S: OpenPgpStore>(store: S, seed: u64) -> (OpenPgp<S>, TestRng, [u8; 65]) {
+    let mut applet = OpenPgp::new(store);
+    assert_eq!(applet.select().sw, Sw::OK);
     let mut rng = TestRng(seed);
     verify_pw3(&mut applet, &mut rng);
     let public = generate(&mut applet, &mut rng, 0xB8);
@@ -764,18 +772,31 @@ fn x25519_zero_point_is_curve_behavior_not_an_error() {
     );
 }
 
-/// INFO (registered limitation, not an acceptance criterion): a deciphered
-/// message of exactly 2048 bytes still fits the response buffer; one byte
-/// more answers `6A84` with an empty body. The boundary is interop-relevant
-/// (GnuPG messages over 2 KB) and logged in `roadmap.md` for a future
-/// decision — the suite records it, it does not fix it.
+/// AC-1..AC-3 of `specs/openpgp-decipher-response-window.md`; AC-4 is the
+/// intactness of the sibling suites this module belongs to, verified by the
+/// gates. This is the INFO limitation the S8 suite recorded, re-anchored as
+/// the executable contract after decision (C): the 2048-octet response
+/// window of the full-RFC 6637 decipher is kept, not widened. Exactly 2047
+/// and 2048 octets ride the window byte for byte; 2049 refuses `6A84` with
+/// an empty body — zero bytes beyond the window, the private material stays
+/// on its documented route, and the refusal leaves the session (slot
+/// material, store saves, PW1 mode 82 flag) pristine, with a small decipher
+/// on the same slot immediately after. The real transport ceiling, measured
+/// over the CCID pipeline, lives in `response_window` (AC-5).
 #[test]
-fn response_over_two_kilobytes_is_a_documented_limitation() {
-    let (mut applet, mut rng, _) = ecdh_p256_applet(43);
+fn decipher_response_window_boundary_is_the_frozen_contract() {
+    let (mut applet, mut rng, _) =
+        ecdh_p256_applet_over(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()), 43);
     let ephemeral_point = fixture_ephemeral_point();
     let anchored = applet.ecdh_material().expect("the material is provisioned");
+    let saved = applet.store.save_calls;
+    assert!(
+        applet.pw1_other_verified,
+        "PW1 in mode 82 is verified at the start"
+    );
 
     for (data_len, expected_sw) in [
+        (2047usize, Sw::OK),
         (2048usize, Sw::OK),
         (2049usize, Sw::NOT_ENOUGH_MEMORY),
         (2100usize, Sw::NOT_ENOUGH_MEMORY),
@@ -784,7 +805,7 @@ fn response_over_two_kilobytes_is_a_documented_limitation() {
         let ciphertext = streamed_body(&SESSION_KEY, &data);
         assert!(
             ciphertext.len() <= pgp_sym::MAX_DATA,
-            "the size refusal belongs to AC-5, not to this limitation"
+            "the size refusal beyond the stream limit is the separate closed contract"
         );
         let command = point_command(&ephemeral_point, Some(&ciphertext));
         let (plain, sw) = run(
@@ -792,18 +813,53 @@ fn response_over_two_kilobytes_is_a_documented_limitation() {
             &mut rng,
             &extended_frame(INS_PSO, 0x80, 0x86, &command),
         );
-        assert_eq!(sw, expected_sw, "the {data_len}-byte message boundary");
+        assert_eq!(sw, expected_sw, "the {data_len}-octet window boundary");
         if sw == Sw::OK {
-            assert_eq!(plain.len(), 2048);
+            assert_eq!(
+                plain.len(),
+                data_len,
+                "the window returns the whole message"
+            );
+            assert_eq!(plain.as_slice(), &data[..], "byte-exact inside the window");
+        } else {
+            assert!(
+                plain.is_empty(),
+                "`6A84` with an empty body: zero bytes beyond the window"
+            );
+            assert_eq!(
+                applet.ecdh_material().as_ref(),
+                Some(&anchored),
+                "the refusal kept the slot (AC-3)"
+            );
+            assert_eq!(
+                applet.store.save_calls, saved,
+                "no save on a window refusal (AC-3)"
+            );
+            assert!(
+                applet.pw1_other_verified,
+                "the refusal left the PW1 mode 82 flag intact (AC-3)"
+            );
+            // A small decipher on the same slot rounds the boundary refusal.
+            let small = vec![0x11u8; 256];
+            let ciphertext = streamed_body(&SESSION_KEY, &small);
+            let command = point_command(&ephemeral_point, Some(&ciphertext));
+            let (plain, sw) = run(
+                &mut applet,
+                &mut rng,
+                &extended_frame(INS_PSO, 0x80, 0x86, &command),
+            );
+            assert_eq!(sw, Sw::OK, "the session survives a window refusal (AC-3)");
             assert_eq!(
                 plain.as_slice(),
-                &data[..],
-                "the literal data of the boundary message"
+                small.as_slice(),
+                "byte-exact decipher right after the refusal (AC-3)"
             );
-        } else {
-            assert!(plain.is_empty(), "no fragment escapes the buffer limit");
         }
         assert_eq!(applet.ecdh_material().as_ref(), Some(&anchored));
         assert_never_leaks(&plain, &applet, None);
     }
+    assert_eq!(
+        applet.store.save_calls, saved,
+        "the whole boundary tour saves nothing (AC-3)"
+    );
 }

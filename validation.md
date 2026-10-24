@@ -358,11 +358,12 @@ de sessão embrulhada ou um segredo compartilhado fora da rota documentada
 | AC-6 | Anti-serialização por janela: nenhuma resposta de recusa reproduz a chave privada do slot, a chave de sessão embrulhada ou um segredo compartilhado fora da rota documentada (o `Z` da decifra parcial é a rota documentada) | verificação embutida em cada recusa dos testes acima (`assert_never_leaks`) | **Verificado em host** |
 | AC-7 | Ponto zero X25519 é comportamento da curva, não erro: resposta determinística `9000` + 32 zeros, portão PW1 `82` antes; recusar pontos não contributivos é não-objetivo | `x25519_zero_point_is_curve_behavior_not_an_error` | **Verificado em host** |
 
-Limitação registrada (INFO, não critério de aceitação): mensagens de exatamente
-2048 bytes ainda cabem no buffer de resposta; um byte a mais responde `6A84`
-com corpo vazio. A fronteira 2048/2049 é gravada por
-`response_over_two_kilobytes_is_a_documented_limitation` e segue para decisão
-futura no `roadmap.md` — a suíte a registra, não a corrige.
+Limitação registrada e **decidida pela fatia S12** (mantida; sub-seção abaixo):
+mensagens de exatamente 2048 bytes ainda cabem no buffer de resposta; um byte a
+mais responde `6A84` com corpo vazio. A fronteira 2047/2048/2049 é o contrato
+executável re-ancorado em `decipher_response_window_boundary_is_the_frozen_contract`
+(`adversarial_apdu.rs`) e o teto real de transporte está na sub-seção S12
+abaixo — a suíte a registra e a decisão a fecha.
 
 Achado do ciclo (bug de produção, fix for a fatia própria): um `PUT DATA D2`
 aceito persiste o slot de decifra com `len = 104` (32 bytes de escalar +
@@ -493,6 +494,40 @@ AC-4. Contradição interna da spec registrada aqui para o review.
 Pendência física: estender `scripts/validate_openpgp.py` com o caso
 "troca do PW1 default de 6 → corpo 12 → `9000`" e o fluxo
 `gpg --card-edit` → `passwd` → "change PIN" em RP2350 disponível.
+
+### OpenPGP: janela de resposta da decifra — decisão de manter `0x6A84` (fatia S12, host)
+
+Decisão de política (rota C, spec
+`specs/openpgp-decipher-response-window.md`, revalidada no código): **manter a
+janela de 2048 octets** do modo RFC 6637 — nenhum buffer muda (a rota (A)
+"ampliar buffers" custa ≈ +8,1 KB e sem a entrada ampliada não muda nada em
+hardware; a rota (B) "resposta parcial `61xx`" colapsa em (A) porque a
+maquinaria do `Chainer` já existe — ambas rejeitadas por números na spec). O
+que a fatia fecha é o contrato observável, por teste de host: re-ancora o
+INFO da S8 como contrato executável (`adversarial_apdu.rs`) e congela o
+**teto real no transporte** num teste novo (`response_window.rs`) sobre o
+pipeline CCID completo (assembler → card → router → applet, o `DefaultCard`
+do firmware 2048/2100): a janela do applet é inalcançável via transporte — a
+entrada de 2100 octets trava antes; o maior comando decifrável do molde
+`86‖80` estendido do scdaemon responde `9000` byte-exata e um octeto a mais
+de frame falha com `CcidError::Overflow` sem SW (o `card.reset()` silencioso
+que o firmware aplica fica documentado, não resolvido). Mensagem > ~2 KB é
+decifra parcial (card spec, `9000` + Z) ou no host — decisão registrada, não
+"códigos de ampliação futuros".
+
+| AC | Critério | Teste de host (`aegis-applets::openpgp`) | Status |
+|----|----------|------------------------------------------|--------|
+| AC-1 | Fronteira exata no applet: 2047 → `9000` com 2047 octetos; 2048 → `9000` com 2048; 2049 → `6A84` | `decipher_response_window_boundary_is_the_frozen_contract` | **Verificado em host** |
+| AC-2 | Byte-exact e zero bytes além da janela: no `9000` o corpo é a mensagem inteira; no `6A84` o corpo é vazio — nenhuma cópia do texto claro, da chave embrulhada ou de `Z` (anti-serialização por `assert_never_leaks`) | mesmo teste | **Verificado em host** |
+| AC-3 | Recusa sem estado: material do slot idêntico ao provisionado, `save_calls` intocado, flag PW1 modo 82 intacta e uma decifra pequena (256) subseqüente no mesmo slot → `9000` byte-exata | mesmo teste | **Verificado em host** |
+| AC-4 | Suítes intactas sem edição: `gnupg_interop.rs`, `adversarial_apdu.rs` (o INFO da limitação, re-ancorado para referir esta spec) e `state_roundtrip.rs` verdes | `cargo test -p aegis-applets` (225 testes) | **Verificado em host** |
+| AC-5 | Teto real de transporte (pipeline CCID completo, `DefaultCard`): o maior molde decifrável que cabe no frame responde `9000` byte-exata; um octeto a mais de frame → `card.feed` → `Err(CcidError::Overflow)` — nenhum SW, nenhum byte; o applet nunca vê o comando (`save_calls` intocado, `out` ainda com a resposta do comando anterior) | `transport_ceiling_of_the_full_decipher_is_the_ccid_input` | **Verificado em host** |
+
+Pendência física (apenas verificação de comportamento já decidido, não AC):
+observar em RP2350 o fallthrough de uma mensagem > janela num cliente GnuPG
+real (queda de sessão silenciosa pós-frame grande) junto com as demais
+pendências de hardware (AC-017/019/021): `validate_openpgp.py` não muda neste
+ciclo — sem hardware, sem senha nova, sem AC físico.
 
 ## SSH / Git signing (Fase 15, AC-020)
 
@@ -698,6 +733,7 @@ acessível via `hidraw`.
 | AC-026 | OpenPGP: o estado gravado por um comando aceito sobrevive à sessão — `decode_state` aceita exatamente a geometria que o writer produz (slot de decifra, UNSET/ECDH P-256, `len` 104), larguras desconhecidas fail-closed, sem bump de versão (livro-in do blob v3) | Testes de host `aegis-applets::openpgp` (fatia S9, `state_roundtrip`) | **Verificado em host** (5 testes novos + inversão do teste S8); power cycle físico + GnuPG em hardware pendente |
 | AC-027 | OpenPGP: `CHANGE REFERENCE DATA` do PW3 (`P2=0x83`) exige a sessão de admin (`6982` sem tocar estado, contador ou store); o PW1 (`0x81`/`0x82`) mantém a autoridade do corrente no corpo; sessão mantida pela troca | Testes de host `aegis-applets::openpgp` (fatia S10) | **Verificado em host** (6 testes novos + 2 S5 atualizados); extensão do `validate_openpgp.py` + interop `gpg` físicos pendentes |
 | AC-028 | OpenPGP: `CHANGE REFERENCE DATA` do PW1 aceita o corpo variável `atual‖novo` da card spec (`12 ≤ Lc ≤ 254`; fora → `6A80` sem tocar slot/contador/store; delimitação pelo hash armazenado — varredura read-only `PinSlot::resolve_change`; corrente errado → exatamente **uma** tentativa `63Cx` com persist; piso S5 com `6A84` na falha de gravação; `0x83` mantém corpo fixo 16 + gate da S10; sem bump de `PIN_STATE_VERSION`) | Testes de host `aegis-applets::openpgp` (fatia S11) | **Verificado em host** (7 testes novos + comentário do teste S10 atualizado); `validate_openpgp.py` + interop `gpg --card-edit` físicos pendentes |
+| AC-029 | OpenPGP: a janela de resposta de 2048 octets da decifra RFC 6637 é **mantida** (decisão C, sem mudança de buffer): fronteira do applet 2047/2048 → `9000` byte-exata e 2049 → `6A84` com corpo vazio como contrato executável (zero vazamento, recusa sem tocar estado/sessão); o teto real no transporte CCID — entrada de 2100 octets, maior comando decifrável do molde `86‖80` → `9000`, um octeto a mais → `CcidError::Overflow` sem SW e `card.reset()` documentado — congelado por teste de host; mensagem > ~2 KB é decifra parcial (card spec) ou no host | Testes de host `aegis-applets::openpgp` (fatia S12) | **Verificado em host** (1 teste novo + INFO da S8 re-ancorado como contrato); verificação física em cliente GnuPG real pendente junto com o hardware de AC-017/019/021 |
 
 ### Fases 7e — credential management e `changePIN` (host; hardware pendente)
 

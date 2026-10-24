@@ -1955,6 +1955,7 @@ mod tests {
 
     mod adversarial_apdu;
     mod gnupg_interop;
+    mod response_window;
     mod state_roundtrip;
 
     /// The OpenPGP Card 3.4.1 section 4.4.3.10 returns the public key of an EC key
@@ -2065,7 +2066,7 @@ mod tests {
         (data, response.sw)
     }
 
-    fn verify_pw3(applet: &mut OpenPgp<MemoryOpenPgpStore>, rng: &mut TestRng) {
+    fn verify_pw3<S: OpenPgpStore>(applet: &mut OpenPgp<S>, rng: &mut TestRng) {
         assert_eq!(
             run(applet, rng, &frame(INS_VERIFY, 0, 0x83, b"12345678")).1,
             Sw::OK
@@ -2079,8 +2080,8 @@ mod tests {
         );
     }
 
-    fn generate(
-        applet: &mut OpenPgp<MemoryOpenPgpStore>,
+    fn generate<S: OpenPgpStore>(
+        applet: &mut OpenPgp<S>,
         rng: &mut TestRng,
         tag: u8,
     ) -> Vec<u8, 2048> {

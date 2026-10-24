@@ -1206,10 +1206,10 @@ adiado.
   pontos não contributivos é não-objetivo); e, embutido em cada recusa, um
   anti-serialização por janela que garante que nenhuma resposta ecoa chave
   privada, chave de sessão embrulhada ou segredo compartilhado fora da rota
-  documentada. Limitação registrada (a suíte grava, não corrige): mensagens de
-  2049+ bytes respondem `6A84` com corpo vazio (2048 ainda cabe) — decisão
-  futura sobre ampliar a janela de resposta fica registrada em
-  `validation.md`. Achado do ciclo, sem fix nesta fatia: `PUT DATA D2` aceito
+  documentada. Limitação registrada e **decidida pela fatia S12** (ver
+  abaixo): mensagens de 2049+ bytes respondem `6A84` com corpo vazio (2048
+  ainda cabe) — a janela foi mantida, com o teto real de transporte congelado
+  por teste. Achado do ciclo, sem fix nesta fatia: `PUT DATA D2` aceito
   persiste `len = 104`, e o `decode_state` recusa slot não-RSA com
   `len > 48` — numa sessão nova o applet perde chaves e PINs e reseta para os
   padrões; recarregas na mesma sessão mascaram (chaves em RAM sobrevivem ao
@@ -1284,6 +1284,38 @@ adiado.
   extensão do `validate_openpgp.py` (troca do default de 6 → corpo 12 →
   `9000` + fluxo `gpg --card-edit` → `passwd`) em RP2350; registrado em
   `validation.md`. Spec: `specs/openpgp-pw1-min-length-change.md`.
+
+- **OpenPGP S12 — janela de resposta da decifra: decisão de manter `0x6A84` +
+  teto real de transporte registrado (entregue):** decisão de política (rota C)
+  sobre custo de RAM × janela decifrável, fechada com evidência do código e do
+  ecossistema: **manter a janela de 2048 octets** — nenhum buffer muda (`out`
+  do applet, `Chainer` do roteador, entrada e `out_buf` CCID; a rota (A)
+  "ampliar buffers" custa ≈ +8,1 KB e não muda nada em hardware sem tocar a
+  entrada, e a rota (B) "resposta parcial `61xx`" colapsa em (A) porque a
+  maquinaria do `Chainer` já existe — rejeitadas por números na spec). O que
+  fecha é o contrato observável, congelado por teste: (i) a fronteira do
+  applet passa a contrato executável — o INFO da S8 em `adversarial_apdu.rs`
+  foi re-ancorado em
+  `decipher_response_window_boundary_is_the_frozen_contract` (2047/2048 →
+  `9000` byte-exata; 2049 → `6A84` com corpo vazio, zero bytes além da
+  janela, anti-serialização por `assert_never_leaks` e sessão intacta — slot,
+  `save_calls`, flags PW1 — com decifra pequena no mesmo slot logo após);
+  (ii) o **teto real no transporte** é teste de host novo
+  (`openpgp::tests::response_window`): no pipeline CCID completo
+  (assembler → card → router → applet, o `DefaultCard` do firmware,
+  2048/2100) a janela do applet é inalcançável — a **entrada** é o limite: o
+  maior comando decifrável do molde `86‖80` estendido do scdaemon que cabe
+  numa mensagem CCID de 2100 octets responde `9000` byte-exata, e um octeto a
+  mais de frame → `CcidError::Overflow` antes do applet rodar — sem SW, sem
+  bytes, sem gravação (o `card.reset()` silencioso que o firmware aplica no
+  erro fica documentado, não resolvido: não-objetivo). Mensagens > ~2 KB são
+  decifra parcial (card spec, `9000` + Z) ou no host, por decisão; ampliações
+  futuras (ex.: mensagem maior que o arquivo) são fatias novas com a
+  evidência da §3. Sem mudança de produção, de `unsafe`, de dependência ou de
+  versão de estado; sem hardware neste ciclo (verificação física em cliente
+  real pendente em `validation.md`). Spec:
+  `specs/openpgp-decipher-response-window.md`. Suite em **225 testes** de
+  host em `aegis-applets`.
 
 ## Persistência selada dos applets (entregue)
 

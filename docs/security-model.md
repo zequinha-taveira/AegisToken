@@ -227,10 +227,19 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   the only route where derived secret material leaves the card, gated by PW1
   in mode 82; an all-zero X25519 point agrees to the all-zero shared secret —
   the card accepts it as curve behavior, and refusing non-contributory points
-  is a documented non-goal; ciphertext the card cannot decrypt answers `0x6F00`
-  without ever being decoded upstream; messages over 2048 bytes hit the
-  response-buffer limit (`0x6A84`, empty body) and the boundary is recorded in
-  `roadmap.md` for a future widening decision.
+  is a documented non-goal; ciphertext the card cannot decrypt answers
+  `0x6F00` without ever being decoded upstream; the 2048-octet response
+  window of the full-RFC 6637 decipher is a recorded interop decision — it is
+  kept, not widened (`specs/openpgp-decipher-response-window.md`): at the
+  applet boundary a 2048-octet message answers `0x9000` byte for byte and
+  2049 answers `0x6A84` with an empty body. Over the real CCID transport that
+  window is unreachable because the command input closes first: the largest
+  scdaemon-shaped command (`86‖80`, extended frame) that fits one 2100-octet
+  CCID message answers `0x9000` byte for byte, and one octet of frame more
+  dies in the assembler with `CcidError::Overflow` before any applet code
+  runs — the firmware then resets the card silently and answers nothing
+  (documented, not negotiated). Messages over the window are the documented
+  partial decrypt (card spec `0x9000` + `Z`) or a host-side job.
 - **Each signing operation honours its touch policy.** When a slot or
   credential requires touch, the applet arms the contextual presence machine
   and fails with the applet's standard error on absence or timeout.
