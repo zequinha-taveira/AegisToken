@@ -1643,14 +1643,21 @@ impl<S: OpenPgpStore> OpenPgp<S> {
     }
 
     fn verify_change(&mut self, apdu: &Apdu<'_>) -> Response<'_> {
-        let slot = match apdu.p2 {
-            0x81 | 0x82 => &mut self.pw1,
-            0x83 => &mut self.pw3,
-            _ => return Response::status(Sw::INCORRECT_PARAMETERS),
-        };
+        let admin = apdu.p2 == 0x83;
+        if !matches!(apdu.p2, 0x81..=0x83) {
+            return Response::status(Sw::INCORRECT_PARAMETERS);
+        }
+        // Changing the admin PIN is session-gated like `reset_retry`: the
+        // authority comes from the session, not only from the body. The
+        // refusal happens before the slot is touched, so no attempt is
+        // consumed and nothing is persisted.
+        if admin && !self.pw3_verified {
+            return Response::status(Sw::SECURITY_STATUS_NOT_SATISFIED);
+        }
         if apdu.data.len() != 16 {
             return Response::status(Sw::WRONG_DATA);
         }
+        let slot = if admin { &mut self.pw3 } else { &mut self.pw1 };
         let result = slot.change(&apdu.data[..8], &apdu.data[8..]);
         if self.persist_state() {
             Response::status(result.err().unwrap_or(Sw::OK))
@@ -3715,6 +3722,16 @@ mod tests {
         let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
         assert_eq!(applet.select().sw, Sw::OK);
         applet.store.set_save_fails(true);
+        // The admin session opens the gate before the change is attempted.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::OK
+        );
         // The change is refused with the memory error instead of `9000` (AC-3).
         assert_eq!(
             run(
@@ -3942,6 +3959,16 @@ mod tests {
             run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
             Sw::retries_left(2)
         );
+        // The admin session opens the gate before the change is attempted.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::OK
+        );
         // The admin change persists: the new PW3 verifies after the reopen.
         assert_eq!(
             run(
@@ -4055,6 +4082,305 @@ mod tests {
             .1,
             Sw::OK
         );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn pw3_change_requires_the_admin_session_and_leaves_the_state_untouched() {
+        let mut rng = TestRng(61);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        assert_eq!(applet.select().sw, Sw::OK);
+        // The initial provisioning already wrote the defaults once.
+        let saves_before = applet.store.save_calls;
+        // Without an admin session the change is refused out of hand, no
+        // matter that the body carries the correct PIN.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"1234567899999999")
+            )
+            .1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        // The refusal is a session verdict: the store never saw a save.
+        assert_eq!(applet.store.save_calls, saves_before);
+        // The hash is intact: the requested PIN does not verify (one spent
+        // attempt) and the original one still does.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"99999999")
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn pw1_verification_does_not_authorize_the_pw3_change() {
+        let mut applet = applet();
+        let mut rng = TestRng(62);
+        // Both PW1 sessions are open; the admin slot stays fenced: only the
+        // VERIFY 0x83 session opens the gate.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"123456")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x82, b"123456")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"1234567899999999")
+            )
+            .1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+    }
+
+    #[test]
+    fn pw3_change_with_session_swaps_the_pin_and_keeps_the_session() {
+        let mut applet = applet();
+        let mut rng = TestRng(63);
+        verify_pw3(&mut applet, &mut rng);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"1234567899999999")
+            )
+            .1,
+            Sw::OK
+        );
+        // The swap did not consume the session: an admin operation answers
+        // without a fresh VERIFY.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0x5B, b"Alice")
+            )
+            .1,
+            Sw::OK
+        );
+        // The new PIN verifies (fresh counter) and the old one is gone (the
+        // failed probe above costs one attempt).
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"99999999")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        // A wrong current PIN under a live session still follows the slot
+        // contract (63Cx, persisted) — and the session survives that too.
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"99999999")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"8765432199999999")
+            )
+            .1,
+            Sw::retries_left(1)
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0x5B, b"Bob")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn select_clears_pw3_and_change_requires_it_again() {
+        let mut applet = applet();
+        let mut rng = TestRng(64);
+        verify_pw3(&mut applet, &mut rng);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"1234567899999999")
+            )
+            .1,
+            Sw::OK
+        );
+        // A re-select drops the session: the same command shape is refused
+        // until the admin verifies again.
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"9999999988888888")
+            )
+            .1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"99999999")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"9999999988888888")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn pw1_change_still_works_without_a_session() {
+        let mut applet = applet();
+        let mut rng = TestRng(65);
+        // Install an 8-byte PW1 through the admin door (the 6-byte default
+        // cannot go through a 16-byte CHANGE body yet).
+        verify_pw3(&mut applet, &mut rng);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x81, b"99999999")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(applet.select().sw, Sw::OK);
+        // A wrong-length body is refused regardless.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, b"AAAAAAAAAAAAAAA")
+            )
+            .1,
+            Sw::WRONG_DATA
+        );
+        // Both modes swap the PW1 on the strength of the current PIN alone,
+        // with no admin session at all.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x81, b"9999999977777777")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x82, b"7777777755555555")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"55555555")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn refused_pw3_change_never_consumes_a_retry() {
+        let mut applet = applet();
+        let mut rng = TestRng(66);
+        // The refusal is identical whether the body guesses the PIN right
+        // or wrong: a session-less change never reaches the slot.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"1234567899999999")
+            )
+            .1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"0000000099999999")
+            )
+            .1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        // The counter is untouched…
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x83, &[])).1,
+            Sw::retries_left(3)
+        );
+        // …and the slot still takes its legitimate verification.
         assert_eq!(
             run(
                 &mut applet,
