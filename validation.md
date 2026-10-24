@@ -229,6 +229,225 @@ certificados completos e `gpg --card-edit` ficam para validação posterior.
 Curvas fora de escopo: brainpoolP512r1 / X448 / Ed448 (sem aritmética `no_std`
 madura em Rust); brainpoolP256r1 e P384r1 seguem suportados.
 
+### OpenPGP: `RESET RETRY COUNTER` exige PW3 (fatia S4, host)
+
+O `RESET RETRY COUNTER` (`00 2C …`) deixou de ser um caminho público: com
+`P1=0x02`/`P2=0x81` ele exige o PIN admin já verificado na sessão
+(`pw3_verified`) e responde `6982` sem alterar nenhum estado na negativa; o
+caminho do Resetting Code (`P1=0x00`) responde `6A81` enquanto o BC não é
+provisionado; `P1` ou `P2` desconhecidos respondem `6A86`. O desbloqueio
+autenticado restaura os retries do PW1 para o máximo da política, nunca mexe
+no PW3 e não consome a sessão de PW3.
+
+| AC | Critério | Teste de host (`aegis-applets::openpgp`) | Status |
+|----|----------|------------------------------------------|--------|
+| AC-1 | SRS (P1=02, P2=81) sem PW3 → `6982`, estado inalterado (hash, contador e sessão PW1 intactos) | `reset_retry_requires_pw3_and_leaves_state_untouched` | **Verificado em host** |
+| AC-2 | Com PW3 verificado: PW1 novo verifica, contador restaurado (`63C3`) e PW3 intacto | `reset_retry_with_pw3_sets_new_pw1_and_restores_retries` | **Verificado em host** |
+| AC-3 | O comando não encerra a sessão de PW3 (`PUT DATA` segue OK sem novo `VERIFY`) | `reset_retry_does_not_end_the_pw3_session` | **Verificado em host** |
+| AC-4 | P2 desconhecido → `6A86`, estado inalterado | `reset_retry_rejects_unknown_p2` | **Verificado em host** |
+| AC-5 | Caminho do Resetting Code (P1=00) → `6A81`, estado inalterado | `reset_retry_rejects_the_resetting_code_path` | **Verificado em host** |
+| AC-6 | `select()` limpa a sessão: novo SRS sem PW3 volta a `6982` | `select_clears_pw3_and_reset_retry_requires_it_again` | **Verificado em host** |
+| AC-7 | PW1 bloqueado continua bloqueado até o unblock autenticado | `blocked_pw1_stays_blocked_until_authenticated_unblock` | **Verificado em host** |
+| AC-8 | Contato do `unblock` documentado (autorização é do chamador) | doc-comment de `PinSlot::unblock` (`pin.rs`) | **Verificado** (revisão estática) |
+
+**Limitação (gate de hardware pendente):** sem RP2350 físico nesta sessão, a
+validação física do `0x2C` fica registrada: estender
+`scripts/validate_openpgp.py` com o caso "RST RETRY COUNTER sem PW3 →
+`6982`" (o script hoje não exerce `0x2C`) e conferir o fluxo com `gpg`
+(`gpg --change-pin` / unblock) quando houver dispositivo.
+
+### OpenPGP: persistência de PIN fail-closed (fatia S5, host)
+
+Os mutadores de PIN do OpenPGP (`VERIFY` com tentativa consumida,
+`CHANGE REFERENCE DATA`, `RESET RETRY COUNTER` autenticado e `PUT DATA`
+aceito) propagam a falha de gravação do estado selado com **`6A84`** em vez de
+confirmar a mutação (`9000`/`63Cx`): o estado em RAM fica restritivo e um
+**piso sticky por slot** (volátil de sessão, sobrevive a `select()`) comanda um
+clamp `min(restaurado, piso)` em todo reload, então re-selecionar nunca
+ressuscita tentativas; um persist bem-sucedido reancora o piso. `VERIFY`
+bem-sucedido emite um save a menos (nada persistível muda). Write-ahead por
+tentativa ficou deliberadamente de fora (desgaste de flash); o resíduo entre
+power cycles — o estado persistido governa até o próximo persist ok — está
+documentado em `docs/security-model.md` como modelo de degradação, não como
+gap.
+
+| AC | Critério | Teste de host (`aegis-applets::openpgp`) | Status |
+|----|----------|------------------------------------------|--------|
+| AC-1 | `VERIFY` que consome tentativa com store em falha → `6A84` (nunca `63Cx`); contador em RAM decrementado (`63C2`) e bloqueio `6983` quando esgota | `verify_failure_with_failing_store_reports_the_save_error` | **Verificado em host** |
+| AC-2 | Piso sticky entre re-seleções: `select()` não restaura o contador (`63C2`); com store íntegra o re-select mantém o comportamento atual | `sticky_floor_survives_reselect` (+ `happy_path_persists_assertions_are_unchanged_under_a_healthy_store`) | **Verificado em host** |
+| AC-3 | `CHANGE REFERENCE DATA` com save falhando → `6A84` (nunca `9000`); PIN novo verifica in-session; após `select()` o PIN antigo volta a verificar | `change_with_failing_store_reports_the_save_error_and_never_fakes_success` | **Verificado em host** |
+| AC-4 | `RESET RETRY COUNTER` (P1=02, P2=81, `pw3_verified`) com save falhando → `6A84`; após `select()` o PW1 retorna ao estado persistido (bloqueado → `6983`); unblock definitivo só sob persistência ok | `unblock_with_failing_store_keeps_the_persisted_blocked_state` | **Verificado em host** |
+| AC-5 | `PUT DATA` aceito com save falhando → `6A84` e DO antigo após `select()`; rejeitado (`WRONG_DATA`) não emite save | `put_data_with_failing_store_reports_the_save_error` | **Verificado em host** |
+| AC-6 | Clamp no carregamento: `min(Y, X)` para PW1 e PW3; store íntegra sem efeito | `reload_never_climbs_above_the_session_floor` | **Verificado em host** |
+| AC-7 | Caminho feliz inalterado (persistência de verify errado/change/unblock/put_data; `VERIFY` bem-sucedido não chama `save`; defaults de `ensure_loaded` sobrevivem a store falhando) | `happy_path_persists_assertions_are_unchanged_under_a_healthy_store`, `successful_verify_does_not_call_save`, `provisioning_defaults_survive_a_failing_store` | **Verificado em host** |
+| AC-8 | Contrato em `pin.rs` (persistência é do handler, resultado propagado) e trade-off registrado em `docs/security-model.md` (piso intra-sessão; power cycle pelo persistido; write-ahead rejeitado) | doc-comment do módulo `pin.rs` + `docs/security-model.md` | **Verificado** (revisão estática) |
+
+**Limitação (gate de hardware pendente):** a falha de gravação não é induzida
+em hardware neste ciclo — nenhum procedimento do `validate_openpgp.py`
+simula flash doente. Fica pendente o caso "mutação de PIN com gravação
+negada → `6A84`" (e conferir que o GnuPG trata o status como erro do cartão,
+não como PIN errado), para quando houver método de indução ou RP2350 físico
+(`memory_error` por flash desgastado não é reprodutível em script). O resíduo
+documentado entre power cycles com store indisponível é aceito (AC-8).
+
+### OpenPGP: `PUT DATA D2` valida o material ECDH na fronteira (fatia S6, host)
+
+O `PUT DATA D2` (material RFC 6637 do slot de decifra) aceitava estado que a
+decifra jamais consumiria: `kdf_hash` gravava cru enquanto a decifra deriva o
+KEK com SHA-256 fixo, e `wrapped_len` admitia blocos abaixo do menor bloco de
+sessão real (o `aes_key_unwrap`/`session_key_from_wrapped` recusariam depois).
+A fronteira agora é fail-closed — o mesmo corpo coerente com o que o cartão
+executa (P-256, já exigido pelos atributos) permanece:
+
+| AC | Critério | Teste de host (`aegis-applets::openpgp`) | Status |
+|----|----------|------------------------------------------|--------|
+| AC-1 | D2 válido (`0x08 0x07`, com e sem fingerprint de 20 octets) → `9000` byte a byte; o material provisionado mantém `wrapped`, `kdf_hash`, `kek_alg` e fingerprint | `d2_accepts_the_supported_kdf_hash_and_keeps_the_material` | **Verificado em host** |
+| AC-2 | `kdf_hash ≠ 0x08` (0x00, 0x02, 0x09, 0x0A, 0xFF) → `6A80`, slot intacto, sem save e o reload recupera o material anterior | `d2_rejects_unsupported_kdf_hash_without_touching_the_slot` | **Verificado em host** |
+| AC-3 | `wrapped_len` fora do domínio de `aes_key_unwrap` + `session_key_from_wrapped` (0, 8, 16, 25, 49; comprimento total errado) → `6A80`, slot intacto | `d2_rejects_wrapped_len_outside_the_key_wrap_domain` | **Verificado em host** |
+| AC-4 | Decifra e2e host-simulada continua `9000` (teste e2e existente); sem fingerprint provisionado a decifra falha fechada | `pso_decipher_unwraps_the_session_key_and_decrypts` + `decipher_fails_closed_without_the_provisioned_fingerprint` | **Verificado em host** |
+| AC-5 | Export NIST P-256 não regrediu: `READ PUBLIC KEY` → tag `86` estável, fingerprint v4 do slot cobre o KDF-DO `0x03 0x01 0x08 0x07` (DEC em C5) e `put_algo(1)` inalterado | `the_decryption_slot_exports_the_nist_kdf_parameters` (+ `put_data_c1_accepts_ed25519_rsa_and_rejects_others`) | **Verificado em host** |
+| AC-6 | Interop real com o GnuPG: provisionamento do interop segue `9000`, decifra do payload GnuPG continua `9000` e um D2 com hash `0x0A` é recusado (`6A80`) sem alterar o material — a decifra seguinte é idêntica | `gnupg_encrypts_and_the_card_decrypts` (extensão) | **Verificado em host** (com `gpg` disponível; pula de forma segura sem ele) |
+
+**Limitação (gate de hardware pendente):** o `validate_openpgp.py` não
+provisiona D2 com hash estranho hoje; estender o script com o caso negativo
+("D2 com `0x0A 0x09` → `6A80` e provisioning válido subsequente → `9000`")
+quando houver RP2350 físico.
+
+### OpenPGP: decifrador simétrico em tempo constante (fatia S7, host)
+
+O decifrador do `PSO: DECIPHER` comparava material derivado da chave de
+sessão com early-exit: `||` de curto-circuito no quick-check e no tag/length
+do pacote MDC (revelando qual octeto falhou) e `==` de fatias no SHA-1 do MDC
+(revelando quantos bytes casaram, o alvo clássico de oráculo de decifração).
+As três verificações agora são absorvidas por um acumulador constante-tempo
+(a disciplina do `constant_time_eq` do `pin.rs`, promovido a `pub(crate)`) e
+decididas uma única vez no fim, por categoria — o SHA-1 roda também nos
+caminhos que terminam em `None`. Nada muda de SW, resultado ou API.
+
+| AC | Critério | Teste de host (`aegis-applets`) | Status |
+|----|----------|---------------------------------|--------|
+| AC-1 | Quick-check ruim recusado com o mesmo resultado: chave de sessão trocada em {0, meio, último} para as larguras 16/24/32 e cada um dos dois octetos do check quebrado um a um → `None` | `wrong_quick_check_byte_is_rejected_for_every_position` (`pgp_sym`) | **Verificado em host** |
+| AC-2 | MDC corrupto recusado com o mesmo resultado: flip em cada um dos 20 bytes do pacote MDC → `Some` com `mdc_verified == false` e `data` idêntico ao baseline | `every_mdc_byte_flip_still_fails_the_verification_with_unchanged_data` (`pgp_sym`) | **Verificado em host** |
+| AC-3 | Tag (0xD3), length (0x14) ou ambos corrompidos com quick-check íntegro → `None` | `corrupted_mdc_tag_or_length_is_rejected` (`pgp_sym`) | **Verificado em host** |
+| AC-4 | Caminho feliz e interop inalterados: o vetor do GnuPG decifra com `mdc_verified == true` e o `encrypt` reproduz o ciphertext octeto a octeto; interop real com `gpg` (skip seguro) | `decrypts_a_message_encrypted_by_gnupg`, `encrypts_to_the_gnupg_ciphertext` (`pgp_sym`) + `gnupg_encrypts_and_the_card_decrypts` | **Verificado em host** |
+| AC-5 | Disciplina constante-tempo verificada estaticamente: nenhum `==` de fatias nem `\|\|` de curto-circuito sobre material derivado da chave em `pgp_sym.rs`; o único comparador de fatias é `constant_time_eq` (`pin.rs`, agora `pub(crate)`), com `black_box`, e as decisões ficam após o acumulador completo | revisão de código estática | **Verificado** (revisão estática) |
+| AC-6 | SWs do chamador inalterados via fluxo APDU `PSO: DECIPHER`: quick-check ruim → `6F00`, MDC corrupto → `6A80`, feliz → `9000` com o literal | `decipher_reports_pro_sw_for_quick_check_mdc_and_success` (`openpgp`) | **Verificado em host** |
+
+Sem pendência de hardware: o timing não é medido em host nem em hardware
+neste ciclo — a comparação constante-tempo é disciplina estática (a mesma
+registrada para o HMAC do OATH); um estudo de temporização em hardware, se
+desejado no futuro, é não-objetivo, não uma pendência.
+
+### OpenPGP: suíte adversarial de APDU do caminho de decifra (fatia S8, host)
+
+Suite de acusações sobre as rotas de dados do decifrador: todo frame
+malformado de `PSO: DECIPHER` e todo corpo fora de domínio de `PUT DATA D2`
+responde um único SW fechado, com corpo vazio, sem pânico, sem gravação e
+sem mudança de estado — e nenhuma resposta ecoa material privado, a chave
+de sessão embrulhada ou um segredo compartilhado fora da rota documentada
+(verificação por janela em cada recusa). Referente a
+`specs/openpgp-apdu-adversarial-tests.md`.
+
+| AC | Critério | Teste de host (`aegis-applets::openpgp`) | Status |
+|----|----------|------------------------------------------|--------|
+| AC-1 | Frames estruturalmente malformados de DECIPHER (`A6` truncado, `86` vazio, comprimento estendido além do dado, `86` nu longo demais) → um SW fechado determinístico com corpo vazio, nas três famílias de slot (RSA, ECDH P-256, X25519), estado intacto | `decipher_refuses_truncated_and_nested_tlv_frames` | **Verificado em host** |
+| AC-2 | As quatro fronteiras de `wrapped_len` do domínio de key wrap (24/32/40/48) com cada KEK id (7/8/9) e com e sem fingerprint do remetente importam e round-tripam byte a byte | `d2_accepts_the_wrapped_len_frontiers_24_32_40_48` | **Verificado em host** |
+| AC-3 | Corpos abaixo do mínimo parseável e totais fora da base declarada → `6A80` zero gravações, slot ancorado intacto (a fronteira de `wrapped_len` permanece coberta pela fatia S6; só a fronteira 24 é reafirmada) | `d2_refuses_short_bodies_and_keeps_the_slot` | **Verificado em host** |
+| AC-4 | Material RFC 6637 abaixo/fora da fronteira de leitura (`len` 103, 32; `wrapped_len` 0/49 com `len` 104) → decifra parcial determinística da especificação do cartão (`9000` + Z de 32 bytes), portão PW1 `82` antes; a fronteira exata (104, `wrapped_len` válido) relê o material e o modo RFC 6637 volta | `decipher_falls_back_deterministically_when_the_slot_material_is_incomplete` | **Verificado em host** |
+| AC-5 | Corpo além do `MAX_DATA` interno (4096): decifra de ~4,3 KB via APDU estendido → um único SW fechado (`6F00`) sem pânico, corpo vazio, sem fragmento de texto claro | `oversized_ciphertext_answers_one_status_word_without_panicking` | **Verificado em host** |
+| AC-6 | Anti-serialização por janela: nenhuma resposta de recusa reproduz a chave privada do slot, a chave de sessão embrulhada ou um segredo compartilhado fora da rota documentada (o `Z` da decifra parcial é a rota documentada) | verificação embutida em cada recusa dos testes acima (`assert_never_leaks`) | **Verificado em host** |
+| AC-7 | Ponto zero X25519 é comportamento da curva, não erro: resposta determinística `9000` + 32 zeros, portão PW1 `82` antes; recusar pontos não contributivos é não-objetivo | `x25519_zero_point_is_curve_behavior_not_an_error` | **Verificado em host** |
+
+Limitação registrada (INFO, não critério de aceitação): mensagens de exatamente
+2048 bytes ainda cabem no buffer de resposta; um byte a mais responde `6A84`
+com corpo vazio. A fronteira 2048/2049 é gravada por
+`response_over_two_kilobytes_is_a_documented_limitation` e segue para decisão
+futura no `roadmap.md` — a suíte a registra, não a corrige.
+
+Achado do ciclo (bug de produção, fix for a fatia própria): um `PUT DATA D2`
+aceito persiste o slot de decifra com `len = 104` (32 bytes de escalar +
+72 bytes de material RFC 6637), mas o `decode_state` recusa qualquer slot
+não-RSA com `len > 48`: numa sessão nova (boot de um cartão recém-provisionado)
+a releitura falha de forma fechada e o applet reseta para os padrões, perdendo
+chaves e PINs. Recarregas na mesma sessão mascaram o defeito — o decode falha
+depois das chaves em RAM, que sobrevivem, e a re-inicialização salva-as de
+volta. Fixado deliberadamente por
+`d2_provisioned_state_survives_across_sessions` (assert invertido) que o
+reparo da fatia S9 realizou — a resolução completa está na seção abaixo.
+
+### OpenPGP: o estado gravado por `PUT DATA D2` sobrevive à sessão (fatia S9, host)
+
+Bug de produção acusado pela fatia S8: o `decode_state` recusava qualquer
+slot não-RSA com `len > 48`, mas um `PUT DATA D2` aceito persiste o slot de
+decifra com `len = 104` (32 octets de escalar + 72 octets de material RFC
+6637, geometria fixa de `EcdhMaterial::store`) — o primeiro boot de um cartão
+provisionado re-inicializava o card no boot frio e, a cada re-`select`,
+sobrescrevia o PIN persistido com os padrões. O reparo é coerência
+writer/reader: o decode aceita o domínio fechado {slot de decifra,
+algoritmo UNSET/ECDH P-256, `len = 104`} e continua fail-closed em qualquer
+outra largura/slot/algoritmo; nenhuma palavra do protocolo muda, nada de
+bump de `STATE_VERSION` (o blob v3 escrito antes do reparo é byte-idêntico e
+decodifica — livro-in). A validação dos octets internos segue onde estava:
+na leitura (`EcdhMaterial::from_slot`), com o fallback parcial documentado
+da card spec para material rasgado — recusar no decode destruiria todo o estado.
+Referente a `specs/openpgp-d2-state-roundtrip.md`.
+
+| AC | Critério | Teste de host (`aegis-applets::openpgp`) | Status |
+|----|----------|------------------------------------------|--------|
+| AC-1 | Round-trip da sessão: provisionamento PW3 → `GENERATE 0xB8` → `D2` → boot frio (`OpenPgp::new` + `select`): `decode_state` carrega, `ecdh_material()` byte a byte, `keys[1].len == 104`, DO de fingerprints `0x00C5` idêntico | `d2_provisioned_state_round_trips_to_a_cold_session` | **Verificado em host** |
+| AC-2 | Identidade do estado completo pós-reboot: name/language/sex/url/certificado, escalar do slot (`keys[1].material[..32]`) e contador de assinatura idênticos | `d2_provisioned_state_round_trips_to_a_cold_session` | **Verificado em host** |
+| AC-3 | Decifra RFC 6637 fim a fim pós-reboot: `VERIFY` PW1 mod 82 com o PIN persistido → `PSO DECIPHER` (`86` + `80`) → `9000` com o plaintext idêntico; o mesmo ciclo sobrevive ao re-`select` | `decipher_after_reboot_returns_the_plaintext_with_the_persisted_pin` | **Verificado em host** |
+| AC-4 | PINs/contadores: PIN customizado provisionado verifica na sessão nova e após re-`select` (sem clobber); contador é o persistido (retries 2 recarregados, piso da S5 intacto) | `custom_pin_and_persisted_counter_survive_cold_boot_and_re_select` | **Verificado em host** |
+| AC-5 | Fail-closed: `len = 103`/`105` bem formados internamente, `len = 104` no slot 0/2, `len = 104` com X25519/EdDSA (e a largura RSA com algoritmo ECDH) → `decode_state` recusa e o boot cai no re-init dos padrões | `unknown_widths_and_slots_still_fail_closed` | **Verificado em host** |
+| AC-6 | Teste S8 realizado: `d2_provisioned_state_fails_decode_across_sessions` invertido e renomeado para `d2_provisioned_state_survives_across_sessions`, doc-comments atualizados; suíte adversarial inteira verde | `adversarial_apdu::d2_provisioned_state_survives_across_sessions` | **Verificado em host** |
+| AC-7 | Livro-in: blob v3 construído à mão com slot `len = 104` (algoritmo UNSET) decodifica, sem bump de `STATE_VERSION` (continua 3) e sem mudar `save_state`; o re-save decodifica de novo; o escalar do `GENERATE` (`len` 32) segue aceito no mesmo teste; v1/v2 (laje 48) cobertos por `state_v1_migrates_to_p256_defaults`/`state_v2_migrates_to_v3` | `pre_repair_blob_decodes_book_in_and_resaves_without_a_version_bump` | **Verificado em host** |
+| AC-8 | Regressão de nada mudou: RSA (`len == RSA_BLOB_BYTES`, validação de chave privada no decode), round-trips de estado existentes, painel da S5 e os ACs do suite S8 (incl. fallback parcial) — toda a suíte verde | `cargo test -p aegis-applets` (211 testes) | **Verificado em host** |
+
+Pendência física: reprodução real — power cycle com material provisionado +
+decifra via GnuPG (`validate_openpgp.py`) em RP2350 disponível; os ACs acima
+são todos de host.
+
+### OpenPGP: `CHANGE REFERENCE DATA` do PW3 exige a sessão de admin (fatia S10, host)
+
+Irmã da fatia S4 (unblock): o `verify_change` mapeava `P2=0x83` para o slot
+PW3 com o PIN corrente no corpo como **único** fator de autorização — o
+default de interop `12345678` é público, então qualquer cartão
+não-personalizado podia trocar o PIN admin (e adquirir `GENERATE`/`PUT
+DATA`/`RESET RETRY`) sem estabelecer a sessão que a casa exige nos demais
+mutadores. O comando agora consulta `pw3_verified`, como `reset_retry`,
+`put_data` e `generate`: sem sessão responde `6982` **antes** de tocar o
+slot — sem decrementar o contador do PW3, sem alterar hash ou flags e sem
+chamar `persist_state()` (recusa por falta de sessão não é adjudicação de
+PIN). Com sessão, o fluxo é o de sempre: corpo `atual(8)+novo(8)`,
+`slot.change` (dupla verificação não é oracle), `persist_state()` com o piso
+da S5 (`6A84` na falha de gravação) e a **sessão mantida** após o comando —
+a única limpeza segue sendo o `select()`. O **PW1** (`0x81`/`0x82`) fica
+intocado: troca com o corrente no corpo sem sessão é o comportamento da card
+spec (o scdaemon só pre-verifica o admin para `chvno == 3` — verificado em
+`app-openpgp.c::do_change_pin`). Referente a
+`specs/openpgp-pw3-change-authority.md`.
+
+| AC | Critério | Teste de host (`aegis-applets::openpgp`) | Status |
+|----|----------|------------------------------------------|--------|
+| AC-1 | `CHANGE` 0x83 sem sessão → `6982`; hash/contador/sessão intactos e **nenhuma gravação** (`save_calls` não se move) | `pw3_change_requires_the_admin_session_and_leaves_the_state_untouched` | **Verificado em host** |
+| AC-2 | `VERIFY` PW1 (mod 81 e 82, `9000`) não estabelece autoridade: `CHANGE` 0x83 → `6982` | `pw1_verification_does_not_authorize_the_pw3_change` | **Verificado em host** |
+| AC-3 | Com sessão: `CHANGE` 0x83 → `9000`; `PUT DATA` responde sem novo `VERIFY` (sessão mantida); corrente errado com sessão segue o contrato do slot (`63Cx` persistido) e a sessão sobrevive | `pw3_change_with_session_swaps_the_pin_and_keeps_the_session` | **Verificado em host** |
+| AC-4 | `select()` recomeça o ciclo: `CHANGE` 0x83 → `6982` até um novo `VERIFY` 0x83 reabrir a sessão | `select_clears_pw3_and_change_requires_it_again` | **Verificado em host** |
+| AC-5 | PW1 sem regressão: troca sem sessão nos modos 81/82 com PIN de 8 bytes → `9000`; `len != 16` → `6A80` nos três modos | `pw1_change_still_works_without_a_session` | **Verificado em host** |
+| AC-6 | Piso S5: `CHANGE` 0x83 autenticado com store flaky → `6A84` (nunca `9000` falso) e o PIN novo não sobrevive ao re-`select`; os dois testes S5 existentes passam a pre-verificar o admin e seguem verdes | `change_with_failing_store_reports_the_save_error_and_never_fakes_success`, `happy_path_persists_assertions_are_unchanged_under_a_healthy_store` | **Verificado em host** |
+| AC-7 | A recusa sem sessão não consome tentativa do PW3 nem vira verify de graça: contador cheio no `VERIFY` vazio e o original ainda `9000` | `refused_pw3_change_never_consumes_a_retry` | **Verificado em host** |
+| AC-8 | Interop GnuPG (`VERIFY` 0x83 → `CHANGE` 0x83) e suítes S8/S9 sem regressão: suíte toda verde | `cargo test -p aegis-applets` (217 testes) | **Verificado em host** |
+
+Limitação registrada (L4): o PW1 default de 6 octetos (`123456`) não pode ser
+trocado via `0x24` hoje — o corpo da instrução é fixo `atual(8)+novo(8)`;
+PINs de comprimento variável (o correto da card spec/ecossistema) ficam para
+uma fatia própria. O AC-5 usa o PW1 de 8 bytes instalado pela porta admin da
+casa (`RESET RETRY COUNTER`).
+
+Pendência física: estender `scripts/validate_openpgp.py` com o caso
+"`CHANGE` 0x83 sem `VERIFY` → `6982`" e conferir o fluxo real
+`gpg --card-edit` → `passwd` → "change Admin PIN" em RP2350 disponível.
+
 ## SSH / Git signing (Fase 15, AC-020)
 
 `validate_fido.py` cobre `makeCredential`/`getAssertion` Ed25519 (`alg -8`,
@@ -426,6 +645,12 @@ acessível via `hidraw`.
 | AC-019 | OpenPGP Card: PW1/PW3, ECC e assinatura | `validate_openpgp.py` + GnuPG/OpenSC | Slices P-256/Ed25519/X25519 OK em testes de host; hardware pendente; persistência selada entregue |
 | AC-020 | SSH/Git (`ed25519-sk`) + OpenPGP Ed25519/X25519 | `validate_fido.py` + `validate_openpgp.py` + OpenSSH | Firmware pronto em testes de host; hardware pendente |
 | AC-021 | RSA-2048 (PIV/OpenPGP): keygen, assinatura, decifra | `validate_piv.py` + `validate_openpgp.py` + OpenSSL/GnuPG/`pkcs11-tool` | Firmware pronto em testes de host (147 `aegis-applets`); hardware pendente; RSA-3072/PSS fora de escopo |
+| AC-022 | OpenPGP: `RESET RETRY COUNTER` exige PW3 verificado (unblock fail-closed; BC → `6A81`) | Testes de host `aegis-applets::openpgp` (fatia S4) + `validate_openpgp.py` | **Verificado em host** (7 testes novos); `validate_openpgp.py` em hardware pendente |
+| AC-023 | OpenPGP: persistência de PIN fail-closed (mutadores de PIN → `6A84` em falha de gravação; piso sticky intra-sessão) | Testes de host `aegis-applets::openpgp` (fatia S5) + `docs/security-model.md` | **Verificado em host** (10 testes novos); indução de falha de flash em hardware pendente |
+| AC-024 | OpenPGP: `PUT DATA D2` fail-closed na fronteira (`kdf_hash` só SHA-256; `wrapped_len` no domínio de *key wrap* RFC 3394; recusa → `6A80` sem gravar) | Testes de host `aegis-applets::openpgp` (fatia S6) + interop `gnupg_interop` | **Verificado em host** (5 testes novos + extensão do interop); `validate_openpgp.py` em hardware pendente |
+| AC-025 | OpenPGP: frames malformados de DECIPHER e corpos D2 fora de domínio → SW fechado único, corpo vazio, sem pânico/gravar/eco de material; fronteiras 24/32/40/48 aceitas; fallback parcial documentado; limite de resposta 2048 registrado; ponto zero X25519 = comportamento da curva | Testes de host `aegis-applets::openpgp` (fatia S8) | **Verificado em host** (8 testes novos); sem pendência de hardware |
+| AC-026 | OpenPGP: o estado gravado por um comando aceito sobrevive à sessão — `decode_state` aceita exatamente a geometria que o writer produz (slot de decifra, UNSET/ECDH P-256, `len` 104), larguras desconhecidas fail-closed, sem bump de versão (livro-in do blob v3) | Testes de host `aegis-applets::openpgp` (fatia S9, `state_roundtrip`) | **Verificado em host** (5 testes novos + inversão do teste S8); power cycle físico + GnuPG em hardware pendente |
+| AC-027 | OpenPGP: `CHANGE REFERENCE DATA` do PW3 (`P2=0x83`) exige a sessão de admin (`6982` sem tocar estado, contador ou store); o PW1 (`0x81`/`0x82`) mantém a autoridade do corrente no corpo; sessão mantida pela troca | Testes de host `aegis-applets::openpgp` (fatia S10) | **Verificado em host** (6 testes novos + 2 S5 atualizados); extensão do `validate_openpgp.py` + interop `gpg` físicos pendentes |
 
 ### Fases 7e — credential management e `changePIN` (host; hardware pendente)
 
@@ -690,6 +915,83 @@ real do build (a spec é `specs/release-requires-vendor-key.md`):
 **Limitação:** o gate é opt-in por variável de ambiente/`-Release`; builds de
 terceiros que não o usem continuam embutindo a chave de desenvolvimento com
 aviso. O aviso no boot permanece como defesa para imagens já gravadas.
+
+### Rodada de gate em hardware (roteiro único)
+
+Sequência para executar o gate completo em um RP2350 físico. Tudo o que a
+rodada produz deve ser anexado a `validation.md` (evidência) e ao commit da
+fatia correspondente.
+
+**Pré-requisitos**
+
+| Item | Necessário para |
+|------|-----------------|
+| `python-fido2` (`pip install fido2`) | `validate_fido.py` (FIDO2/U2F, clientPIN, credential management) |
+| `cbor2`, `hidapi` | `validate_management.py` (Management HID) |
+| `pcsc_transport`/`pyscard` **ou** `pcscd`+`usbccid` | `validate_ccid.py`, `validate_piv.py`, `validate_oath.py`, `validate_openpgp.py` |
+| Interface FIDO liberada do driver `fidohid` do Windows | `validate_fido.py` (ver "Windows: liberar a interface FIDO") |
+| `probe-rs` (flash e RTT) | `flash` + log de boot |
+| `AEGIS_UPDATE_VENDOR_PUBKEY` exportada | build com chave de update de produção |
+
+**1. Build e flash da imagem de release**
+
+```powershell
+& scripts/build-uf2.ps1 -Release
+probe-rs run --chip RP2350 target/thumbv8m.main-none-eabihf/release/firmware-universal-rp2350
+```
+
+O log de boot (RTT) deve mostrar o destino `active` e o plano com
+`fido=true ccid=true management=true`. Uma imagem com a chave de
+desenvolvimento é recusada por `-Release`.
+
+**2. Management HID (AC-003..AC-009)**
+
+```powershell
+python scripts/validate_management.py
+```
+
+Além dos 12 checks já automatizados, registrar o `GET_DIAGNOSTICS`:
+`boot_destination` deve ser `active` e `fido_enabled`/`ccid_enabled` devem
+ser `true` (chaves CBOR 0x08/0x09/0x0A).
+
+**3. FIDO2/U2F, clientPIN e credential management (AC-002/011/013, 7e/7g)**
+
+```powershell
+python scripts/validate_fido.py                 # sem PIN: fluxo só com presença
+python scripts/validate_fido.py --pin 123456    # com PIN: exige a prova do PIN
+```
+
+Com `--pin`, o script exercita: `getPinToken`/`getPinUvAuthTokenWithPermissions`,
+`changePIN` (ida e volta), `enumerateRPs`/`enumerateCredentials` sobre uma
+credencial residente e os **casos negativos** do escopo do token (token legado
+em credential management → 0x33; token `cm` com `rpId` → `enumerateRPsBegin`
+recusado; token `mc` de um RP em `getAssertion` de outro RP → 0x33).
+
+**4. CCID e applets (AC-016..AC-021)**
+
+```powershell
+python scripts/validate_ccid.py
+python scripts/validate_piv.py
+python scripts/validate_oath.py
+python scripts/validate_openpgp.py
+```
+
+**5. Procedimento 7h — Recovery/Locked negam FIDO/CCID (AC-10)**
+
+1. Flash do firmware e **manter BOOTSEL pressionado durante o power cycle**.
+2. Registrar que as interfaces FIDO (usage page `0xF1D0`) e CCID **enumeram**.
+3. `python scripts/validate_fido.py` → **deve falhar/timeout** (sem resposta).
+4. `python scripts/validate_ccid.py` → **deve falhar/timeout**.
+5. `python scripts/validate_management.py` → `GET_STATUS` e `GET_DIAGNOSTICS`
+   **respondem**, com `boot_destination = recovery` e `fido_enabled`/
+   `ccid_enabled` = `false`.
+6. Power cycle **sem** BOOTSEL → `validate_fido.py` volta a passar.
+
+**6. Evidência**
+
+Anexar a saída dos scripts, o log de boot e a captura da USB (enumerate +
+`GET_DIAGNOSTICS`) às seções "Evidência — …" desta matriz e marcar as linhas
+correspondentes como **Verificado** (hoje estão "host; hardware pendente").
 
 ### Evidência — Management HID (12/12)
 

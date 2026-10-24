@@ -1116,6 +1116,148 @@ adiado.
   do provisionamento é **provisório** (`PUT DATA 0xD2`) e o ensaio `gpg -d`
   contra o cartão físico exige hardware. Spec:
   `specs/openpgp-rfc6637-ecdh.md`.
+- **OpenPGP S4 — `RESET RETRY COUNTER` exige PW3 verificado (entregue):** o
+  unblock do OpenPGP deixou de ser um caminho público (achado CRÍTICO do
+  `sec-audit`): o comando (`00 2C 02 81`, corpo de 8 bytes) agora exige
+  `pw3_verified` e responde `6982` sem alterar nenhum estado na negativa; o
+  caminho do Resetting Code (`P1=0x00`) responde `6A81` enquanto o BC não é
+  provisionado; `P1`/`P2` desconhecidos respondem `6A86` (antes `6A80`). O
+  desbloqueio autenticado restaura os retries do PW1 para o máximo da
+  política, nunca mexe no PW3 e **não** consome a sessão de PW3 (§7.2.14 da
+  card spec). A exigência de autoridade mora no handler do applet; a
+  primitiva `PinSlot::unblock` continua sem sessão, com o contrato de
+  chamadores (PUK no PIV, PW3 no OpenPGP) documentado em `pin.rs`. 7 testes
+  novos de host (179 em `aegis-applets`); a validação física do `0x2C` fica
+  pendente em `validation.md`. Spec: `specs/openpgp-unblock-auth.md`.
+- **OpenPGP S5 — persistência fail-closed dos mutadores de PIN (entregue):**
+  os quatro handlers que descartavam o resultado de `save_state()` (achado
+  MÉDIO do `sec-audit`) agora o propagam: `VERIFY` que consome tentativa,
+  `CHANGE REFERENCE DATA`, `RESET RETRY COUNTER` autenticado e `PUT DATA`
+  aceito respondem **`6A84`** quando a gravação falha (consistentes com
+  `generate`/`sign`); `VERIFY` bem-sucedido **não grava mais** (nada
+  persistível muda: flags são de sessão e sucesso não repõe contador — menos
+  desgaste e nenhum erro no caminho feliz). Ao falhar, o estado em RAM
+  permanece restritivo e um **piso sticky por slot** (`pw1_floor`/`pw3_floor`,
+  volátil de sessão: sobrevive a `select()`, não a power cycle) registra o
+  menor contador garantido persistido-ou-consumido; todo reload (`SELECT`,
+  inclusive o reprovisionamento de defaults) é clampeado a
+  `min(restaurado, piso)`, então um re-select nunca ressuscita tentativas —
+  e um persist ok subsequente reancora o piso. Gravação por tentativa
+  (*write-ahead*) ficou deliberadamente de fora por desgaste de flash; o
+  resíduo entre power cycles (o persistido governa) está documentado como
+  modelo de degradação física em `docs/security-model.md`. O mesmo gap no PIV
+  (`persist_pin` fail-open) fica registrado como follow-up (fatia própria,
+  mecânica idêntica, arquivo próprio — não-objetivo desta fatia). 10 testes
+  novos de host (189 em `aegis-applets`); a falha de gravação não é induzida
+  em hardware neste ciclo (pendência em `validation.md`). Spec:
+  `specs/openpgp-pin-persistence.md`.
+- **OpenPGP S6 — `PUT DATA D2` fail-closed na fronteira (`kdf_hash`/
+  `wrapped_len`, entregue):** o material ECDH do slot de decifra
+  (`00 DA 00 D2`, achado MÉDIO do `sec-audit`) deixou de aceitar estado que o
+  cartão jamais conseguiria usar: o `kdf_hash` só é aceito se **SHA-256**
+  (`ecdh::HASH_SHA256` — o KDF da §7 do RFC 6637 implementado no cartão é
+  SHA-256 fixo e o GnuPG com P-256 usa SHA-256/AES-128, que o interop
+  comprova), o `wrapped_len` passou a exigir o domínio real do *key wrap* do
+  RFC 3394 (24/32/40/48 octets — a sessão OpenPGP mínima: alg + AES-128 +
+  checksum; len 8/16/25 e 49 viram `6A80` na provisionação em vez de `6F00` na
+  primeira decifra) e o KEK continua restrito a AES-128/192/256. A recusa
+  responde `WRONG_DATA` (`6A80`), não grava o slot e não emite save —
+  indistinguível das outras recusas de DO (sem oráculo de parse). D2 válido
+  idêntico ao interop (`0x08 0x07`) segue `9000` byte a byte e os atributos
+  X25519 (KDF-DO `0x0A 0x09` informativo) não são tocados (o X25519 não passa
+  pela D2). 5 testes novos de host além da extensão do interop (194 em
+  `aegis-applets`); a validação física fica pendente em `validation.md`. Spec:
+  `specs/openpgp-kdf-validation.md`.
+- **OpenPGP S7 — decifrador simétrico (quick-check e MDC) em tempo constante
+  (entregue):** as três verificações de material derivado da chave de sessão
+  no caminho `PSO: DECIPHER` (achado BAIXO do `sec-audit`) saíram do regime de
+  early-exit: o *quick check* dos dois octetos repetidos, o tag/length do
+  pacote MDC (`D3 14`) e o compare do SHA-1 do MDC — este último pelo
+  `constant_time_eq` do `pin.rs` (agora `pub(crate)`, o comparador do crate),
+  com `black_box` no resultado — são absorvidos por um acumulador
+  constante-tempo e decididos uma única vez no fim, por categoria; o SHA-1
+  também roda nos caminhos que terminam em `None`, então o tempo dentro das
+  classes `0x6F00` e `0x6A80` não depende de qual octeto ou de quantos bytes
+  do hash falharam. Nenhum SW, resultado ou API muda: quick-check/estrutura
+  ruim continua `6F00`, MDC corrupto continua `6A80` (`WRONG_DATA`) — a
+  distinção entre categorias é um comportamento de protocolo documentado
+  (interop GnuPG), não um gap, e o residual está em
+  `docs/security-model.md`. O vetor do GnuPG decifra igual e o `encrypt`
+  reproduz o ciphertext octeto a octeto. Timing não é medido em host nem em
+  hardware neste ciclo: a disciplina é estática (revisão + o helper testado
+  do `pin.rs`). 4 testes novos de host (3 em `pgp_sym` paramétricos por byte:
+  quick-check quebrado em qualquer posição e largura, flips de cada um dos 20
+  bytes do MDC com dados intactos, tag/length corrompidos; 1 SW em
+  `openpgp`). Spec: `specs/openpgp-mdc-constant-time.md`.
+
+- **OpenPGP S8 — suíte adversarial de APDU do caminho de decifra (entregue):**
+  testes de host exclusivos (8 novos em
+  `crates/aegis-applets/src/openpgp/tests/adversarial_apdu.rs`) que acusarão as
+  rotas de dados do decifrador através do SW real do cartão: frames
+  estruturalmente malformados de `PSO: DECIPHER` nas três famílias de slot
+  (RSA, ECDH P-256, X25519) → um SW fechado, corpo vazio, sem pânico, sem
+  gravação, sem mudança de estado; as quatro fronteiras de `wrapped_len`
+  (24/32/40/48) × KEK ids (7/8/9) × com/sem fingerprint de remetente em
+  `PUT DATA D2` importam byte a byte; corpos curtos ou fora da base declarada
+  → `6A80` zero gravações; material RFC 6637 fora da fronteira de leitura →
+  decifra parcial determinística (`9000` + Z, portão PW1 `82`); corpo além do
+  `MAX_DATA` (~4,3 KB via APDU estendido) → um único SW fechado sem pânico;
+  ponto zero X25519 → `9000` + 32 zeros como comportamento da curva (recusa de
+  pontos não contributivos é não-objetivo); e, embutido em cada recusa, um
+  anti-serialização por janela que garante que nenhuma resposta ecoa chave
+  privada, chave de sessão embrulhada ou segredo compartilhado fora da rota
+  documentada. Limitação registrada (a suíte grava, não corrige): mensagens de
+  2049+ bytes respondem `6A84` com corpo vazio (2048 ainda cabe) — decisão
+  futura sobre ampliar a janela de resposta fica registrada em
+  `validation.md`. Achado do ciclo, sem fix nesta fatia: `PUT DATA D2` aceito
+  persiste `len = 104`, e o `decode_state` recusa slot não-RSA com
+  `len > 48` — numa sessão nova o applet perde chaves e PINs e reseta para os
+  padrões; recarregas na mesma sessão mascaram (chaves em RAM sobrevivem ao
+  decode falho e são salvas de volta). Fixado deliberadamente por
+  `d2_provisioned_state_survives_across_sessions` (assert invertido pela
+  fatia S9 abaixo). Spec: `specs/openpgp-apdu-adversarial-tests.md`. Suite em
+  206 testes de host em `aegis-applets`.
+
+- **OpenPGP S9 — o estado gravado por `PUT DATA D2` sobrevive à sessão (bug de
+  produção do S8 corrigido, entregue):** o `decode_state` aprendeu a única
+  geometria que `PUT DATA D2` aceito grava — slot de decifra, algoritmo UNSET
+  ou ECDH P-256, `len = 104` (32 octets de escalar + 72 octets de material RFC
+  6637) — além da laje de 48: o estado que o card escreve sobrevive ao boot
+  frio e ao re-`select` (chaves, PINs, contadores e DOs byte a byte; decifra
+  RFC 6637 fim a fim pós-reboot com o PIN persistido). Larguras desconhecidas
+  seguem fail-closed (103/105, 104 em slot 0/2, 104 com X25519/EdDSA/RSA) e o
+  material rasgado continua caindo no fallback parcial documentado (a leitura
+  em `EcdhMaterial::from_slot` é a fronteira que sobra). Sem bump de
+  `STATE_VERSION` nem migração: o blob gravado antes do reparo é byte-idêntico
+  e decodifica (livro-in); o escalar do `GENERATE` (`len` 32) segue aceito no
+  mesmo teste e v1/v2 (laje 48) ficam com as migrações
+  `state_v1_migrates_to_p256_defaults`/`state_v2_migrates_to_v3`. 5 testes
+  novos em `crates/aegis-applets/src/openpgp/tests/state_roundtrip.rs` +
+  inversão do teste S8 em `adversarial_apdu.rs`. Suite em **211 testes** de
+  host em `aegis-applets`. Física de hardware pendente: power cycle real com
+  material provisionado + decifra via GnuPG em RP2350; registrado em
+  `validation.md`.
+
+- **OpenPGP S10 — `CHANGE REFERENCE DATA` do PW3 exige a sessão de admin
+  (entregue):** fechou o último mutador administrativo fora da regra de
+  autorização da casa (irmão do achado da fatia S4): o `verify_change` agora
+  exige `pw3_verified` para `P2=0x83`, como `reset_retry`, `put_data` e
+  `generate` — sem sessão, responde `6982` antes de tocar o slot, sem
+  decrementar o contador do PW3, sem alterar o hash e sem `persist_state()`
+  (a recusa por falta de sessão não é adjudicação de PIN, nem verify de
+  graça). O PIN corrente no corpo permanece fator (`slot.change`): o gate
+  soma um segundo fator. O **PW1** (`0x81`/`0x82`) fica intocado — troca com
+  o corrente no corpo sem sessão é comportamento da card spec (o scdaemon só
+  pre-verifica o admin para `chvno == 3`, `app-openpgp.c::do_change_pin`),
+  inclusive o `6A80` de comprimento errado. A sessão de admin sobrevive à
+  troca (bem ou mal sucedida no corpo); a única limpeza segue sendo o
+  `select()`. Piso da S5 preservado na troca autorizada (`6A84` em falha de
+  gravação). 6 testes novos + 2 testes da S5 atualizados para pre-verificar
+  o admin em `openpgp.rs`. Suite em **217 testes** de host em
+  `aegis-applets`. Física de hardware pendente: extensão do
+  `validate_openpgp.py` ("`CHANGE` 0x83 sem `VERIFY` → `6982`") + interop
+  `gpg --card-edit` em RP2350; registrado em `validation.md`. Spec:
+  `specs/openpgp-pw3-change-authority.md`.
 
 ## Persistência selada dos applets (entregue)
 

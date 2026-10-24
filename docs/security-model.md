@@ -136,10 +136,50 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   material (certificates, data objects) may be imported.
 - **PIN state is persistent and fail-closed.** Retry counters, blocked states
   and unblock flows are sealed with the OTP-derived key and survive power
-  cycles; every failed attempt decrements before any other work.
+  cycles; every failed attempt decrements before any other work. Unblock is
+  fail-closed at each applet's command handler: the OpenPGP `RESET RETRY
+  COUNTER` (`P1=0x02, P2=0x81`) requires the admin PIN already verified in
+  the session (`pw3_verified`) and answers `6982` without touching any state
+  otherwise; the resetting-code path (`P1=0x00`) answers `6A81` while the
+  code is not provisioned; unknown parameters answer `6A86`; a successful
+  unblock restores the PW1 counter, never touches the admin PIN and does not
+  consume the PW3 session (it survives until `select()`). The PIN slot itself
+  writes the new hash without knowing about sessions — the authorization is
+  the caller's obligation (PIV verifies the PUK, OpenPGP requires the PW3).
+  Admin mutations are session-gated: in OpenPGP, `CHANGE REFERENCE DATA` of
+  the **PW3** (`P2=0x83`) also requires the admin session (`pw3_verified`)
+  and answers `6982` before touching the slot, the counter, the session
+  flags or the store (a session refusal neither consumes a retry nor
+  persists); the current PIN in the command body remains a second factor
+  (`slot.change` still verifies it) and the session survives the swap (only
+  `select()` clears it). The **PW1** change (`P2=0x81`/`0x82`) keeps the
+  current-PIN-in-data authority — card-spec/ecosystem behavior.
+  A failed save in a PIN-mutating OpenPGP handler is **observable**: `VERIFY`
+  (when it consumes an attempt), `CHANGE REFERENCE DATA`, `RESET RETRY
+  COUNTER` and an accepted `PUT DATA` answer `6A84` instead of confirming a
+  mutation that the store refused (a successful `VERIFY` moves nothing
+  persistable and emits no save). The in-session RAM state stays
+  restrictive and each reload is clamped to a per-slot sticky floor — the
+  lowest retry counter known to be persisted or consumed in the session.
+  **Trade-offs:** the floor is intra-session (it survives `select()`, is
+  zeroed on a power cycle), and writing ahead of every attempt is
+  deliberately rejected for flash wear. Until a good save re-anchors the
+  floor, a power cycle can therefore restore the persisted counter when the
+  save of the consumed attempt failed — this is the documented degradation
+  model for a failing flash, not an unintended gap.
 - **Secrets are sealed at rest.** Credential keys, OATH secrets, PIN-derived
   values and data objects are stored in sealed records (AES-256-GCM under the
   OTP root key); no applet response can export them.
+- **The state an accepted command writes survives the session.** The decoder
+  accepts the geometry its writer produces above the 48-octet slab, so the blob
+  a sealed store holds is the state the next boot and every `select()` read
+  back (OpenPGP: the decryption slot with `len = 104` — 32-octet ECDH scalar
+  plus 72 octets of RFC 6637 material — under `UNSET` or ECDH P-256); every
+  other width, slot or algorithm stays fail-closed. No `STATE_VERSION` bump and
+  no migration: a blob written before the decoder learned that geometry decodes
+  unchanged. The provisioned RFC 6637 material is card state, not a new secret:
+  the sender's ciphertext plus public parameters, with the private key staying
+  in the slot.
 - **The card's private key never leaves it, and the ECDH model is the one the
   specification defines.** The OpenPGP Card 3.4.1 §4.4.3.8 defines the ECDH
   `PSO:DECIPHER` as a *partial decrypt*: the card calculates the shared secret
@@ -152,11 +192,38 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   CFB chain, the quick check and the modification detection code); in that mode
   the shared secret never leaves the card. Only ciphertext (the wrapped session
   key) and public material (the recipient fingerprint) are importable; the
-  private key of the slot is generated on the device and never imported. The
+  private key of the slot is generated on the device and never imported.
+  Provisioning only accepts material the decipher can actually consume
+  (`PUT DATA D2`: P-256 with the KDF of SHA-256, AES-128/192/256 as the KEK
+  and a wrapped key in the RFC 3394 block domain); anything outside the
+  domain is refused with `0x6A80` at the border, so nothing accepted can
+  fail only at the first real decipher. The
   primitives live in `aegis-applets::ecdh` and `aegis-applets::pgp_sym`, covered
   by the RFC 3394 test vectors, by an independent reference implementation of
   the symmetric layer (`tests/openpgp_sym_reference.py`) and by an end-to-end
   interoperability test with a real GnuPG (`openpgp::tests::gnupg_interop`).
+  The symmetric layer of RFC 4880 §13.9 compares its key-derived material —
+  the quick-check octets, the MDC packet structure and the SHA-1 of the
+  modification detection code — in constant time, through the same
+  `constant_time_eq` accumulator discipline as the PIN comparison; the failure
+  categories stay distinguishable by status word (`0x6F00` vs `0x6A80`) on
+  purpose, for protocol interoperability, and only the timing *inside* each
+  category is uniform — a documented behavior, not a gap. The adversarial
+  contract of the data-heavy commands is pinned by the host suite
+  (`openpgp::tests::adversarial_apdu`): every structurally malformed
+  `PSO:DECIPHER` frame and every `PUT DATA D2` body out of the domain answers
+  a single closed status word (`0x6A80` at the border, `0x6F00` when the size
+  or the wrap can only fail later) with an empty body, no panic, no save and
+  no state change, and no refusal ever echoes the private scalar, the wrapped
+  session key or a shared secret off its documented route (window-checked per
+  refusal). The deterministic `0x9000` + `Z` of the partial decrypt remains
+  the only route where derived secret material leaves the card, gated by PW1
+  in mode 82; an all-zero X25519 point agrees to the all-zero shared secret —
+  the card accepts it as curve behavior, and refusing non-contributory points
+  is a documented non-goal; ciphertext the card cannot decrypt answers `0x6F00`
+  without ever being decoded upstream; messages over 2048 bytes hit the
+  response-buffer limit (`0x6A84`, empty body) and the boundary is recorded in
+  `roadmap.md` for a future widening decision.
 - **Each signing operation honours its touch policy.** When a slot or
   credential requires touch, the applet arms the contextual presence machine
   and fails with the applet's standard error on absence or timeout.
