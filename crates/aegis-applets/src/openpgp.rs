@@ -343,6 +343,13 @@ pub struct OpenPgp<S: OpenPgpStore> {
     store: S,
     pw1: PinSlot,
     pw3: PinSlot,
+    /// Sticky floor of the PW1 retry counter this session: the lowest
+    /// counter known to be persisted or consumed. A failed save keeps the
+    /// RAM state (restrictive) and lowers the floor, so a reload can never
+    /// restore a more permissive counter than the one already lost.
+    pw1_floor: u8,
+    /// Sticky floor of the PW3 retry counter this session.
+    pw3_floor: u8,
     pw1_signature_verified: bool,
     pw1_other_verified: bool,
     pw3_verified: bool,
@@ -366,6 +373,8 @@ impl<S: OpenPgpStore> OpenPgp<S> {
             store,
             pw1: PinSlot::new(PW_POLICY),
             pw3: PinSlot::new(PW_POLICY),
+            pw1_floor: PW_POLICY.max_attempts,
+            pw3_floor: PW_POLICY.max_attempts,
             pw1_signature_verified: false,
             pw1_other_verified: false,
             pw3_verified: false,
@@ -401,7 +410,40 @@ impl<S: OpenPgpStore> OpenPgp<S> {
         }
         let _ = self.pw1.set(b"123456");
         let _ = self.pw3.set(b"12345678");
+        self.clamp_to_floors();
         let _ = self.save_state();
+    }
+
+    /// Persist the state and anchor the session floors of both slots to the
+    /// truth the store now holds.
+    ///
+    /// `save_state` serializes the two PIN slots together, so one save moves
+    /// both floors: a failed save keeps the RAM state of the slots
+    /// (restrictive) and lowers each floor to the counter still in RAM, while
+    /// a successful one re-anchors both to the current counter. The floors
+    /// are volatile session state: they survive `select()` but not a power
+    /// cycle, and every reload is clamped to them.
+    fn persist_state(&mut self) -> bool {
+        let saved = self.save_state();
+        let pw1_retries = self.pw1.retries_remaining();
+        let pw3_retries = self.pw3.retries_remaining();
+        if saved {
+            self.pw1_floor = pw1_retries;
+            self.pw3_floor = pw3_retries;
+        } else {
+            self.pw1_floor = self.pw1_floor.min(pw1_retries);
+            self.pw3_floor = self.pw3_floor.min(pw3_retries);
+        }
+        saved
+    }
+
+    /// Clamp both PIN counters of the shared load path to their session
+    /// floors.
+    fn clamp_to_floors(&mut self) {
+        let pw1_floor = self.pw1_floor;
+        let pw3_floor = self.pw3_floor;
+        clamp_to_floor(&mut self.pw1, pw1_floor);
+        clamp_to_floor(&mut self.pw3, pw3_floor);
     }
 
     fn save_state(&mut self) -> bool {
@@ -485,6 +527,15 @@ impl<S: OpenPgpStore> OpenPgp<S> {
         let Some(pw3) = decode_pin(bytes, &mut cursor, PW_POLICY) else {
             return false;
         };
+        // A reload never lifts above the session floor: a counter restored
+        // from the sealed store must not undo a decrement that failed to
+        // persist in this session.
+        let mut pw1 = pw1;
+        let mut pw3 = pw3;
+        let pw1_floor = self.pw1_floor;
+        let pw3_floor = self.pw3_floor;
+        clamp_to_floor(&mut pw1, pw1_floor);
+        clamp_to_floor(&mut pw3, pw3_floor);
         let mut keys = [KeySlot::EMPTY; 3];
         for (index, key) in keys.iter_mut().enumerate() {
             let Some(present) = take_u8(bytes, &mut cursor) else {
@@ -595,17 +646,33 @@ impl<S: OpenPgpStore> OpenPgp<S> {
             });
         }
         let result = slot.verify(apdu.data);
-        let success = result.is_ok();
-        self.save_state();
-        if success {
+        let Err(error) = result else {
+            // A successful verification moves no persistable state: the
+            // session flags are RAM-only and success never refills the
+            // counter, so no save (and no way to fail one) belongs here.
             match apdu.p2 {
                 0x81 => self.pw1_signature_verified = true,
                 0x82 => self.pw1_other_verified = true,
                 0x83 => self.pw3_verified = true,
                 _ => {}
             }
+            return Response::status(Sw::OK);
+        };
+        // Only a consumed attempt mutates the sealed state; the unset and
+        // blocked diagnostics leave the counter alone, so they are answered
+        // without touching the store.
+        if !error.is_retry_indicator() {
+            return Response::status(error);
         }
-        Response::status(result.err().unwrap_or(Sw::OK))
+        if self.persist_state() {
+            Response::status(error)
+        } else {
+            // The decrement lives only in RAM and the floor already recorded
+            // it: answer with an observable error instead of the retry
+            // indicator, which a host would read as "one attempt left" in a
+            // state the store no longer holds.
+            Response::status(Sw::NOT_ENOUGH_MEMORY)
+        }
     }
 
     fn get_data(&mut self, apdu: &Apdu<'_>) -> Response<'_> {
@@ -978,8 +1045,13 @@ impl<S: OpenPgpStore> OpenPgp<S> {
             _ => false,
         };
         if accepted {
-            self.save_state();
-            Response::status(Sw::OK)
+            if self.persist_state() {
+                Response::status(Sw::OK)
+            } else {
+                // The accepted mutation lives only in RAM: never confirm it
+                // with a bare `9000`.
+                Response::status(Sw::NOT_ENOUGH_MEMORY)
+            }
         } else {
             Response::status(Sw::WRONG_DATA)
         }
@@ -997,6 +1069,14 @@ impl<S: OpenPgpStore> OpenPgp<S> {
     /// speaks it (GnuPG) to be validated. The optional trailing 20 octets are
     /// the fingerprint of the key that the sender used in the KDF parameters;
     /// without them the card uses the fingerprint it computes itself.
+    ///
+    /// The slot only accepts material the decipher can actually consume: the
+    /// curve must be P-256 (checked through the algorithm attributes), the KDF
+    /// hash must be SHA-256, the KEK one of AES-128/192/256 and the wrapped
+    /// key one RFC 3394 block granule — 24/32/40/48 octets, the real AES
+    /// session key sizes. The GnuPG interop (SHA-256 and AES-128 for P-256) is
+    /// the practical authority: anything outside the domain would be accepted
+    /// here and fail only at the first real decipher.
     fn put_ecdh_material(&mut self, value: &[u8]) -> bool {
         if self.keys[1].effective_algo(1) != KEY_ALGO_ECDH_P256 || !self.keys[1].present {
             return false;
@@ -1006,9 +1086,12 @@ impl<S: OpenPgpStore> OpenPgp<S> {
         }
         let wrapped_len = usize::from(value[0]);
         let base = 1 + wrapped_len + 2;
-        if wrapped_len == 0
-            || wrapped_len > ECDH_WRAPPED_MAX
-            || value.len() != base && value.len() != base + 20
+        // The floor is the smallest real OpenPGP session key block (symm_alg
+        // ID + AES-128 key + checksum, one RFC 3394 granule): everything below
+        // it, above the cap or off the 8-octet granularity can never unwrap.
+        if !(24..=ECDH_WRAPPED_MAX).contains(&wrapped_len)
+            || wrapped_len % 8 != 0
+            || (value.len() != base && value.len() != base + 20)
         {
             return false;
         }
@@ -1031,8 +1114,11 @@ impl<S: OpenPgpStore> OpenPgp<S> {
             kek_alg: value[2 + wrapped_len],
             fingerprint,
         };
-        // The key encryption algorithm must be one the card supports.
-        if !(7..=9).contains(&material.kek_alg) {
+        // The card derives the KEK with SHA-256 (the only hash the KDF of
+        // RFC 6637 §7 implements) and the key encryption algorithm must be one
+        // it supports: anything else would be provisioned and fail closed
+        // only at the first real decipher.
+        if material.kdf_hash != ecdh::HASH_SHA256 || !(7..=9).contains(&material.kek_alg) {
             return false;
         }
         material.store(&mut self.keys[1]);
@@ -1556,17 +1642,39 @@ impl<S: OpenPgpStore> OpenPgp<S> {
             return Response::status(Sw::WRONG_DATA);
         }
         let result = slot.change(&apdu.data[..8], &apdu.data[8..]);
-        self.save_state();
-        Response::status(result.err().unwrap_or(Sw::OK))
+        if self.persist_state() {
+            Response::status(result.err().unwrap_or(Sw::OK))
+        } else {
+            // The new hash lives only in RAM: a failed save must never be
+            // confirmed as a successful change.
+            Response::status(Sw::NOT_ENOUGH_MEMORY)
+        }
     }
 
     fn reset_retry(&mut self, apdu: &Apdu<'_>) -> Response<'_> {
-        if apdu.p2 != 0x81 || apdu.data.len() != 8 {
+        // P1 names the authority: 0x02 = the PW3 verified earlier, 0x00 = the
+        // resetting code, which this foundation never provisions.
+        if apdu.p1 != 0x02 || apdu.p2 != 0x81 {
+            return Response::status(if apdu.p1 == 0x00 {
+                Sw::FUNCTION_NOT_SUPPORTED
+            } else {
+                Sw::INCORRECT_PARAMETERS
+            });
+        }
+        if !self.pw3_verified {
+            return Response::status(Sw::SECURITY_STATUS_NOT_SATISFIED);
+        }
+        if apdu.data.len() != 8 {
             return Response::status(Sw::WRONG_DATA);
         }
         let result = self.pw1.unblock(apdu.data);
-        self.save_state();
-        Response::status(result.err().unwrap_or(Sw::OK))
+        if self.persist_state() {
+            Response::status(result.err().unwrap_or(Sw::OK))
+        } else {
+            // The unblock lives only in RAM (and its floor cannot rise above
+            // the consumed counter): never confirm it with `9000`.
+            Response::status(Sw::NOT_ENOUGH_MEMORY)
+        }
     }
 }
 
@@ -1577,6 +1685,8 @@ impl<S: OpenPgpStore> Applet for OpenPgp<S> {
 
     fn select(&mut self) -> Response<'_> {
         self.loaded = false;
+        // The session floors are deliberately not reset: a re-select reloads
+        // the sealed store and must never undo a failed save of this session.
         self.ensure_loaded();
         self.pw1_signature_verified = false;
         self.pw1_other_verified = false;
@@ -1734,6 +1844,28 @@ fn decode_pin(bytes: &[u8], cursor: &mut usize, policy: PinPolicy) -> Option<Pin
     PinSlot::decode(policy, raw).ok()
 }
 
+/// Lower a reloaded slot counter to `floor` when the store carried a more
+/// permissive one.
+///
+/// [`PinSlot`] does no I/O and exposes no counter setter (the counter only
+/// moves through the framework itself), so the clamp goes through the sealed
+/// encoding: the floor never exceeds the policy maximum, therefore the
+/// re-decoded state stays valid. On any encoding failure the slot is kept as
+/// it was: the clamp is already in the restrictive direction.
+fn clamp_to_floor(slot: &mut PinSlot, floor: u8) {
+    if slot.retries_remaining() <= floor {
+        return;
+    }
+    let mut encoded = [0u8; crate::pin::PIN_STATE_LEN];
+    if slot.encode(&mut encoded).is_err() {
+        return;
+    }
+    encoded[2] = floor;
+    if let Ok(clamped) = PinSlot::decode(slot.policy(), &encoded) {
+        *slot = clamped;
+    }
+}
+
 fn take<'a>(bytes: &'a [u8], cursor: &mut usize, length: usize) -> Option<&'a [u8]> {
     let end = cursor.checked_add(length)?;
     let value = bytes.get(*cursor..end)?;
@@ -1806,6 +1938,50 @@ mod tests {
         applet
     }
 
+    /// A store wrapper that delegates to `MemoryOpenPgpStore` and can be
+    /// switched to reject every save, standing in for a worn-out flash.
+    ///
+    /// It counts the observed saves so tests can prove which commands do and
+    /// do not touch the store.
+    struct FlakyOpenPgpStore {
+        inner: MemoryOpenPgpStore,
+        save_fails: bool,
+        save_calls: u32,
+    }
+
+    impl FlakyOpenPgpStore {
+        fn new(inner: MemoryOpenPgpStore) -> Self {
+            Self {
+                inner,
+                save_fails: false,
+                save_calls: 0,
+            }
+        }
+
+        fn set_save_fails(&mut self, fails: bool) {
+            self.save_fails = fails;
+        }
+    }
+
+    impl OpenPgpStore for FlakyOpenPgpStore {
+        fn load(&mut self, out: &mut [u8]) -> Option<usize> {
+            self.inner.load(out)
+        }
+
+        fn save(&mut self, data: &[u8]) -> bool {
+            self.save_calls += 1;
+            if self.save_fails {
+                false
+            } else {
+                self.inner.save(data)
+            }
+        }
+
+        fn clear(&mut self) -> bool {
+            self.inner.clear()
+        }
+    }
+
     fn frame(ins: u8, p1: u8, p2: u8, data: &[u8]) -> Vec<u8, 2048> {
         let mut output = Vec::new();
         output.extend_from_slice(&[0x00, ins, p1, p2]).unwrap();
@@ -1825,8 +2001,8 @@ mod tests {
         output
     }
 
-    fn run(
-        applet: &mut OpenPgp<MemoryOpenPgpStore>,
+    fn run<S: OpenPgpStore>(
+        applet: &mut OpenPgp<S>,
         rng: &mut TestRng,
         frame: &[u8],
     ) -> (Vec<u8, 2048>, Sw) {
@@ -2112,6 +2288,356 @@ mod tests {
         let material = applet.ecdh_material().expect("the material is provisioned");
         assert_eq!(material.fingerprint, Some(recipient));
         assert_eq!(material.wrapped.as_slice(), &wrapped);
+    }
+
+    #[test]
+    fn d2_accepts_the_supported_kdf_hash_and_keeps_the_material() {
+        let mut applet = applet();
+        let mut rng = TestRng(20);
+        verify_pw3(&mut applet, &mut rng);
+        let _ = generate(&mut applet, &mut rng, 0xB8);
+
+        // The provisioner the interop deems valid: SHA-256 and AES-128. The
+        // wrapped session key alone: the card falls back to the fingerprint
+        // it computes itself.
+        let wrapped = [0x11u8; 24];
+        let mut import: Vec<u8, 64> = Vec::new();
+        import.push(wrapped.len() as u8).unwrap();
+        import.extend_from_slice(&wrapped).unwrap();
+        import.push(ecdh::HASH_SHA256).unwrap();
+        import.push(ecdh::KEK_AES128).unwrap();
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0xD2, &import)
+            )
+            .1,
+            Sw::OK
+        );
+        let material = applet.ecdh_material().expect("the material is provisioned");
+        assert_eq!(material.wrapped.as_slice(), &wrapped);
+        assert_eq!(material.kdf_hash, ecdh::HASH_SHA256);
+        assert_eq!(material.kek_alg, ecdh::KEK_AES128);
+        assert_eq!(material.fingerprint, None);
+
+        // With the fingerprint of the sender: every provisioned byte survives.
+        let mut recipient = [0x22u8; 20];
+        recipient[0] = 0x01;
+        import.extend_from_slice(&recipient).unwrap();
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0xD2, &import)
+            )
+            .1,
+            Sw::OK
+        );
+        let material = applet.ecdh_material().expect("the material is provisioned");
+        assert_eq!(material.wrapped.as_slice(), &wrapped);
+        assert_eq!(material.kdf_hash, ecdh::HASH_SHA256);
+        assert_eq!(material.kek_alg, ecdh::KEK_AES128);
+        assert_eq!(material.fingerprint, Some(recipient));
+    }
+
+    #[test]
+    fn d2_rejects_unsupported_kdf_hash_without_touching_the_slot() {
+        let mut rng = TestRng(21);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_GENERATE, 0x80, 0, &[0xB8, 0x00])
+            )
+            .1,
+            Sw::OK
+        );
+
+        // A valid material is anchored first so a refusal has something to
+        // leave intact.
+        let wrapped = [0x33u8; 32];
+        let mut import: Vec<u8, 64> = Vec::new();
+        import.push(wrapped.len() as u8).unwrap();
+        import.extend_from_slice(&wrapped).unwrap();
+        import.push(ecdh::HASH_SHA256).unwrap();
+        import.push(ecdh::KEK_AES128).unwrap();
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0xD2, &import)
+            )
+            .1,
+            Sw::OK
+        );
+        let material = applet.ecdh_material().expect("the material is anchored");
+        let saves_before = applet.store.save_calls;
+
+        // Every hash outside the implemented KDF is refused at the border
+        // with `WRONG_DATA`, the slot keeps the anchored material and the
+        // refusal emits no save at all.
+        for hash in [0x00, 0x02, 0x09, 0x0A, 0xFF] {
+            let mut mutant = import.clone();
+            mutant[1 + wrapped.len()] = hash;
+            assert_eq!(
+                run(
+                    &mut applet,
+                    &mut rng,
+                    &frame(INS_PUT_DATA, 0x00, 0xD2, &mutant)
+                )
+                .1,
+                Sw::WRONG_DATA,
+                "zero is not a supported hash"
+            );
+            assert_eq!(
+                applet.ecdh_material().expect("the slot is intact"),
+                material,
+                "the refused import changed nothing"
+            );
+            assert_eq!(
+                applet.store.save_calls, saves_before,
+                "no save on a refusal"
+            );
+        }
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            applet
+                .ecdh_material()
+                .expect("the reload recovers the material"),
+            material,
+            "the reload never resurrects the refused material"
+        );
+    }
+
+    #[test]
+    fn d2_rejects_wrapped_len_outside_the_key_wrap_domain() {
+        let mut applet = applet();
+        let mut rng = TestRng(22);
+        verify_pw3(&mut applet, &mut rng);
+        let _ = generate(&mut applet, &mut rng, 0xB8);
+
+        // A valid material anchored to prove the refusals never overwrite it.
+        let wrapped = [0x44u8; 24];
+        let mut import: Vec<u8, 64> = Vec::new();
+        import.push(wrapped.len() as u8).unwrap();
+        import.extend_from_slice(&wrapped).unwrap();
+        import.push(ecdh::HASH_SHA256).unwrap();
+        import.push(ecdh::KEK_AES128).unwrap();
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0xD2, &import)
+            )
+            .1,
+            Sw::OK
+        );
+        let material = applet.ecdh_material().expect("the material is anchored");
+
+        // The consumers only ever see RFC 3394 blocks of a real session key:
+        // zero (regression), 8 and 16 (below the smallest real block, new),
+        // 25 (off the 8-octet granularity, new) and 49 (above the cap,
+        // regression) are all refused with the slot intact.
+        for wrapped_len in [0, 8, 16, 25, 49] {
+            let mut mutant: Vec<u8, 64> = Vec::new();
+            mutant.push(wrapped_len as u8).unwrap();
+            mutant.resize(1 + wrapped_len, 0x55).unwrap();
+            mutant.push(ecdh::HASH_SHA256).unwrap();
+            mutant.push(ecdh::KEK_AES128).unwrap();
+            assert_eq!(
+                run(
+                    &mut applet,
+                    &mut rng,
+                    &frame(INS_PUT_DATA, 0x00, 0xD2, &mutant)
+                )
+                .1,
+                Sw::WRONG_DATA,
+                "the wrapped length leaves the key wrap domain"
+            );
+            assert_eq!(
+                applet.ecdh_material().expect("the slot is intact"),
+                material,
+                "the refused import changed nothing"
+            );
+        }
+
+        // Total length off `base`/`base + 20` stays refused (regression).
+        let mut off_base = import.clone();
+        off_base.push(0x01).unwrap();
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0xD2, &off_base)
+            )
+            .1,
+            Sw::WRONG_DATA,
+            "the body length still has to match the declared one"
+        );
+        assert_eq!(
+            applet.ecdh_material().expect("the slot is intact"),
+            material
+        );
+    }
+
+    #[test]
+    fn decipher_fails_closed_without_the_provisioned_fingerprint() {
+        use p256::elliptic_curve::sec1::ToSec1Point;
+        use sha1::Digest as _;
+
+        let mut applet = applet();
+        let mut rng = TestRng(23);
+        verify_pw3(&mut applet, &mut rng);
+        let public = generate(&mut applet, &mut rng, 0xB8);
+        let card_point = tlv::find(tlv::find(&public, 0x7F49).unwrap(), 0x86).unwrap();
+        assert_eq!(card_point.len(), 65);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x82, b"123456")
+            )
+            .1,
+            Sw::OK
+        );
+
+        let ephemeral = p256::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let ephemeral_point = ephemeral.public_key().to_sec1_point(false);
+        let card_public = p256::PublicKey::from_sec1_bytes(card_point).unwrap();
+        let shared =
+            p256::ecdh::diffie_hellman(ephemeral.to_nonzero_scalar(), card_public.as_affine());
+        // The sender used a fingerprint that the card does not hold: without
+        // the provisioned value the card cannot reconstruct the KDF
+        // parameters, and it must not guess them (the interop exercises the
+        // same case against a real GnuPG).
+        let mut fingerprint = applet.fingerprint(1).expect("the slot has a fingerprint");
+        fingerprint[0] ^= 0xFF;
+        let param = ecdh::param(
+            ecdh::CURVE_OID_P256,
+            ecdh::ALG_ECDH,
+            ecdh::HASH_SHA256,
+            ecdh::KEK_AES128,
+            &fingerprint,
+        )
+        .unwrap();
+        let kek = ecdh::kdf(&param, shared.raw_secret_bytes().as_slice(), 16).unwrap();
+
+        let session_key = [0x2Bu8; 16];
+        let checksum = session_key
+            .iter()
+            .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
+        let mut m: Vec<u8, 64> = Vec::new();
+        m.push(7u8).unwrap();
+        m.extend_from_slice(&session_key).unwrap();
+        m.extend_from_slice(&checksum.to_be_bytes()).unwrap();
+        m.resize(24, 0x05).unwrap();
+        let wrapped = ecdh::aes_key_wrap(&kek, &m).unwrap();
+
+        // The import is valid on its own, but carries no fingerprint.
+        let mut import: Vec<u8, 64> = Vec::new();
+        import.push(wrapped.len() as u8).unwrap();
+        import.extend_from_slice(&wrapped).unwrap();
+        import.push(ecdh::HASH_SHA256).unwrap();
+        import.push(ecdh::KEK_AES128).unwrap();
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0xD2, &import)
+            )
+            .1,
+            Sw::OK
+        );
+
+        let data = b"nothing leaves without the fingerprint";
+        let mut prefix = [0x11u8; 16];
+        prefix[14] = prefix[12];
+        prefix[15] = prefix[13];
+        let mut plaintext: Vec<u8, 256> = Vec::new();
+        plaintext.extend_from_slice(&prefix).unwrap();
+        plaintext
+            .extend_from_slice(&[prefix[14], prefix[15]])
+            .unwrap();
+        plaintext.extend_from_slice(data).unwrap();
+        plaintext.extend_from_slice(&[0xD3, 0x14]).unwrap();
+        let mut digest = sha1::Sha1::new();
+        digest.update(&plaintext);
+        plaintext.extend_from_slice(&digest.finalize()).unwrap();
+        let ciphertext = pgp_sym::encrypt_aes(&session_key, &plaintext).unwrap();
+
+        let mut command: Vec<u8, 512> = Vec::new();
+        append_tlv(&mut command, 0x86, ephemeral_point.as_bytes());
+        append_tlv(&mut command, 0x80, &ciphertext);
+        let (plain, status) = run(&mut applet, &mut rng, &frame(INS_PSO, 0x80, 0x86, &command));
+        assert_ne!(status, Sw::OK, "the card does not guess the KDF parameters");
+        assert!(plain.is_empty(), "the card returns nothing on the failure");
+    }
+
+    #[test]
+    fn the_decryption_slot_exports_the_nist_kdf_parameters() {
+        use sha1::Digest as _;
+
+        let mut applet = applet();
+        let mut rng = TestRng(24);
+        verify_pw3(&mut applet, &mut rng);
+        let public = generate(&mut applet, &mut rng, 0xB8);
+        let (response, status) = run(
+            &mut applet,
+            &mut rng,
+            &frame(INS_GENERATE, 0x81, 0, &[0xB8, 0x00]),
+        );
+        assert_eq!(status, Sw::OK);
+        let template = tlv::find(&response, 0x7F49).unwrap();
+        let point = tlv::find(template, 0x86).unwrap();
+        assert_eq!(point.len(), 65);
+        assert_eq!(
+            point,
+            tlv::find(tlv::find(&public, 0x7F49).unwrap(), 0x86).unwrap(),
+            "the export is stable"
+        );
+
+        // The v4 fingerprint of the slot covers the KDF-DO of NIST P-256
+        // (SHA-256 and AES-128), the parameters the interop provisions
+        // against: rebuild the expected value independently of the applet.
+        let mut body: Vec<u8, 128> = Vec::new();
+        body.push(0x04).unwrap();
+        body.extend_from_slice(&[0; 4]).unwrap();
+        body.push(0x12).unwrap();
+        body.push(ecdh::CURVE_OID_P256.len() as u8).unwrap();
+        body.extend_from_slice(ecdh::CURVE_OID_P256).unwrap();
+        // 515 bits: the MPI of a P-256 point (65 octets with the leading
+        // `0x04` of the SEC1 uncompressed form).
+        body.extend_from_slice(&0x0203u16.to_be_bytes()).unwrap();
+        body.extend_from_slice(point).unwrap();
+        body.extend_from_slice(&[0x03, 0x01, 0x08, 0x07]).unwrap();
+        let mut input: Vec<u8, 136> = Vec::new();
+        input.push(0x99).unwrap();
+        input
+            .extend_from_slice(&(body.len() as u16).to_be_bytes())
+            .unwrap();
+        input.extend_from_slice(&body).unwrap();
+        let expected: [u8; 20] = sha1::Sha1::digest(&input).into();
+        assert_eq!(
+            applet.fingerprint(1).expect("the slot has a fingerprint"),
+            expected
+        );
+
+        // The fingerprint DO carries it as the DEC entry of the aggregate.
+        let (c5, status) = run(&mut applet, &mut rng, &frame(INS_GET_DATA, 0x00, 0xC5, &[]));
+        assert_eq!(status, Sw::OK);
+        assert_eq!(&c5[20..40], &expected[..]);
     }
 
     #[test]
@@ -2748,5 +3274,748 @@ mod tests {
         // Re-saving upgrades the encoding to v3.
         assert!(applet.save_state());
         assert_eq!(applet.state[0], STATE_VERSION);
+    }
+
+    #[test]
+    fn reset_retry_requires_pw3_and_leaves_state_untouched() {
+        let mut applet = applet();
+        let mut rng = TestRng(30);
+        // One failed PW1 attempt fixes the observable state (63C2).
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"99999999")
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        // Without a verified PW3 the request is refused and nothing moves.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x81, b"66666666")
+            )
+            .1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        // The counter shows the same single failed attempt as before.
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
+            Sw::retries_left(2)
+        );
+        // The PW1 signature session is exactly where it was: unreached.
+        let digest = [0xA5u8; 32];
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_PSO, 0x9E, 0x9A, &digest)).1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        // The original PW1 still verifies; the requested hash never landed.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"123456")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"66666666")
+            )
+            .1,
+            Sw::retries_left(1)
+        );
+    }
+
+    #[test]
+    fn reset_retry_with_pw3_sets_new_pw1_and_restores_retries() {
+        let mut applet = applet();
+        let mut rng = TestRng(31);
+        verify_pw3(&mut applet, &mut rng);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x81, b"99999999")
+            )
+            .1,
+            Sw::OK
+        );
+        // The new PW1 verifies with a counter back at the policy maximum.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"99999999")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
+            Sw::retries_left(3)
+        );
+        // The admin PIN is untouched by the command.
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x83, &[])).1,
+            Sw::retries_left(3)
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn reset_retry_does_not_end_the_pw3_session() {
+        let mut applet = applet();
+        let mut rng = TestRng(32);
+        verify_pw3(&mut applet, &mut rng);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x81, b"99999999")
+            )
+            .1,
+            Sw::OK
+        );
+        // An administrative command keeps working without a new VERIFY PW3.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0x5B, b"Alice")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn reset_retry_rejects_unknown_p2() {
+        let mut applet = applet();
+        let mut rng = TestRng(33);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x82, b"99999999")
+            )
+            .1,
+            Sw::INCORRECT_PARAMETERS
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x83, b"99999999")
+            )
+            .1,
+            Sw::INCORRECT_PARAMETERS
+        );
+        // State untouched: the usage PW1 keeps its hash.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"123456")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn reset_retry_rejects_the_resetting_code_path() {
+        let mut applet = applet();
+        let mut rng = TestRng(34);
+        // The resetting code (P1=0x00) is not provisioned in this foundation.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x00, 0x81, b"99999999")
+            )
+            .1,
+            Sw::FUNCTION_NOT_SUPPORTED
+        );
+        // State untouched: the requested hash never landed and the original
+        // PW1 keeps verifying.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"99999999")
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"123456")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn select_clears_pw3_and_reset_retry_requires_it_again() {
+        let mut applet = applet();
+        let mut rng = TestRng(35);
+        verify_pw3(&mut applet, &mut rng);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x81, b"99999999")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x81, b"88888888")
+            )
+            .1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        verify_pw3(&mut applet, &mut rng);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x81, b"88888888")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn blocked_pw1_stays_blocked_until_authenticated_unblock() {
+        let mut applet = applet();
+        let mut rng = TestRng(36);
+        for _ in 0..3 {
+            let _ = run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"99999999"),
+            );
+        }
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"123456")
+            )
+            .1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+        // The unauthenticated request leaves the slot blocked, not overwritten.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x81, b"66666666")
+            )
+            .1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"66666666")
+            )
+            .1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+        verify_pw3(&mut applet, &mut rng);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x81, b"66666666")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"66666666")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+    #[test]
+    fn verify_failure_with_failing_store_reports_the_save_error() {
+        let mut rng = TestRng(50);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        assert_eq!(applet.select().sw, Sw::OK);
+        applet.store.set_save_fails(true);
+        // A consumed attempt with a failing store is reported as a memory
+        // error, never as the retry indicator `63Cx` (AC-1).
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"99999999")
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        // The decrement stays in RAM: the next empty VERIFY shows `63C2`, and
+        // the slot blocks with `6983` once the counter is exhausted (AC-1).
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
+            Sw::retries_left(2)
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                run(
+                    &mut applet,
+                    &mut rng,
+                    &frame(INS_VERIFY, 0, 0x81, b"99999999")
+                )
+                .1,
+                Sw::NOT_ENOUGH_MEMORY
+            );
+        }
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+    }
+
+    #[test]
+    fn sticky_floor_survives_reselect() {
+        let mut rng = TestRng(51);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        assert_eq!(applet.select().sw, Sw::OK);
+        applet.store.set_save_fails(true);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"99999999")
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        // The floor recorded the consumed attempt, so a re-select that
+        // reloads the (still permissive) store cannot refill the counter:
+        // the empty VERIFY stays `63C2` (AC-2).
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
+            Sw::retries_left(2)
+        );
+    }
+
+    #[test]
+    fn power_cycle_restores_the_persisted_counter_as_documented() {
+        let mut rng = TestRng(52);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        assert_eq!(applet.select().sw, Sw::OK);
+        applet.store.set_save_fails(true);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"99999999")
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        // Documented residue (AC-8): the floor is session-volatile, so a new
+        // instantiation (a power cycle) re-arms the counter from the
+        // provisioning defaults when no good save ever re-anchored it.
+        let store = core::mem::replace(
+            applet.store_mut(),
+            FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()),
+        );
+        let mut rebooted = OpenPgp::new(store);
+        assert_eq!(rebooted.select().sw, Sw::OK);
+        assert_eq!(
+            run(&mut rebooted, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
+            Sw::retries_left(3)
+        );
+    }
+
+    #[test]
+    fn change_with_failing_store_reports_the_save_error_and_never_fakes_success() {
+        let mut rng = TestRng(53);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        assert_eq!(applet.select().sw, Sw::OK);
+        applet.store.set_save_fails(true);
+        // The change is refused with the memory error instead of `9000` (AC-3).
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"1234567899999999")
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        // Sticky: the new PIN verifies in-session despite the failed save.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"99999999")
+            )
+            .1,
+            Sw::OK
+        );
+        // After a re-select the persisted state governs: the old PIN verifies
+        // again and the never-persisted hash is gone: no ghost upgrade (AC-3).
+        applet.store.set_save_fails(false);
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"99999999")
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn unblock_with_failing_store_keeps_the_persisted_blocked_state() {
+        let mut rng = TestRng(54);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        assert_eq!(applet.select().sw, Sw::OK);
+        // Drain PW1 while the store is healthy, so the blocked state persists.
+        for remaining in [2, 1, 0] {
+            assert_eq!(
+                run(
+                    &mut applet,
+                    &mut rng,
+                    &frame(INS_VERIFY, 0, 0x81, b"99999999")
+                )
+                .1,
+                Sw::retries_left(remaining)
+            );
+        }
+        applet.store.set_save_fails(true);
+        // The admin PIN verifies (success emits no save) and the unblock is
+        // refused with the memory error (AC-4).
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x81, b"66666666")
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        // The persisted state governs after the re-select: PW1 stays blocked
+        // and the new hash never landed (AC-4).
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"66666666")
+            )
+            .1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+    }
+
+    #[test]
+    fn put_data_with_failing_store_reports_the_save_error() {
+        let mut rng = TestRng(55);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0x5B, b"Alice")
+            )
+            .1,
+            Sw::OK
+        );
+        // Anchor a persisted old DO.
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::OK
+        );
+        applet.store.set_save_fails(true);
+        // An accepted PUT DATA with a failing store is refused with `6A84`
+        // (AC-5).
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0x5B, b"Bob")
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_GET_DATA, 0x00, 0x5B, &[])).0,
+            b"Alice".as_slice()
+        );
+        // A rejected PUT DATA (`WRONG_DATA`) emits no save at all (AC-5).
+        applet.store.set_save_fails(true);
+        let saves_before = applet.store.save_calls;
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0xC4, b"junk")
+            )
+            .1,
+            Sw::WRONG_DATA
+        );
+        assert_eq!(applet.store.save_calls, saves_before);
+    }
+
+    #[test]
+    fn reload_never_climbs_above_the_session_floor() {
+        let mut rng = TestRng(56);
+        let mut applet = applet();
+        // A healthy applet consumes an attempt and anchors the persisted
+        // counter at 2.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"99999999")
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        let stored = core::mem::take(applet.store_mut());
+        // A new applet whose session floor sits below the persisted counter
+        // loads the clamped one: `min(Y, X)` for PW1 and PW3 alike (AC-6).
+        let mut reloaded = OpenPgp::new(stored);
+        reloaded.pw1_floor = 1;
+        reloaded.pw3_floor = 1;
+        assert_eq!(reloaded.select().sw, Sw::OK);
+        assert_eq!(
+            run(&mut reloaded, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
+            Sw::retries_left(1)
+        );
+        assert_eq!(
+            run(&mut reloaded, &mut rng, &frame(INS_VERIFY, 0, 0x83, &[])).1,
+            Sw::retries_left(1)
+        );
+    }
+
+    #[test]
+    fn happy_path_persists_assertions_are_unchanged_under_a_healthy_store() {
+        let mut rng = TestRng(57);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        assert_eq!(applet.select().sw, Sw::OK);
+        // A consumed attempt persists as before: the re-select keeps `63C2`.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"99999999")
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
+            Sw::retries_left(2)
+        );
+        // The admin change persists: the new PW3 verifies after the reopen.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_CHANGE_REFERENCE_DATA, 0, 0x83, b"1234567899999999")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"99999999")
+            )
+            .1,
+            Sw::OK
+        );
+        // The authenticated unblock persists: the new PW1 verifies with a
+        // full counter after the reopen.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_RESET_RETRY_COUNTER, 0x02, 0x81, b"88888888")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"88888888")
+            )
+            .1,
+            Sw::OK
+        );
+        // The accepted PUT DATA persists: the DO survives the reopen.
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"99999999")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_PUT_DATA, 0x00, 0x5B, b"Alice")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(applet.select().sw, Sw::OK);
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_GET_DATA, 0x00, 0x5B, &[])).0,
+            b"Alice".as_slice()
+        );
+    }
+
+    #[test]
+    fn successful_verify_does_not_call_save() {
+        let mut rng = TestRng(58);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        assert_eq!(applet.select().sw, Sw::OK);
+        // The initial provisioning already wrote the defaults once.
+        let saves_before = applet.store.save_calls;
+        assert!(saves_before > 0);
+        // A successful VERIFY moves nothing persistable: it must not touch
+        // the store (AC-7).
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(applet.store.save_calls, saves_before);
+        // Same for the unset/blocked diagnostics: no state, no save.
+        applet.store.set_save_fails(true);
+        assert_eq!(
+            run(&mut applet, &mut rng, &frame(INS_VERIFY, 0, 0x81, &[])).1,
+            Sw::retries_left(3)
+        );
+        assert_eq!(applet.store.save_calls, saves_before);
+    }
+
+    #[test]
+    fn provisioning_defaults_survive_a_failing_store() {
+        let mut rng = TestRng(59);
+        let mut applet = OpenPgp::new(FlakyOpenPgpStore::new(MemoryOpenPgpStore::new()));
+        applet.store.set_save_fails(true);
+        assert_eq!(applet.select().sw, Sw::OK);
+        // The interop defaults are provisioned in RAM even though their save
+        // failed (regression for the `ensure_loaded` fallback of R1).
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x81, b"123456")
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut applet,
+                &mut rng,
+                &frame(INS_VERIFY, 0, 0x83, b"12345678")
+            )
+            .1,
+            Sw::OK
+        );
     }
 }

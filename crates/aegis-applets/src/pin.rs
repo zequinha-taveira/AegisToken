@@ -8,6 +8,18 @@
 //!
 //! The framework never stores or returns the PIN itself; only a
 //! [`PinHash`] exists after provisioning, and it is redacted from `Debug`.
+//!
+//! The slot has no notion of session, so it cannot know who is asking:
+//! authorization lives with the applet's command handler, never here.
+//!
+//! Persistence is also not the slot's business: a `PinSlot` never reads or
+//! writes a store. Whoever mutates a slot owns the save of the sealed state
+//! and must propagate its result — a silently dropped save makes the
+//! mutation fail-open, because the persisted state stays behind the RAM
+//! state and a reload would resurrect the old counter. The OATH applet and
+//! the OpenPGP key/signature routes answer `6A84` on a failed save, and the
+//! mutators of the retry counters (verify with consumed attempt, change,
+//! unblock) follow the same rule.
 
 use crate::apdu::Sw;
 use sha2::{Digest, Sha256};
@@ -131,7 +143,8 @@ impl core::fmt::Debug for PinHash {
     }
 }
 
-/// Compare two byte slices without an early exit.
+/// The crate-wide constant-time comparator: every comparison of
+/// key-derived material (`PinHash`, OATH HMAC, OpenPGP MDC) goes through it.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -198,6 +211,13 @@ impl PinSlot {
     }
 
     /// Change the PIN after verifying `current`.
+    ///
+    /// The current PIN in the data is the slot's floor: it is what a holder
+    /// must present, but it is not the whole of the authorization. Extra
+    /// session-gated authority belongs to the calling handler — e.g. the
+    /// OpenPGP `reset_retry` and its `verify_change` for the admin slot
+    /// (`P2=0x83`) both require the admin PIN already verified in the
+    /// session, like the callers of [`Self::unblock`].
     pub fn change(&mut self, current: &[u8], new: &[u8]) -> Result<(), Sw> {
         self.verify(current)?;
         self.set(new)
@@ -223,8 +243,12 @@ impl PinSlot {
 
     /// Unblock the slot with a new PIN, restoring the retry counter.
     ///
-    /// The caller must have verified the unblocking authority (PUK, PW3 or the
-    /// management key) first.
+    /// Authorization is entirely the caller's obligation: a command handler
+    /// may call this only after verifying the unblocking authority of its
+    /// applet. The present callers are the PIV `reset_retry_counter`, which
+    /// verifies the PUK carried in the command data first, and the OpenPGP
+    /// `reset_retry`, which requires the admin PIN already verified in the
+    /// session. An applet without such a gate must not call it.
     pub fn unblock(&mut self, new: &[u8]) -> Result<(), Sw> {
         self.set(new)
     }

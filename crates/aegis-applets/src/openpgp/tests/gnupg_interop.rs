@@ -390,6 +390,16 @@ fn gnupg_encrypts_and_the_card_decrypts() {
     let data = &plain[4 + name_length + 4..];
     assert_eq!(data, message, "the card returns the plaintext");
 
+    // A KDF hash outside the implemented domain is refused at the border and
+    // the valid material keeps working: the refusal wrote nothing.
+    let mut foreign = import.clone();
+    foreign[1 + wrapped.len()] = 0x0A;
+    let (_, sw) = send(&frame(0xDA, 0x00, 0xD2, &foreign));
+    assert_eq!(sw, Sw::WRONG_DATA, "SHA-512 is not a supported KDF hash");
+    let (again, sw) = send(&frame(0x2A, 0x80, 0x86, &command));
+    assert_eq!(sw, Sw::OK, "the provisioned material still decrypts");
+    assert_eq!(again, plain, "the same plaintext comes back");
+
     // --- GnuPG decrypts the same message -----------------------------------
     let output = run_gpg(&home, &["--decrypt", &cipher_file]);
     assert!(
