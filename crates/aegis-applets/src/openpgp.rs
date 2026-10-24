@@ -574,7 +574,12 @@ impl<S: OpenPgpStore> OpenPgp<S> {
                 return false;
             }
             // RSA slots must decode to a valid private key; anything else
-            // fails closed so a torn write can never yield a half key.
+            // fails closed so a torn write can never yield a half key. The
+            // one non-RSA width above the 48-octet slab is the RFC 6637
+            // material an accepted `PUT DATA D2` writes into the decryption
+            // slot (`EcdhMaterial::store`): accepted exactly there, under the
+            // only algorithms the import is handled under, so the state the
+            // card itself wrote survives to the next session.
             if algo == KEY_ALGO_RSA2048 {
                 if len != rsa::RSA_BLOB_BYTES
                     || rsa::Rsa2048PrivateKey::from_blob(&raw[..len]).is_none()
@@ -582,7 +587,12 @@ impl<S: OpenPgpStore> OpenPgp<S> {
                     return false;
                 }
             } else if len > 48 {
-                return false;
+                let d2_geometry = len == ECDH_KEY_BYTES + ECDH_MATERIAL_BYTES
+                    && index == 1
+                    && (algo == KEY_ALGO_UNSET || algo == KEY_ALGO_ECDH_P256);
+                if !d2_geometry {
+                    return false;
+                }
             }
             key.present = present != 0;
             key.len = len;
@@ -1903,7 +1913,9 @@ mod tests {
     use super::*;
     use p256::ecdsa::signature::hazmat::PrehashVerifier;
 
+    mod adversarial_apdu;
     mod gnupg_interop;
+    mod state_roundtrip;
 
     /// The OpenPGP Card 3.4.1 section 4.4.3.10 returns the public key of an EC key
     /// under the tag 86; the tag 81 carries the modulus of an RSA key.
