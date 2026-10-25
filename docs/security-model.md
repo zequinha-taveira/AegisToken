@@ -174,6 +174,21 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   floor, a power cycle can therefore restore the persisted counter when the
   save of the consumed attempt failed — this is the documented degradation
   model for a failing flash, not an unintended gap.
+  The PIV applet follows the same rule on its own per-slot records: a `VERIFY`
+  that consumes an attempt, `CHANGE REFERENCE DATA` and `RESET RETRY COUNTER`
+  answer `6A84` when the save of the mutated record fails, and only the record
+  of the slot that changed is written (`RECORD_PIN`/`RECORD_PUK`), so a
+  refused save is attributable to one slot and is never confirmed as
+  `63Cx`/`9000`. A successful `VERIFY`, an empty `VERIFY` and the parameter,
+  length, format and blocked refusals (`6A86`, `6A88`, `6A80`, `6985`, `6700`,
+  `6983`) save nothing. Its reloads are clamped to the same sticky per-slot
+  floor (`pin_floor`/`puk_floor`, independent per slot): a failed save lowers
+  the floor to the RAM counter — an unblock that did not persist can never
+  raise it, so the next `SELECT` stays blocked — and a later good save
+  re-anchors it. This matters more in PIV because a CCID stack reselects the
+  AID per operation, so the floor is what closes the re-select window; between
+  power cycles the persisted state governs, under the same trade-offs
+  (intra-session floor, write-ahead rejected for flash wear).
 - **Secrets are sealed at rest.** Credential keys, OATH secrets, PIN-derived
   values and data objects are stored in sealed records (AES-256-GCM under the
   OTP root key); no applet response can export them.

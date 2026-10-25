@@ -188,6 +188,33 @@ presença, respondida pelo botão BOOTSEL).
 > contadores usam `SealedPivStore` (AES-256-GCM na região de applets) e
 > sobrevivem a power cycle; sem a chave, o firmware usa `MemoryPivStore`.
 
+### Persistência fail-closed de PIN/PUK (fatia `specs/piv-pin-persistence.md`)
+
+A falha de gravação do record de PIN/PUK deixou de ser silenciosa: o `VERIFY`
+que consome tentativa, `CHANGE REFERENCE DATA` e `RESET RETRY COUNTER`
+respondem **`6A84`** quando a store recusa a gravação (nunca `63Cx`/`9000`),
+cada mutação grava apenas o record do slot mutado e um **piso sticky por slot**
+(`pin_floor`/`puk_floor`, volátil de sessão) impede que um `SELECT` ressuscite
+tentativas consumidas ou confirme um unblock não persistido. O caminho feliz
+com store íntegra é o de antes (`63Cx` persistido, `9000` em
+`CHANGE`/`RESET`).
+
+| AC | Critério | Teste de host (`aegis-applets::piv`) | Status |
+|----|----------|--------------------------------------|--------|
+| AC-1 | `VERIFY` que consome tentativa com save falhando → `6A84` (nunca `63Cx`), contador decrementado em RAM; esgotado → `6983` | `verify_with_failing_store_reports_the_save_error_and_keeps_the_ram_counter` | **Verificado em host** |
+| AC-2 | Piso sticky sobrevive ao `select()` na mesma instância (PIN e PUK independentes); com store íntegra o persistido governa | `pin_floor_survives_reselect`, `puk_floor_survives_reselect_independently` | **Verificado em host** |
+| AC-3 | Clamp no `load_state` (`min(restaurado, piso)`), inclusive sobre os defaults do `provision`; piso máximo não muda nada | `reload_never_climbs_above_the_session_floor` | **Verificado em host** |
+| AC-4 | `CHANGE` (PIN e PUK) com save falhando → `6A84`, hash novo in-session e antigo após `select()`; corrente errado → `6A84` com decremento em RAM | `change_with_failing_store_never_fakes_success`, `change_puk_with_failing_store_never_fakes_success` | **Verificado em host** |
+| AC-5 | `RESET` com PUK correto e save falhando → `6A84`; bloqueado após `select()` (unblock não sobe o piso), PUK intocado; PUK errado → `6A84`; store íntegra → `9000` e desbloqueio sobrevive | `reset_with_failing_store_never_confirms_the_unblock`, `session_floor_reanchors_on_a_good_save_and_never_rises_on_a_failed_one` | **Verificado em host** |
+| AC-6 | Só records mutados são escritos: `VERIFY` ok/vazio = 0, `CHANGE` errado = 1 no alvo/0 no outro, `RESET` ok = 1 PIN/0 PUK, recusas = 0 | `successful_verify_does_not_write`, `mutations_write_only_the_mutated_record`, `blocked_puk_reset_emits_no_write` | **Verificado em host** |
+| AC-7 | Superfície de SW preservada (`6983`, `6A86`/`6A88`/`6A80`/`6985`/`6700`) e caminho feliz idêntico; regressão zero na suíte | `refusals_do_not_write_pin_records_under_a_failing_store`, `happy_path_persists_the_three_handlers` + `cargo test -p aegis-applets` | **Verificado em host** |
+| AC-8 | Contrato em `docs/security-model.md`, `roadmap.md` e `validation.md` | revisão estática | **Verificado** (documentação na mesma mudança) |
+
+> **Pendência física:** a falha de gravação não é induzida em hardware — o
+> `validate_piv.py` não simula flash doente (nada muda no script neste ciclo).
+> Fica pendente o caso "mutação de PIN/PUK com gravação negada → `6A84`" em
+> dispositivo real; a interop `pivy`/OpenSC segue a mesma dos ACs de host.
+
 ## OATH / TOTP / HOTP (Fase 13)
 
 O applet OATH usa o protocolo YKOATH sobre a mesma interface CCID. Os segredos
@@ -734,6 +761,7 @@ acessível via `hidraw`.
 | AC-027 | OpenPGP: `CHANGE REFERENCE DATA` do PW3 (`P2=0x83`) exige a sessão de admin (`6982` sem tocar estado, contador ou store); o PW1 (`0x81`/`0x82`) mantém a autoridade do corrente no corpo; sessão mantida pela troca | Testes de host `aegis-applets::openpgp` (fatia S10) | **Verificado em host** (6 testes novos + 2 S5 atualizados); extensão do `validate_openpgp.py` + interop `gpg` físicos pendentes |
 | AC-028 | OpenPGP: `CHANGE REFERENCE DATA` do PW1 aceita o corpo variável `atual‖novo` da card spec (`12 ≤ Lc ≤ 254`; fora → `6A80` sem tocar slot/contador/store; delimitação pelo hash armazenado — varredura read-only `PinSlot::resolve_change`; corrente errado → exatamente **uma** tentativa `63Cx` com persist; piso S5 com `6A84` na falha de gravação; `0x83` mantém corpo fixo 16 + gate da S10; sem bump de `PIN_STATE_VERSION`) | Testes de host `aegis-applets::openpgp` (fatia S11) | **Verificado em host** (7 testes novos + comentário do teste S10 atualizado); `validate_openpgp.py` + interop `gpg --card-edit` físicos pendentes |
 | AC-029 | OpenPGP: a janela de resposta de 2048 octets da decifra RFC 6637 é **mantida** (decisão C, sem mudança de buffer): fronteira do applet 2047/2048 → `9000` byte-exata e 2049 → `6A84` com corpo vazio como contrato executável (zero vazamento, recusa sem tocar estado/sessão); o teto real no transporte CCID — entrada de 2100 octets, maior comando decifrável do molde `86‖80` → `9000`, um octeto a mais → `CcidError::Overflow` sem SW e `card.reset()` documentado — congelado por teste de host; mensagem > ~2 KB é decifra parcial (card spec) ou no host | Testes de host `aegis-applets::openpgp` (fatia S12) | **Verificado em host** (1 teste novo + INFO da S8 re-ancorado como contrato); verificação física em cliente GnuPG real pendente junto com o hardware de AC-017/019/021 |
+| AC-030 | PIV: persistência de PIN/PUK fail-closed (mutadores de PIN → `6A84` em falha de gravação; save por record — só o slot mutado; piso sticky por slot com clamp no `SELECT`; `VERIFY` ok/recusas não gravam) | Testes de host `aegis-applets::piv` (fatia `specs/piv-pin-persistence.md`) + `docs/security-model.md` | **Verificado em host** (13 testes novos); indução de falha de flash em hardware pendente (`validate_piv.py` não simula flash doente) |
 
 ### Fases 7e — credential management e `changePIN` (host; hardware pendente)
 

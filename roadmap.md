@@ -945,6 +945,19 @@ adiado.
   `SELECT`, políticas de PIN (`never`/`once`/`always`) e de touch
   (`never`/`always`/`cached`), e enforcement de administrador em
   `PUT DATA`/`GENERATE ASYMMETRIC KEY PAIR`.
+- **Persistência fail-closed de PIN/PUK (fatia `specs/piv-pin-persistence.md`,
+  entregue):** `persist_pin` deixou de descartar o resultado da gravação — cada
+  mutação grava **só o record do slot mutado** (`RECORD_PIN`/`RECORD_PUK`) e
+  devolve o `bool`; `VERIFY` que consome tentativa, `CHANGE REFERENCE DATA` e
+  `RESET RETRY COUNTER` respondem **`6A84`** quando a store recusa a gravação,
+  nunca `63Cx`/`9000`. `VERIFY` bem-sucedido, `VERIFY` vazio e as recusas
+  (`6A86`/`6A88`/`6A80`/`6985`/`6700`/`6983`) não gravam — o save inútil depois
+  da recusa `6985` do `RESET` foi removido. Um **piso sticky por slot**
+  (`pin_floor`/`puk_floor`, volátil de sessão, clampeado no `load_state`)
+  impede que um `SELECT` ressuscite tentativas consumidas e um unblock não
+  persistido não sobe o piso (o `SELECT` seguinte continua bloqueado). 13
+  testes novos de host (238 em `aegis-applets`); a indução de falha de gravação
+  em hardware fica pendente em `validation.md`.
 - Cripto: ECDSA P-256/P-384 com assinatura sobre o *prehash* fornecido pelo
   host (padding à esquerda quando menor que a curva) e ponto público SEC1
   não comprimido em `7F49 { 86 }`; 3DES e AES em ECB de bloco único para o
@@ -1146,10 +1159,10 @@ adiado.
   (*write-ahead*) ficou deliberadamente de fora por desgaste de flash; o
   resíduo entre power cycles (o persistido governa) está documentado como
   modelo de degradação física em `docs/security-model.md`. O mesmo gap no PIV
-  (`persist_pin` fail-open) fica registrado como follow-up (fatia própria,
-  mecânica idêntica, arquivo próprio — não-objetivo desta fatia). 10 testes
-  novos de host (189 em `aegis-applets`); a falha de gravação não é induzida
-  em hardware neste ciclo (pendência em `validation.md`). Spec:
+  (`persist_pin` fail-open) foi entregue em `specs/piv-pin-persistence.md`
+  (Fase 12, mesma mecânica, arquivo próprio), mantendo a rastreabilidade. 10
+  testes novos de host (189 em `aegis-applets`); a falha de gravação não é
+  induzida em hardware neste ciclo (pendência em `validation.md`). Spec:
   `specs/openpgp-pin-persistence.md`.
 - **OpenPGP S6 — `PUT DATA D2` fail-closed na fronteira (`kdf_hash`/
   `wrapped_len`, entregue):** o material ECDH do slot de decifra

@@ -413,6 +413,22 @@ struct PendingSign {
     digest: Vec<u8, 256>,
 }
 
+/// Which of the two PIN records a command mutates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinRecord {
+    Pin,
+    Puk,
+}
+
+impl PinRecord {
+    const fn record(self) -> u16 {
+        match self {
+            Self::Pin => RECORD_PIN,
+            Self::Puk => RECORD_PUK,
+        }
+    }
+}
+
 /// PIV applet over a persistent store.
 pub struct Piv<S: PivStore> {
     store: S,
@@ -420,6 +436,13 @@ pub struct Piv<S: PivStore> {
     out: Vec<u8, SCRATCH_BYTES>,
     pin: PinSlot,
     puk: PinSlot,
+    /// Sticky floor of the PIN retry counter this session: the lowest counter
+    /// known to be persisted or consumed. A failed save keeps the RAM state
+    /// (restrictive) and lowers the floor, so a reload can never restore a
+    /// more permissive counter than the one already lost.
+    pin_floor: u8,
+    /// Sticky floor of the PUK retry counter this session.
+    puk_floor: u8,
     mgmt: MgmtKey,
     pin_verified: bool,
     mgmt_authenticated: bool,
@@ -439,6 +462,8 @@ impl<S: PivStore> Piv<S> {
             out: Vec::new(),
             pin: PinSlot::new(PIV_PIN_POLICY),
             puk: PinSlot::new(PIV_PIN_POLICY),
+            pin_floor: PIV_PIN_POLICY.max_attempts,
+            puk_floor: PIV_PIN_POLICY.max_attempts,
             mgmt: MgmtKey::default_key(),
             pin_verified: false,
             mgmt_authenticated: false,
@@ -495,23 +520,46 @@ impl<S: PivStore> Piv<S> {
         }
     }
 
+    fn slot(&self, record: PinRecord) -> &PinSlot {
+        match record {
+            PinRecord::Pin => &self.pin,
+            PinRecord::Puk => &self.puk,
+        }
+    }
+
+    fn slot_mut(&mut self, record: PinRecord) -> &mut PinSlot {
+        match record {
+            PinRecord::Pin => &mut self.pin,
+            PinRecord::Puk => &mut self.puk,
+        }
+    }
+
+    fn floor_mut(&mut self, record: PinRecord) -> &mut u8 {
+        match record {
+            PinRecord::Pin => &mut self.pin_floor,
+            PinRecord::Puk => &mut self.puk_floor,
+        }
+    }
+
     fn load_state(&mut self) -> bool {
         self.provision();
         let mut encoded = [0u8; crate::pin::PIN_STATE_LEN];
         let Some(len) = self.store.read(RECORD_PIN, &mut encoded) else {
             return false;
         };
-        let Ok(pin) = PinSlot::decode(PIV_PIN_POLICY, &encoded[..len]) else {
+        let Ok(mut pin) = PinSlot::decode(PIV_PIN_POLICY, &encoded[..len]) else {
             return false;
         };
+        clamp_to_floor(&mut pin, self.pin_floor);
         self.pin = pin;
 
         let Some(len) = self.store.read(RECORD_PUK, &mut encoded) else {
             return false;
         };
-        let Ok(puk) = PinSlot::decode(PIV_PIN_POLICY, &encoded[..len]) else {
+        let Ok(mut puk) = PinSlot::decode(PIV_PIN_POLICY, &encoded[..len]) else {
             return false;
         };
+        clamp_to_floor(&mut puk, self.puk_floor);
         self.puk = puk;
 
         let mut record = [0u8; 34];
@@ -525,11 +573,43 @@ impl<S: PivStore> Piv<S> {
         true
     }
 
-    fn persist_pin(&mut self) {
-        let pin = self.pin.clone();
-        let puk = self.puk.clone();
-        self.write_pin_slot(RECORD_PIN, &pin);
-        self.write_pin_slot(RECORD_PUK, &puk);
+    /// Persist only the record of `record` and anchor that slot's session
+    /// floor.
+    ///
+    /// One save is attributable to one slot, so a failed write cannot leave
+    /// the two slots half-written. The floor is volatile session state: a
+    /// successful save re-anchors it to the stored counter, a failed one
+    /// lowers it to the counter still in RAM so a reload cannot resurrect a
+    /// more permissive budget.
+    fn persist_pin(&mut self, record: PinRecord) -> bool {
+        let slot = self.slot(record).clone();
+        let saved = self.write_pin_slot(record.record(), &slot);
+        let retries = slot.retries_remaining();
+        let floor = self.floor_mut(record);
+        if saved {
+            *floor = retries;
+        } else {
+            *floor = (*floor).min(retries);
+        }
+        saved
+    }
+
+    /// Answer a mutating command: persist `record` when the command changed
+    /// it and translate a refused save into `6A84`.
+    ///
+    /// A failed save is never confirmed as a successful mutation, and a
+    /// consumed attempt is never reported as `63Cx` in a state the store does
+    /// not hold; the RAM state and the floor already kept it restrictive.
+    fn finish_mutation(
+        &mut self,
+        record: PinRecord,
+        mutated: bool,
+        result: Result<(), Sw>,
+    ) -> Response<'_> {
+        if mutated && !self.persist_pin(record) {
+            return Response::status(Sw::NOT_ENOUGH_MEMORY);
+        }
+        Response::status(result.err().unwrap_or(Sw::OK))
     }
 
     // ----- command handling -------------------------------------------------
@@ -665,58 +745,54 @@ impl<S: PivStore> Piv<S> {
         if apdu.p1 != 0x00 {
             return Response::status(Sw::INCORRECT_PARAMETERS);
         }
-        let result = match apdu.p2 {
-            REF_PIN => {
-                if apdu.data.is_empty() {
-                    return Response::status(Sw::retries_left(self.pin.retries_remaining()));
-                }
-                if apdu.data.len() != 8 {
-                    return Response::status(Sw::WRONG_LENGTH);
-                }
-                let result = self.pin.verify(apdu.data);
-                self.persist_pin();
-                self.pin_verified = result.is_ok();
-                result
-            }
-            REF_PUK => {
-                if apdu.data.is_empty() {
-                    return Response::status(Sw::retries_left(self.puk.retries_remaining()));
-                }
-                if apdu.data.len() != 8 {
-                    return Response::status(Sw::WRONG_LENGTH);
-                }
-                let result = self.puk.verify(apdu.data);
-                self.persist_pin();
-                result
-            }
+        let record = match apdu.p2 {
+            REF_PIN => PinRecord::Pin,
+            REF_PUK => PinRecord::Puk,
             _ => return Response::status(Sw::INCORRECT_PARAMETERS),
         };
-        Response::status(result.err().unwrap_or(Sw::OK))
+        if apdu.data.is_empty() {
+            return Response::status(Sw::retries_left(self.slot(record).retries_remaining()));
+        }
+        if apdu.data.len() != 8 {
+            return Response::status(Sw::WRONG_LENGTH);
+        }
+        let before = self.slot(record).retries_remaining();
+        let result = self.slot_mut(record).verify(apdu.data);
+        if record == PinRecord::Pin {
+            self.pin_verified = result.is_ok();
+        }
+        // Success and a blocked slot leave the counter alone: only a consumed
+        // attempt has persistable state behind it.
+        let mutated = self.slot(record).retries_remaining() < before;
+        self.finish_mutation(record, mutated, result)
     }
 
     fn change_reference_data(&mut self, apdu: &Apdu<'_>) -> Response<'_> {
         if apdu.p1 != 0x00 {
             return Response::status(Sw::INCORRECT_PARAMETERS);
         }
-        if apdu.p2 != REF_PIN && apdu.p2 != REF_PUK {
-            return Response::status(Sw::REFERENCED_DATA_NOT_FOUND);
-        }
+        let record = match apdu.p2 {
+            REF_PIN => PinRecord::Pin,
+            REF_PUK => PinRecord::Puk,
+            _ => return Response::status(Sw::REFERENCED_DATA_NOT_FOUND),
+        };
         if apdu.data.len() != 16 {
             return Response::status(Sw::WRONG_DATA);
         }
         if effective_pin_len(&apdu.data[8..]) < PIV_PIN_POLICY.min_len {
             return Response::status(Sw::CONDITIONS_NOT_SATISFIED);
         }
-        let result = if apdu.p2 == REF_PIN {
-            self.pin.change(&apdu.data[..8], &apdu.data[8..])
-        } else {
-            self.puk.change(&apdu.data[..8], &apdu.data[8..])
-        };
-        self.persist_pin();
-        if result.is_ok() && apdu.p2 == REF_PIN {
+        let before = self.slot(record).retries_remaining();
+        let result = self
+            .slot_mut(record)
+            .change(&apdu.data[..8], &apdu.data[8..]);
+        if result.is_ok() && record == PinRecord::Pin {
             self.pin_verified = true;
         }
-        Response::status(result.err().unwrap_or(Sw::OK))
+        // A successful change replaced the hash; a wrong current value
+        // consumed an attempt; a blocked refusal changed nothing.
+        let mutated = result.is_ok() || self.slot(record).retries_remaining() < before;
+        self.finish_mutation(record, mutated, result)
     }
 
     fn reset_retry_counter(&mut self, apdu: &Apdu<'_>) -> Response<'_> {
@@ -726,18 +802,18 @@ impl<S: PivStore> Piv<S> {
         if apdu.data.len() != 16 {
             return Response::status(Sw::WRONG_DATA);
         }
-        if let Err(sw) = self.puk.verify(&apdu.data[..8]) {
-            self.persist_pin();
-            return Response::status(sw);
+        let before = self.puk.retries_remaining();
+        let result = self.puk.verify(&apdu.data[..8]);
+        if result.is_err() {
+            let mutated = self.puk.retries_remaining() < before;
+            return self.finish_mutation(PinRecord::Puk, mutated, result);
         }
         if effective_pin_len(&apdu.data[8..]) < PIV_PIN_POLICY.min_len {
-            self.persist_pin();
             return Response::status(Sw::CONDITIONS_NOT_SATISFIED);
         }
         let result = self.pin.unblock(&apdu.data[8..]);
-        self.persist_pin();
         self.pin_verified = false;
-        Response::status(result.err().unwrap_or(Sw::OK))
+        self.finish_mutation(PinRecord::Pin, result.is_ok(), result)
     }
 
     fn generate_key_pair(&mut self, apdu: &Apdu<'_>, rng: &mut dyn Rng) -> Response<'_> {
@@ -1369,6 +1445,28 @@ fn padded_pin(pin: &[u8]) -> [u8; 8] {
     out
 }
 
+/// Lower a reloaded slot counter to `floor` when the store carried a more
+/// permissive one.
+///
+/// [`PinSlot`] does no I/O and exposes no counter setter (the counter only
+/// moves through the framework itself), so the clamp goes through the sealed
+/// encoding: the floor never exceeds the policy maximum, therefore the
+/// re-decoded state stays valid. On any encoding failure the slot is kept as
+/// it was: the clamp is already in the restrictive direction.
+fn clamp_to_floor(slot: &mut PinSlot, floor: u8) {
+    if slot.retries_remaining() <= floor {
+        return;
+    }
+    let mut encoded = [0u8; crate::pin::PIN_STATE_LEN];
+    if slot.encode(&mut encoded).is_err() {
+        return;
+    }
+    encoded[2] = floor;
+    if let Ok(clamped) = PinSlot::decode(slot.policy(), &encoded) {
+        *slot = clamped;
+    }
+}
+
 /// Read a one-byte TLV value.
 fn one_byte(value: &[u8]) -> Option<u8> {
     match value {
@@ -1505,11 +1603,74 @@ mod tests {
     const PIN: [u8; 8] = [b'1', b'2', b'3', b'4', b'5', b'6', 0xFF, 0xFF];
     const WRONG_PIN: [u8; 8] = [b'0'; 8];
 
-    fn applet() -> Piv<MemoryPivStore> {
-        let mut piv = Piv::new(MemoryPivStore::new());
+    fn applet_with<S: PivStore>(store: S) -> Piv<S> {
+        let mut piv = Piv::new(store);
         let response = piv.select();
         assert_eq!(response.sw, Sw::OK);
         piv
+    }
+
+    fn applet() -> Piv<MemoryPivStore> {
+        applet_with(MemoryPivStore::new())
+    }
+
+    /// A store wrapper that delegates to [`MemoryPivStore`] and can be
+    /// switched to reject every write, standing in for a worn-out flash.
+    ///
+    /// It counts the observed writes per record so tests can prove which
+    /// commands do and do not touch each slot, and it is `Default` so a
+    /// power cycle can swap the store out with `core::mem::take`.
+    struct FailingPivStore {
+        inner: MemoryPivStore,
+        write_fails: bool,
+        writes: [u32; MEMORY_RECORDS],
+    }
+
+    impl FailingPivStore {
+        fn new(inner: MemoryPivStore) -> Self {
+            Self {
+                inner,
+                write_fails: false,
+                writes: [0; MEMORY_RECORDS],
+            }
+        }
+
+        fn set_write_fails(&mut self, fails: bool) {
+            self.write_fails = fails;
+        }
+
+        fn reset_writes(&mut self) {
+            self.writes = [0; MEMORY_RECORDS];
+        }
+
+        fn writes(&self, record: u16) -> u32 {
+            self.writes[usize::from(record)]
+        }
+    }
+
+    impl Default for FailingPivStore {
+        fn default() -> Self {
+            Self::new(MemoryPivStore::new())
+        }
+    }
+
+    impl PivStore for FailingPivStore {
+        fn read(&mut self, record: u16, out: &mut [u8]) -> Option<usize> {
+            self.inner.read(record, out)
+        }
+
+        fn write(&mut self, record: u16, data: &[u8]) -> bool {
+            self.writes[usize::from(record)] += 1;
+            if self.write_fails {
+                false
+            } else {
+                self.inner.write(record, data)
+            }
+        }
+
+        fn erase(&mut self, record: u16) -> bool {
+            self.inner.erase(record)
+        }
     }
 
     #[test]
@@ -1576,8 +1737,8 @@ mod tests {
         frame
     }
 
-    fn run(
-        piv: &mut Piv<MemoryPivStore>,
+    fn run<S: PivStore>(
+        piv: &mut Piv<S>,
         rng: &mut TestRng,
         frame: &[u8],
     ) -> (HeaplessVec<u8, 2048>, Sw) {
@@ -1588,8 +1749,8 @@ mod tests {
         (data, response.sw)
     }
 
-    fn get_data(
-        piv: &mut Piv<MemoryPivStore>,
+    fn get_data<S: PivStore>(
+        piv: &mut Piv<S>,
         rng: &mut TestRng,
         oid: &[u8],
     ) -> (HeaplessVec<u8, 2048>, Sw) {
@@ -1613,7 +1774,7 @@ mod tests {
     }
 
     /// Authenticate the management key with the default 3DES key.
-    fn authenticate_management(piv: &mut Piv<MemoryPivStore>, rng: &mut TestRng) {
+    fn authenticate_management<S: PivStore>(piv: &mut Piv<S>, rng: &mut TestRng) {
         let (data, sw) = run(
             piv,
             rng,
@@ -1638,8 +1799,8 @@ mod tests {
         assert_eq!(sw, Sw::OK, "management key authentication");
     }
 
-    fn generate_key(
-        piv: &mut Piv<MemoryPivStore>,
+    fn generate_key<S: PivStore>(
+        piv: &mut Piv<S>,
         rng: &mut TestRng,
         slot: u8,
         algorithm: u8,
@@ -2497,5 +2658,873 @@ mod tests {
             &command(INS_PUT_DATA, 0x3F, 0xFF, &body),
         );
         assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+
+    const NEW_PIN: [u8; 8] = [b'6', b'5', b'4', b'3', b'2', b'1', 0xFF, 0xFF];
+
+    #[test]
+    fn verify_with_failing_store_reports_the_save_error_and_keeps_the_ram_counter() {
+        let mut piv = applet_with(FailingPivStore::new(MemoryPivStore::new()));
+        let mut rng = TestRng(60);
+        piv.store_mut().set_write_fails(true);
+        // A consumed attempt whose save is refused is never reported as
+        // `63Cx`: a host must not read a budget the store does not hold.
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN)
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        // The RAM counter keeps the decrement.
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &[])).1,
+            Sw::retries_left(2)
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                run(
+                    &mut piv,
+                    &mut rng,
+                    &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN)
+                )
+                .1,
+                Sw::NOT_ENOUGH_MEMORY
+            );
+        }
+        // Exhausted: the blocked slot answers `6983` and emits no save.
+        piv.store_mut().reset_writes();
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &PIN)).1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+        assert_eq!(piv.store().writes(RECORD_PIN), 0);
+    }
+
+    #[test]
+    fn pin_floor_survives_reselect() {
+        let mut piv = applet_with(FailingPivStore::new(MemoryPivStore::new()));
+        let mut rng = TestRng(61);
+        piv.store_mut().set_write_fails(true);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN)
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        // The floor recorded the consumed attempt, so a re-select that
+        // reloads the (still permissive) store cannot refill the counter.
+        assert_eq!(piv.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &[])).1,
+            Sw::retries_left(2)
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                run(
+                    &mut piv,
+                    &mut rng,
+                    &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN)
+                )
+                .1,
+                Sw::NOT_ENOUGH_MEMORY
+            );
+        }
+        assert_eq!(piv.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &PIN)).1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+
+        // With a healthy store the persisted counter keeps governing.
+        let mut healthy = applet();
+        assert_eq!(
+            run(
+                &mut healthy,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN)
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(healthy.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut healthy,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &[])
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+    }
+
+    #[test]
+    fn puk_floor_survives_reselect_independently() {
+        let mut piv = applet_with(FailingPivStore::new(MemoryPivStore::new()));
+        let mut rng = TestRng(62);
+        piv.store_mut().set_write_fails(true);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PUK, &WRONG_PIN)
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        assert_eq!(piv.select_response().sw, Sw::OK);
+        // The PUK floor keeps the consumed attempt; the PIN budget, whose
+        // record was never written, stays at the policy maximum.
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PUK, &[])).1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &[])).1,
+            Sw::retries_left(3)
+        );
+    }
+
+    #[test]
+    fn reload_never_climbs_above_the_session_floor() {
+        let mut rng = TestRng(63);
+        // A healthy applet consumes one attempt in each slot and persists it.
+        let mut piv = applet();
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN)
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PUK, &WRONG_PIN)
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        // The store holds 2 for both slots; a session floor of 1 wins.
+        let store = core::mem::take(piv.store_mut());
+        let mut reloaded = Piv::new(store);
+        reloaded.pin_floor = 1;
+        reloaded.puk_floor = 1;
+        assert_eq!(reloaded.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut reloaded,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &[])
+            )
+            .1,
+            Sw::retries_left(1)
+        );
+        assert_eq!(
+            run(
+                &mut reloaded,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PUK, &[])
+            )
+            .1,
+            Sw::retries_left(1)
+        );
+
+        // The clamp applies over the provisioning defaults too.
+        let mut fresh = Piv::new(MemoryPivStore::new());
+        fresh.pin_floor = 2;
+        fresh.puk_floor = 0;
+        assert_eq!(fresh.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(&mut fresh, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &[])).1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(
+            run(&mut fresh, &mut rng, &command(INS_VERIFY, 0, REF_PUK, &[])).1,
+            Sw::retries_left(0)
+        );
+        assert_eq!(
+            run(
+                &mut fresh,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PUK, DEFAULT_PUK)
+            )
+            .1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+
+        // A floor at the policy maximum leaves the reload untouched.
+        let mut maxed = Piv::new(MemoryPivStore::new());
+        assert_eq!(maxed.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(&mut maxed, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &[])).1,
+            Sw::retries_left(3)
+        );
+        assert_eq!(
+            run(&mut maxed, &mut rng, &command(INS_VERIFY, 0, REF_PUK, &[])).1,
+            Sw::retries_left(3)
+        );
+    }
+
+    #[test]
+    fn change_with_failing_store_never_fakes_success() {
+        let mut piv = applet_with(FailingPivStore::new(MemoryPivStore::new()));
+        let mut rng = TestRng(64);
+        piv.store_mut().set_write_fails(true);
+        let mut body = [0u8; 16];
+        body[..8].copy_from_slice(&PIN);
+        body[8..].copy_from_slice(&NEW_PIN);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_CHANGE_REFERENCE_DATA, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        // The session flags follow the slot result: the new hash is live in
+        // RAM, so the owner stays verified despite the refused save.
+        assert!(piv.pin_verified);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &NEW_PIN)
+            )
+            .1,
+            Sw::OK
+        );
+
+        // The persisted old PIN governs after the re-select.
+        piv.store_mut().set_write_fails(false);
+        assert_eq!(piv.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &NEW_PIN)
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &PIN)).1,
+            Sw::OK
+        );
+
+        // A wrong current value consumes an attempt in RAM and is reported as
+        // the save error, not as `63Cx`.
+        piv.store_mut().set_write_fails(true);
+        body[..8].copy_from_slice(&WRONG_PIN);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_CHANGE_REFERENCE_DATA, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &[])).1,
+            Sw::retries_left(1)
+        );
+    }
+
+    #[test]
+    fn change_puk_with_failing_store_never_fakes_success() {
+        let mut piv = applet_with(FailingPivStore::new(MemoryPivStore::new()));
+        let mut rng = TestRng(65);
+        piv.store_mut().set_write_fails(true);
+        let new_puk = [b'8'; 8];
+        let mut body = [0u8; 16];
+        body[..8].copy_from_slice(DEFAULT_PUK);
+        body[8..].copy_from_slice(&new_puk);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_CHANGE_REFERENCE_DATA, 0, REF_PUK, &body)
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PUK, &new_puk)
+            )
+            .1,
+            Sw::OK
+        );
+
+        piv.store_mut().set_write_fails(false);
+        assert_eq!(piv.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PUK, &new_puk)
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PUK, DEFAULT_PUK)
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn reset_with_failing_store_never_confirms_the_unblock() {
+        let mut piv = applet_with(FailingPivStore::new(MemoryPivStore::new()));
+        let mut rng = TestRng(66);
+        // Drain the PIN while the store is healthy, so the blocked state is
+        // persisted.
+        for remaining in [2, 1, 0] {
+            assert_eq!(
+                run(
+                    &mut piv,
+                    &mut rng,
+                    &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN)
+                )
+                .1,
+                Sw::retries_left(remaining)
+            );
+        }
+        piv.store_mut().set_write_fails(true);
+        let mut body = [0u8; 16];
+        body[..8].copy_from_slice(DEFAULT_PUK);
+        body[8..].copy_from_slice(&NEW_PIN);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_RESET_RETRY_COUNTER, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        // The unblock lives in RAM only, and the session flag stays as before.
+        assert!(!piv.pin_verified);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &NEW_PIN)
+            )
+            .1,
+            Sw::OK
+        );
+        // The re-select restores the persisted blocked state: the unpersisted
+        // unblock could not raise the floor.
+        assert_eq!(piv.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &NEW_PIN)
+            )
+            .1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+        // The PUK record was not touched.
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PUK, &[])).1,
+            Sw::retries_left(3)
+        );
+
+        // A wrong PUK with a failing store is the save error, not `63Cx`.
+        body[..8].copy_from_slice(&WRONG_PIN);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_RESET_RETRY_COUNTER, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PUK, &[])).1,
+            Sw::retries_left(2)
+        );
+
+        // With a healthy store the unblock is confirmed and survives a reopen.
+        let mut healthy = applet();
+        for _ in 0..3 {
+            let _ = run(
+                &mut healthy,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN),
+            );
+        }
+        body[..8].copy_from_slice(DEFAULT_PUK);
+        assert_eq!(
+            run(
+                &mut healthy,
+                &mut rng,
+                &command(INS_RESET_RETRY_COUNTER, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::OK
+        );
+        let store = core::mem::take(healthy.store_mut());
+        let mut reopened = Piv::new(store);
+        assert_eq!(reopened.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut reopened,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &NEW_PIN)
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn successful_verify_does_not_write() {
+        let mut piv = applet_with(FailingPivStore::new(MemoryPivStore::new()));
+        let mut rng = TestRng(67);
+        piv.store_mut().reset_writes();
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &PIN)).1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PUK, DEFAULT_PUK)
+            )
+            .1,
+            Sw::OK
+        );
+        // Reading the counters is a read of the slot too.
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &[])).1,
+            Sw::retries_left(3)
+        );
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PUK, &[])).1,
+            Sw::retries_left(3)
+        );
+        assert_eq!(piv.store().writes(RECORD_PIN), 0);
+        assert_eq!(piv.store().writes(RECORD_PUK), 0);
+    }
+
+    #[test]
+    fn mutations_write_only_the_mutated_record() {
+        let mut rng = TestRng(68);
+        let mut piv = applet_with(FailingPivStore::new(MemoryPivStore::new()));
+        piv.store_mut().reset_writes();
+        let mut body = [0u8; 16];
+        body[..8].copy_from_slice(&WRONG_PIN);
+        body[8..].copy_from_slice(&NEW_PIN);
+        // A wrong current PIN consumes one attempt in the PIN record only.
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_CHANGE_REFERENCE_DATA, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(piv.store().writes(RECORD_PIN), 1);
+        assert_eq!(piv.store().writes(RECORD_PUK), 0);
+        // The same holds for the PUK record.
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_CHANGE_REFERENCE_DATA, 0, REF_PUK, &body)
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        assert_eq!(piv.store().writes(RECORD_PIN), 1);
+        assert_eq!(piv.store().writes(RECORD_PUK), 1);
+
+        // A successful RESET writes the PIN record only.
+        let mut reset_piv = applet_with(FailingPivStore::new(MemoryPivStore::new()));
+        for _ in 0..3 {
+            let _ = run(
+                &mut reset_piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN),
+            );
+        }
+        reset_piv.store_mut().reset_writes();
+        body[..8].copy_from_slice(DEFAULT_PUK);
+        assert_eq!(
+            run(
+                &mut reset_piv,
+                &mut rng,
+                &command(INS_RESET_RETRY_COUNTER, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(reset_piv.store().writes(RECORD_PIN), 1);
+        assert_eq!(reset_piv.store().writes(RECORD_PUK), 0);
+    }
+
+    #[test]
+    fn refusals_do_not_write_pin_records_under_a_failing_store() {
+        let mut piv = applet_with(FailingPivStore::new(MemoryPivStore::new()));
+        let mut rng = TestRng(69);
+        piv.store_mut().set_write_fails(true);
+        piv.store_mut().reset_writes();
+        let mut body = [0u8; 16];
+        body[..8].copy_from_slice(&PIN);
+        body[8..].copy_from_slice(&NEW_PIN);
+
+        // VERIFY: P1, unknown P2 and wrong length keep their status words.
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 1, REF_PIN, &PIN)).1,
+            Sw::INCORRECT_PARAMETERS
+        );
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, 0x82, &PIN)).1,
+            Sw::INCORRECT_PARAMETERS
+        );
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &PIN[..7])
+            )
+            .1,
+            Sw::WRONG_LENGTH
+        );
+        // CHANGE: P1, P2, length and new-PIN format.
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_CHANGE_REFERENCE_DATA, 1, REF_PIN, &body)
+            )
+            .1,
+            Sw::INCORRECT_PARAMETERS
+        );
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_CHANGE_REFERENCE_DATA, 0, 0x82, &body)
+            )
+            .1,
+            Sw::REFERENCED_DATA_NOT_FOUND
+        );
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_CHANGE_REFERENCE_DATA, 0, REF_PIN, &body[..15])
+            )
+            .1,
+            Sw::WRONG_DATA
+        );
+        body[8..].copy_from_slice(&[0xFF; 8]);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_CHANGE_REFERENCE_DATA, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::CONDITIONS_NOT_SATISFIED
+        );
+        // RESET: P1, P2, length and new-PIN format.
+        body[..8].copy_from_slice(DEFAULT_PUK);
+        body[8..].copy_from_slice(&NEW_PIN);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_RESET_RETRY_COUNTER, 1, REF_PIN, &body)
+            )
+            .1,
+            Sw::INCORRECT_PARAMETERS
+        );
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_RESET_RETRY_COUNTER, 0, REF_PUK, &body)
+            )
+            .1,
+            Sw::INCORRECT_PARAMETERS
+        );
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_RESET_RETRY_COUNTER, 0, REF_PIN, &body[..15])
+            )
+            .1,
+            Sw::WRONG_DATA
+        );
+        body[8..].copy_from_slice(&[0xFF; 8]);
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_RESET_RETRY_COUNTER, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::CONDITIONS_NOT_SATISFIED
+        );
+        assert_eq!(piv.store().writes(RECORD_PIN), 0);
+        assert_eq!(piv.store().writes(RECORD_PUK), 0);
+
+        // A blocked slot answers `6983` and does not write either.
+        piv.store_mut().set_write_fails(false);
+        for _ in 0..3 {
+            let _ = run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN),
+            );
+        }
+        piv.store_mut().set_write_fails(true);
+        piv.store_mut().reset_writes();
+        assert_eq!(
+            run(&mut piv, &mut rng, &command(INS_VERIFY, 0, REF_PIN, &PIN)).1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+        assert_eq!(piv.store().writes(RECORD_PIN), 0);
+        assert_eq!(piv.store().writes(RECORD_PUK), 0);
+    }
+
+    #[test]
+    fn happy_path_persists_the_three_handlers() {
+        let mut piv = applet();
+        let mut rng = TestRng(70);
+        // A consumed attempt is persisted across a reopen.
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN)
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+        let store = core::mem::take(piv.store_mut());
+        let mut reopened = Piv::new(store);
+        assert_eq!(reopened.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut reopened,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &[])
+            )
+            .1,
+            Sw::retries_left(2)
+        );
+
+        // CHANGE answers `9000` and the new hash is the persisted one.
+        let mut body = [0u8; 16];
+        body[..8].copy_from_slice(&PIN);
+        body[8..].copy_from_slice(&NEW_PIN);
+        assert_eq!(
+            run(
+                &mut reopened,
+                &mut rng,
+                &command(INS_CHANGE_REFERENCE_DATA, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::OK
+        );
+        let store = core::mem::take(reopened.store_mut());
+        let mut changed = Piv::new(store);
+        assert_eq!(changed.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut changed,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &NEW_PIN)
+            )
+            .1,
+            Sw::OK
+        );
+
+        // RESET answers `9000` and the unblock survives a reopen.
+        for _ in 0..3 {
+            let _ = run(
+                &mut changed,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN),
+            );
+        }
+        let unblocked = [b'9', b'9', b'9', b'9', b'9', b'9', 0xFF, 0xFF];
+        body[..8].copy_from_slice(DEFAULT_PUK);
+        body[8..].copy_from_slice(&unblocked);
+        assert_eq!(
+            run(
+                &mut changed,
+                &mut rng,
+                &command(INS_RESET_RETRY_COUNTER, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::OK
+        );
+        let store = core::mem::take(changed.store_mut());
+        let mut unlocked = Piv::new(store);
+        assert_eq!(unlocked.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut unlocked,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &unblocked)
+            )
+            .1,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn session_floor_reanchors_on_a_good_save_and_never_rises_on_a_failed_one() {
+        let mut rng = TestRng(71);
+        let mut body = [0u8; 16];
+        body[..8].copy_from_slice(DEFAULT_PUK);
+        body[8..].copy_from_slice(&NEW_PIN);
+
+        // A good save after a drained session must raise the floor again: a
+        // CCID stack reselects per operation, and a stale floor of 0 would
+        // clamp the freshly unblocked record into a false lockout.
+        let mut reanchored = applet_with(FailingPivStore::new(MemoryPivStore::new()));
+        reanchored.store_mut().set_write_fails(true);
+        for _ in 0..3 {
+            assert_eq!(
+                run(
+                    &mut reanchored,
+                    &mut rng,
+                    &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN)
+                )
+                .1,
+                Sw::NOT_ENOUGH_MEMORY
+            );
+        }
+        assert_eq!(
+            run(
+                &mut reanchored,
+                &mut rng,
+                &command(INS_RESET_RETRY_COUNTER, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        reanchored.store_mut().set_write_fails(false);
+        assert_eq!(
+            run(
+                &mut reanchored,
+                &mut rng,
+                &command(INS_RESET_RETRY_COUNTER, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::OK
+        );
+        assert_eq!(reanchored.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut reanchored,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &NEW_PIN)
+            )
+            .1,
+            Sw::OK
+        );
+
+        // An unblock whose save was refused must not raise the floor: here the
+        // blocked state lives only in RAM (the store still holds 3), so a
+        // re-select that regained the budget would resurrect the old PIN.
+        let mut refused = applet_with(FailingPivStore::new(MemoryPivStore::new()));
+        refused.store_mut().set_write_fails(true);
+        for _ in 0..3 {
+            assert_eq!(
+                run(
+                    &mut refused,
+                    &mut rng,
+                    &command(INS_VERIFY, 0, REF_PIN, &WRONG_PIN)
+                )
+                .1,
+                Sw::NOT_ENOUGH_MEMORY
+            );
+        }
+        assert_eq!(
+            run(
+                &mut refused,
+                &mut rng,
+                &command(INS_RESET_RETRY_COUNTER, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        assert_eq!(refused.select_response().sw, Sw::OK);
+        assert_eq!(
+            run(
+                &mut refused,
+                &mut rng,
+                &command(INS_VERIFY, 0, REF_PIN, &PIN)
+            )
+            .1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+    }
+
+    #[test]
+    fn blocked_puk_reset_emits_no_write() {
+        let mut piv = applet_with(FailingPivStore::new(MemoryPivStore::new()));
+        let mut rng = TestRng(72);
+        // Drain the PUK while the store is healthy, so the block is persisted.
+        for remaining in [2, 1, 0] {
+            assert_eq!(
+                run(
+                    &mut piv,
+                    &mut rng,
+                    &command(INS_VERIFY, 0, REF_PUK, &WRONG_PIN)
+                )
+                .1,
+                Sw::retries_left(remaining)
+            );
+        }
+        piv.store_mut().reset_writes();
+        piv.store_mut().set_write_fails(true);
+        let mut body = [0u8; 16];
+        body[..8].copy_from_slice(DEFAULT_PUK);
+        body[8..].copy_from_slice(&NEW_PIN);
+        // A blocked PUK refuses the reset before any slot work: no record is
+        // written even though the store is failing (it never gets consulted).
+        assert_eq!(
+            run(
+                &mut piv,
+                &mut rng,
+                &command(INS_RESET_RETRY_COUNTER, 0, REF_PIN, &body)
+            )
+            .1,
+            Sw::AUTHENTICATION_BLOCKED
+        );
+        assert_eq!(piv.store().writes(RECORD_PUK), 0);
+        assert_eq!(piv.store().writes(RECORD_PIN), 0);
     }
 }
