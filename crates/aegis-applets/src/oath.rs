@@ -593,13 +593,18 @@ impl<S: OathStore> Oath<S> {
     }
 
     fn reset(&mut self) -> Response<'_> {
+        // The empty RAM state is the permissive side (`require_auth` releases
+        // without an access code), so the erase must persist before it is
+        // applied; `clear` commits a torn-safe empty generation, which makes
+        // its boolean exact.
+        self.pending = None;
+        if !self.store.clear() {
+            return Response::status(Sw::NOT_ENOUGH_MEMORY);
+        }
         self.credentials.clear();
         self.auth_key.clear();
         self.authenticated = false;
         self.auth_challenge = DEFAULT_CHALLENGE;
-        self.pending = None;
-        let _ = self.store.clear();
-        let _ = self.save_state();
         Response::status(Sw::OK)
     }
 
@@ -861,10 +866,100 @@ mod tests {
         }
     }
 
-    fn applet() -> Oath<MemoryOathStore> {
-        let mut oath = Oath::new(MemoryOathStore::new());
+    fn applet_with<S: OathStore>(store: S) -> Oath<S> {
+        let mut oath = Oath::new(store);
         assert_eq!(oath.select().sw, Sw::OK);
         oath
+    }
+
+    fn applet() -> Oath<MemoryOathStore> {
+        applet_with(MemoryOathStore::new())
+    }
+
+    /// A store wrapper that delegates to [`MemoryOathStore`] and can be
+    /// switched to reject `clear` or `save`, standing in for a worn-out
+    /// flash.
+    ///
+    /// It counts the observed calls per operation so tests can prove which
+    /// commands do and do not touch the store, and it is `Default` so a power
+    /// cycle can swap the store out with `core::mem::take`.
+    struct FailingOathStore {
+        inner: MemoryOathStore,
+        clear_fails: bool,
+        save_fails: bool,
+        clears: u32,
+        saves: u32,
+        loads: u32,
+    }
+
+    impl FailingOathStore {
+        fn new(inner: MemoryOathStore) -> Self {
+            Self {
+                inner,
+                clear_fails: false,
+                save_fails: false,
+                clears: 0,
+                saves: 0,
+                loads: 0,
+            }
+        }
+
+        fn set_clear_fails(&mut self, fails: bool) {
+            self.clear_fails = fails;
+        }
+
+        fn set_save_fails(&mut self, fails: bool) {
+            self.save_fails = fails;
+        }
+
+        fn reset_calls(&mut self) {
+            self.clears = 0;
+            self.saves = 0;
+            self.loads = 0;
+        }
+
+        fn clears(&self) -> u32 {
+            self.clears
+        }
+
+        fn saves(&self) -> u32 {
+            self.saves
+        }
+
+        fn loads(&self) -> u32 {
+            self.loads
+        }
+    }
+
+    impl Default for FailingOathStore {
+        fn default() -> Self {
+            Self::new(MemoryOathStore::new())
+        }
+    }
+
+    impl OathStore for FailingOathStore {
+        fn load(&mut self, out: &mut [u8]) -> Option<usize> {
+            self.loads += 1;
+            self.inner.load(out)
+        }
+
+        fn save(&mut self, data: &[u8]) -> bool {
+            self.saves += 1;
+            if self.save_fails {
+                false
+            } else {
+                self.inner.save(data)
+            }
+        }
+
+        fn clear(&mut self) -> bool {
+            self.clears += 1;
+            if self.clear_fails {
+                false
+            } else {
+                self.inner.clear()
+            }
+        }
     }
 
     fn frame(ins: u8, p1: u8, p2: u8, data: &[u8]) -> Vec<u8, 512> {
@@ -877,8 +972,8 @@ mod tests {
         output
     }
 
-    fn run(
-        oath: &mut Oath<MemoryOathStore>,
+    fn run<S: OathStore>(
+        oath: &mut Oath<S>,
         rng: &mut TestRng,
         frame: &[u8],
     ) -> (Vec<u8, 2048>, Sw) {
@@ -927,6 +1022,27 @@ mod tests {
         let value = tlv::find(response, tag).unwrap();
         assert_eq!(value.len(), 5);
         u32::from_be_bytes(value[1..5].try_into().unwrap()) % 10u32.pow(u32::from(value[0]))
+    }
+
+    fn set_access_code<S: OathStore>(oath: &mut Oath<S>, rng: &mut TestRng, key: &[u8]) -> Sw {
+        let challenge = b"12345678";
+        let response = hmac_digest(ALGORITHM_SHA1, key, challenge).unwrap();
+        let mut data = Vec::<u8, 256>::new();
+        let mut key_data = Vec::<u8, 128>::new();
+        key_data.push(ALGORITHM_SHA1).unwrap();
+        key_data.extend_from_slice(key).unwrap();
+        append_tlv(&mut data, TAG_KEY, &key_data);
+        append_tlv(&mut data, TAG_CHALLENGE, challenge);
+        append_tlv(&mut data, TAG_RESPONSE, &response);
+        run(oath, rng, &frame(INS_SET_CODE, 0, 0, &data)).1
+    }
+
+    fn validate_access_code<S: OathStore>(oath: &mut Oath<S>, rng: &mut TestRng, key: &[u8]) -> Sw {
+        let response = hmac_digest(ALGORITHM_SHA1, key, &oath.auth_challenge).unwrap();
+        let mut validate = Vec::<u8, 128>::new();
+        append_tlv(&mut validate, TAG_RESPONSE, &response);
+        append_tlv(&mut validate, TAG_CHALLENGE, b"87654321");
+        run(oath, rng, &frame(INS_VALIDATE, 0, 0, &validate)).1
     }
 
     #[test]
@@ -1040,19 +1156,7 @@ mod tests {
         let mut rng = TestRng;
         let mut key = [0u8; 10];
         rng.fill_bytes(&mut key);
-        let challenge = b"12345678";
-        let response = hmac_digest(ALGORITHM_SHA1, &key, challenge).unwrap();
-        let mut data = Vec::<u8, 256>::new();
-        let mut key_data = Vec::<u8, 128>::new();
-        key_data.push(ALGORITHM_SHA1).unwrap();
-        key_data.extend_from_slice(&key).unwrap();
-        append_tlv(&mut data, TAG_KEY, &key_data);
-        append_tlv(&mut data, TAG_CHALLENGE, challenge);
-        append_tlv(&mut data, TAG_RESPONSE, &response);
-        assert_eq!(
-            run(&mut oath, &mut rng, &frame(INS_SET_CODE, 0, 0, &data)).1,
-            Sw::OK
-        );
+        assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
 
         assert_eq!(oath.select().sw, Sw::OK);
         assert_eq!(
@@ -1227,6 +1331,400 @@ mod tests {
                 .0
                 .len(),
             0
+        );
+    }
+
+    const RFC_SECRET: &[u8] = b"12345678901234567890";
+
+    #[test]
+    fn reset_with_failing_store_reports_6a84_and_keeps_the_session_state() {
+        let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
+        let mut rng = TestRng;
+        let data = put_data(
+            b"reset-me",
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            8,
+            RFC_SECRET,
+            None,
+            0,
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &data)).1,
+            Sw::OK
+        );
+        oath.store_mut().set_clear_fails(true);
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_RESET, 0xDE, 0xAD, &[])).1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        let (list, status) = run(&mut oath, &mut rng, &frame(INS_LIST, 0, 0, &[]));
+        assert_eq!(status, Sw::OK);
+        assert_eq!(tlv::find(&list, TAG_NAME_LIST).unwrap()[1..], *b"reset-me");
+        let request = calculate_data(b"reset-me", Some(&1u64.to_be_bytes()));
+        let (response, status) = run(&mut oath, &mut rng, &frame(INS_CALCULATE, 0, 1, &request));
+        assert_eq!(status, Sw::OK);
+        assert_eq!(code(&response, TAG_TRUNCATED), 94287082);
+
+        let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
+        let mut key = [0u8; 10];
+        rng.fill_bytes(&mut key);
+        let data = put_data(
+            b"reset-me",
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            6,
+            RFC_SECRET,
+            None,
+            0,
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &data)).1,
+            Sw::OK
+        );
+        assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
+        assert_eq!(oath.select().sw, Sw::OK);
+        oath.store_mut().set_clear_fails(true);
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_RESET, 0xDE, 0xAD, &[])).1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_LIST, 0, 0, &[])).1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        let request = calculate_data(b"reset-me", Some(&1u64.to_be_bytes()));
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_CALCULATE, 0, 1, &request)).1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+
+        let mut healthy = applet();
+        let data = put_data(
+            b"reset-me",
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            6,
+            RFC_SECRET,
+            None,
+            0,
+        );
+        assert_eq!(
+            run(&mut healthy, &mut rng, &frame(INS_PUT, 0, 0, &data)).1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(&mut healthy, &mut rng, &frame(INS_RESET, 0xDE, 0xAD, &[])).1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(&mut healthy, &mut rng, &frame(INS_LIST, 0, 0, &[]))
+                .0
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn reset_retries_successfully_after_the_store_recovers() {
+        let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
+        let mut rng = TestRng;
+        let mut key = [0u8; 10];
+        rng.fill_bytes(&mut key);
+        let data = put_data(
+            b"reset-me",
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            6,
+            RFC_SECRET,
+            None,
+            0,
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &data)).1,
+            Sw::OK
+        );
+        assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
+        assert_eq!(oath.select().sw, Sw::OK);
+        oath.store_mut().set_clear_fails(true);
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_RESET, 0xDE, 0xAD, &[])).1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+
+        oath.store_mut().set_clear_fails(false);
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_RESET, 0xDE, 0xAD, &[])).1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_LIST, 0, 0, &[]))
+                .0
+                .len(),
+            0
+        );
+        let select = oath.select();
+        assert_eq!(select.sw, Sw::OK);
+        assert!(tlv::find(select.data, TAG_CHALLENGE).is_none());
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_LIST, 0, 0, &[]))
+                .0
+                .len(),
+            0
+        );
+        assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
+    }
+
+    #[test]
+    fn failed_reset_leaves_the_persisted_state_reachable_from_a_reload() {
+        let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
+        let mut rng = TestRng;
+        let mut key = [0u8; 10];
+        rng.fill_bytes(&mut key);
+        let data = put_data(
+            b"keep-me",
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            6,
+            RFC_SECRET,
+            None,
+            0,
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &data)).1,
+            Sw::OK
+        );
+        assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
+        assert_eq!(oath.select().sw, Sw::OK);
+        oath.store_mut().set_clear_fails(true);
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_RESET, 0xDE, 0xAD, &[])).1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+
+        let select = oath.select();
+        assert_eq!(select.sw, Sw::OK);
+        assert!(tlv::find(select.data, TAG_CHALLENGE).is_some());
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_LIST, 0, 0, &[])).1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        assert_eq!(validate_access_code(&mut oath, &mut rng, &key), Sw::OK);
+        let (list, status) = run(&mut oath, &mut rng, &frame(INS_LIST, 0, 0, &[]));
+        assert_eq!(status, Sw::OK);
+        assert_eq!(tlv::find(&list, TAG_NAME_LIST).unwrap()[1..], *b"keep-me");
+
+        let store = core::mem::take(oath.store_mut());
+        let mut reopened = applet_with(store);
+        assert_eq!(
+            run(&mut reopened, &mut rng, &frame(INS_LIST, 0, 0, &[])).1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        assert_eq!(validate_access_code(&mut reopened, &mut rng, &key), Sw::OK);
+        let (list, status) = run(&mut reopened, &mut rng, &frame(INS_LIST, 0, 0, &[]));
+        assert_eq!(status, Sw::OK);
+        assert_eq!(tlv::find(&list, TAG_NAME_LIST).unwrap()[1..], *b"keep-me");
+        let request = calculate_data(b"keep-me", Some(&1u64.to_be_bytes()));
+        let (response, status) = run(
+            &mut reopened,
+            &mut rng,
+            &frame(INS_CALCULATE, 0, 1, &request),
+        );
+        assert_eq!(status, Sw::OK);
+        assert_eq!(code(&response, TAG_TRUNCATED), 287082);
+
+        let mut encoded = [0u8; STATE_BYTES];
+        let len = reopened.store_mut().load(&mut encoded).unwrap();
+        assert!(len > 0);
+    }
+
+    #[test]
+    fn successful_reset_persists_the_erase_across_reopen() {
+        let mut oath = applet();
+        let mut rng = TestRng;
+        let data = put_data(
+            b"erase-me",
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            6,
+            RFC_SECRET,
+            None,
+            0,
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &data)).1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_RESET, 0xDE, 0xAD, &[])).1,
+            Sw::OK
+        );
+        let (list, status) = run(&mut oath, &mut rng, &frame(INS_LIST, 0, 0, &[]));
+        assert_eq!(status, Sw::OK);
+        assert!(list.is_empty());
+
+        let store = core::mem::take(oath.store_mut());
+        let mut reopened = applet_with(store);
+        let (list, status) = run(&mut reopened, &mut rng, &frame(INS_LIST, 0, 0, &[]));
+        assert_eq!(status, Sw::OK);
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn reset_parameters_outside_de_ad_do_not_touch_the_store() {
+        let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
+        let mut rng = TestRng;
+        let data = put_data(
+            b"keep-me",
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            6,
+            RFC_SECRET,
+            None,
+            0,
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &data)).1,
+            Sw::OK
+        );
+        oath.store_mut().reset_calls();
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_RESET, 0x00, 0x00, &[])).1,
+            Sw::INS_NOT_SUPPORTED
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_RESET, 0xDE, 0x00, &[])).1,
+            Sw::INS_NOT_SUPPORTED
+        );
+        assert_eq!(oath.store_mut().clears(), 0);
+        assert_eq!(oath.store_mut().saves(), 0);
+        let (list, status) = run(&mut oath, &mut rng, &frame(INS_LIST, 0, 0, &[]));
+        assert_eq!(status, Sw::OK);
+        assert_eq!(tlv::find(&list, TAG_NAME_LIST).unwrap()[1..], *b"keep-me");
+    }
+
+    #[test]
+    fn reset_writes_once_and_never_saves() {
+        let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
+        let mut rng = TestRng;
+        let data = put_data(
+            b"reset-me",
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            6,
+            RFC_SECRET,
+            None,
+            0,
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &data)).1,
+            Sw::OK
+        );
+        oath.store_mut().reset_calls();
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_RESET, 0xDE, 0xAD, &[])).1,
+            Sw::OK
+        );
+        assert_eq!(oath.store_mut().clears(), 1);
+        assert_eq!(oath.store_mut().saves(), 0);
+        assert_eq!(oath.store_mut().loads(), 0);
+
+        let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
+        let data = put_data(
+            b"reset-me",
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            6,
+            RFC_SECRET,
+            None,
+            0,
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &data)).1,
+            Sw::OK
+        );
+        oath.store_mut().set_clear_fails(true);
+        oath.store_mut().reset_calls();
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_RESET, 0xDE, 0xAD, &[])).1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        assert_eq!(oath.store_mut().clears(), 1);
+        assert_eq!(oath.store_mut().saves(), 0);
+        assert_eq!(oath.store_mut().loads(), 0);
+
+        oath.store_mut().set_clear_fails(false);
+        oath.store_mut().set_save_fails(true);
+        oath.store_mut().reset_calls();
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_RESET, 0xDE, 0xAD, &[])).1,
+            Sw::OK
+        );
+        assert_eq!(oath.store_mut().saves(), 0);
+    }
+
+    #[test]
+    fn reset_drops_the_pending_touch_in_both_paths() {
+        let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
+        let mut rng = TestRng;
+        let data = put_data(
+            b"touch",
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            6,
+            RFC_SECRET,
+            None,
+            PROPERTY_TOUCH,
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &data)).1,
+            Sw::OK
+        );
+        let request = calculate_data(b"touch", Some(&1u64.to_be_bytes()));
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_CALCULATE, 0, 1, &request)).1,
+            Sw::PRESENCE_REQUIRED
+        );
+        oath.store_mut().set_clear_fails(true);
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_RESET, 0xDE, 0xAD, &[])).1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        assert_eq!(
+            oath.confirm_presence(&mut rng).sw,
+            Sw::CONDITIONS_NOT_SATISFIED
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_CALCULATE, 0, 1, &request)).1,
+            Sw::PRESENCE_REQUIRED
+        );
+        assert_eq!(oath.confirm_presence(&mut rng).sw, Sw::OK);
+
+        let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
+        let data = put_data(
+            b"touch",
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            6,
+            RFC_SECRET,
+            None,
+            PROPERTY_TOUCH,
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &data)).1,
+            Sw::OK
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_CALCULATE, 0, 1, &request)).1,
+            Sw::PRESENCE_REQUIRED
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_RESET, 0xDE, 0xAD, &[])).1,
+            Sw::OK
+        );
+        assert_eq!(
+            oath.confirm_presence(&mut rng).sw,
+            Sw::CONDITIONS_NOT_SATISFIED
         );
     }
 }

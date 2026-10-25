@@ -189,6 +189,27 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   AID per operation, so the floor is what closes the re-select window; between
   power cycles the persisted state governs, under the same trade-offs
   (intra-session floor, write-ahead rejected for flash wear).
+  The OATH applet applies the same fail-closed rule to `RESET`
+  (`P1=0xDE, P2=0xAD`), with the order inverted: the store erase (`clear`) is
+  committed **before** any volatile cleanup, and a store refusal answers
+  `6A84` instead of `9000` — credentials, access code and the authentication
+  flags stay exactly as they were, and only an armed touch request (`pending`)
+  is dropped. The order is what closes the hole here, because the empty OATH
+  volatile state is the **permissive** side (`require_auth` releases when
+  `auth_key` is empty), unlike the restrictive PIV/OpenPGP floor: clearing RAM
+  first and failing the erase would silently disable the access code for the
+  session and let the next save persist a state without it. There is no floor
+  and no rollback: either the erase persisted and the RAM is cleared, or
+  nothing changes. The happy path is a **single** write (the redundant
+  `save_state()` of the empty blob was removed: it duplicated the erase and
+  its failure had no correct answer), the removed persisted state is the whole
+  blob (credentials, access code, HMAC algorithm/challenge; the in-session
+  `auth_algorithm` lingers in RAM untouched, since it never leaves the blob
+  on its own), and `P1`/`P2` outside the canonical pair answer `6D00` without
+  touching the store. `INS_RESET`
+  stays unauthenticated (YKOATH: it erases, it never reveals) and the erase is
+  **logical** — the `SealedBlob` slot rotation may keep older sealed
+  generations until they are overwritten.
 - **Secrets are sealed at rest.** Credential keys, OATH secrets, PIN-derived
   values and data objects are stored in sealed records (AES-256-GCM under the
   OTP root key); no applet response can export them.

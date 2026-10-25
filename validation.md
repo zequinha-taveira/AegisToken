@@ -232,6 +232,30 @@ O script grava uma credencial TOTP temporária com o vetor RFC 6238, executa
 a credencial. Os testes de host cobrem também RFC 4226, SHA-256/SHA-512,
 access code, persistência serializada e touch-required.
 
+### OATH: `RESET` fail-closed (fatia `specs/oath-reset-fail-closed.md`)
+
+O `RESET` YKOATH (`00 04 DE AD`, sem autenticação) apaga a store **antes** de
+limpar o estado volátil: uma recusa de gravação responde `6A84` e deixa
+credenciais, access code e flags de sessão intactos (só o toque armado é
+descartado); `9000` só é dado depois de o erase persistir. O caminho feliz é
+uma única escrita (sem `save_state` redundante) e `P1`/`P2` fora de `DE AD`
+respondem `6D00` sem tocar a store.
+
+| AC | Critério | Teste de host (`aegis-applets::oath`) | Status |
+|----|----------|---------------------------------------|--------|
+| AC-1 | `clear` falhando → `6A84`; `LIST`/`CALCULATE` iguais ao estado anterior (com access code e sem validação → `6982`) | `reset_with_failing_store_reports_6a84_and_keeps_the_session_state` | **Verificado em host** |
+| AC-2 | Store recuperada: `RESET` → `9000`, `LIST` vazio, `SELECT` sem `TAG_CHALLENGE` e novo `SET CODE` aceito | `reset_retries_successfully_after_the_store_recovers` | **Verificado em host** |
+| AC-3 | Pós-`6A84`, `select()` e um applet novo sobre a mesma store mostram o estado persistido (credencial e access code exigido; `load` → `Some(n)` com `n > 0`) | `failed_reset_leaves_the_persisted_state_reachable_from_a_reload` | **Verificado em host** |
+| AC-4 | Caminho feliz `9000` e erase persistido após reabrir; `reset_removes_credentials_and_authentication` sem edição; `P1`/`P2` fora de `DE AD` → `6D00` sem store | `successful_reset_persists_the_erase_across_reopen`, `reset_parameters_outside_de_ad_do_not_touch_the_store` | **Verificado em host** |
+| AC-5 | Exatamente 1 `clear`, 0 `save`, 0 `load` por `RESET`, no sucesso e na falha | `reset_writes_once_and_never_saves` | **Verificado em host** |
+| AC-6 | `pending` armado é descartado nos dois caminhos (`confirm_presence` → `6985`) e a credencial segue calculável após falha | `reset_drops_the_pending_touch_in_both_paths` | **Verificado em host** |
+| AC-7 | Contrato em `docs/security-model.md`, `roadmap.md` e `validation.md` | revisão estática | **Verificado** (documentação na mesma mudança) |
+
+> **Pendência física:** a falha de gravação não é induzida em hardware — o
+> `validate_oath.py` não simula flash doente (nada muda no script neste ciclo).
+> Fica pendente o caso "`RESET` com gravação negada → `6A84` e credenciais
+> intactas" em dispositivo real, junto da validação `ykman oath` de AC-018.
+
 ## OpenPGP Card v3.4 (Fase 14–16)
 
 O applet OpenPGP usa o AID v3.4 e implementa PW1/PW3, retry counters, os DOs
@@ -749,7 +773,7 @@ acessível via `hidraw`.
 | AC-015 | Rollback não autorizado não executa | `update` (testes) + rollback do bootrom | Lógica OK; OTP pendente |
 | AC-016 | CCID enumera e roteia por AID | `validate_ccid.py` + `opensc-tool -l` + selftest `applet-select` | Transporte e roteamento OK em host/tests e no autoteste on-target; PC/SC em hardware pendente |
 | AC-017 | PIV: PIN, chaves P-256/P-384 e assinatura | `validate_piv.py` + `pivy`/OpenSC | Applet OK em testes de host; hardware pendente; persistência selada entregue |
-| AC-018 | OATH: HOTP/TOTP e CCID | `validate_oath.py` + RFC 4226/6238 | Applet OK em testes de host; hardware pendente; persistência selada entregue |
+| AC-018 | OATH: HOTP/TOTP e CCID | `validate_oath.py` + RFC 4226/6238 | Applet OK em testes de host; hardware pendente; persistência selada e `RESET` fail-closed entregues |
 | AC-019 | OpenPGP Card: PW1/PW3, ECC e assinatura | `validate_openpgp.py` + GnuPG/OpenSC | Slices P-256/Ed25519/X25519 OK em testes de host; hardware pendente; persistência selada entregue |
 | AC-020 | SSH/Git (`ed25519-sk`) + OpenPGP Ed25519/X25519 | `validate_fido.py` + `validate_openpgp.py` + OpenSSH | Firmware pronto em testes de host; hardware pendente |
 | AC-021 | RSA-2048 (PIV/OpenPGP): keygen, assinatura, decifra | `validate_piv.py` + `validate_openpgp.py` + OpenSSL/GnuPG/`pkcs11-tool` | Firmware pronto em testes de host (147 `aegis-applets`); hardware pendente; RSA-3072/PSS fora de escopo |
@@ -762,6 +786,7 @@ acessível via `hidraw`.
 | AC-028 | OpenPGP: `CHANGE REFERENCE DATA` do PW1 aceita o corpo variável `atual‖novo` da card spec (`12 ≤ Lc ≤ 254`; fora → `6A80` sem tocar slot/contador/store; delimitação pelo hash armazenado — varredura read-only `PinSlot::resolve_change`; corrente errado → exatamente **uma** tentativa `63Cx` com persist; piso S5 com `6A84` na falha de gravação; `0x83` mantém corpo fixo 16 + gate da S10; sem bump de `PIN_STATE_VERSION`) | Testes de host `aegis-applets::openpgp` (fatia S11) | **Verificado em host** (7 testes novos + comentário do teste S10 atualizado); `validate_openpgp.py` + interop `gpg --card-edit` físicos pendentes |
 | AC-029 | OpenPGP: a janela de resposta de 2048 octets da decifra RFC 6637 é **mantida** (decisão C, sem mudança de buffer): fronteira do applet 2047/2048 → `9000` byte-exata e 2049 → `6A84` com corpo vazio como contrato executável (zero vazamento, recusa sem tocar estado/sessão); o teto real no transporte CCID — entrada de 2100 octets, maior comando decifrável do molde `86‖80` → `9000`, um octeto a mais → `CcidError::Overflow` sem SW e `card.reset()` documentado — congelado por teste de host; mensagem > ~2 KB é decifra parcial (card spec) ou no host | Testes de host `aegis-applets::openpgp` (fatia S12) | **Verificado em host** (1 teste novo + INFO da S8 re-ancorado como contrato); verificação física em cliente GnuPG real pendente junto com o hardware de AC-017/019/021 |
 | AC-030 | PIV: persistência de PIN/PUK fail-closed (mutadores de PIN → `6A84` em falha de gravação; save por record — só o slot mutado; piso sticky por slot com clamp no `SELECT`; `VERIFY` ok/recusas não gravam) | Testes de host `aegis-applets::piv` (fatia `specs/piv-pin-persistence.md`) + `docs/security-model.md` | **Verificado em host** (13 testes novos); indução de falha de flash em hardware pendente (`validate_piv.py` não simula flash doente) |
+| AC-031 | OATH: `RESET` fail-closed (erase persistido antes da limpeza da RAM; recusa de gravação → `6A84` com credenciais/access code/flags intactos; uma escrita por comando, sem `save_state`; `pending` descartado nos dois caminhos; `P1`/`P2` fora de `DE AD` → `6D00` sem store) | Testes de host `aegis-applets::oath` (fatia `specs/oath-reset-fail-closed.md`) + `docs/security-model.md` | **Verificado em host** (7 testes novos); indução de falha de flash em hardware pendente (`validate_oath.py` não simula flash doente) |
 
 ### Fases 7e — credential management e `changePIN` (host; hardware pendente)
 

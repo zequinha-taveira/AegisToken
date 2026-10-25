@@ -20,7 +20,7 @@ Documento vivo: cada fase é marcada conforme concluída e verificada.
 | 10 | Validação de hardware (AC-001..AC-015) | Concluída (bootrom/OTP pendentes) |
 | 11 | `aegis-applets`: APDU, CCID e roteamento de applets | Concluída (hardware pendente) |
 | 12 | PIV (NIST SP 800-73-4) | Concluída (hardware pendente; persistência selada entregue) |
-| 13 | OATH (TOTP/HOTP) | Concluída (hardware pendente; persistência selada entregue) |
+| 13 | OATH (TOTP/HOTP) | Concluída (hardware pendente; persistência selada e `RESET` fail-closed entregues) |
 | 14 | OpenPGP card (v3.4) | Concluída (P-256 slice; hardware pendente; persistência selada entregue) |
 | 15 | SSH/Git signing + Ed25519 no CTAP2 | Concluída (firmware; hardware pendente) |
 | 16 | RSA (PIV/OpenPGP) | Em andamento (16a–16d em firmware; hardware pendente) |
@@ -1039,11 +1039,25 @@ adiado.
   totalizando **104 testes** em `aegis-applets`.
 - `scripts/validate_oath.py` (AC-018) com PC/SC, PUT/LIST/CALCULATE/DELETE e
   vetor RFC 6238.
+- **`RESET` fail-closed (fatia `specs/oath-reset-fail-closed.md`):** o `RESET`
+  (`DE AD`, sem autenticação) apaga a store **antes** de limpar a RAM e
+  responde `6A84` quando a gravação é recusada — credenciais, access code e
+  flags de sessão intactos, só o toque armado cai; `9000` só depois de o erase
+  persistir. Uma escrita por `RESET` (o `save_state()` redundante do blob
+  vazio foi removido) e `P1`/`P2` fora do par canônico → `6D00` sem tocar a
+  store. 7 testes novos, totalizando **245 testes** em `aegis-applets`.
 
 **Pendências**
 
 - **AC-018 em hardware:** validação com `validate_oath.py`, `ykman oath` e
-  `pcscd`/`usbccid` ainda pendente.
+  `pcscd`/`usbccid` ainda pendente; a indução de falha de flash no `RESET`
+  (`6A84` com credenciais intactas) também não é exercida pelo script e fica
+  para dispositivo real.
+- **Follow-ups deliberados da fatia do `RESET` fail-closed:** a leitura da
+  store tratada como estado vazio no `load_state` (erro de `SELECT` não
+  recupera o blob anterior) e os bounds/ciclo de vida de `pending` em
+  `confirm_presence` (índice não checado) e `delete` (não limpa `pending`)
+  ficam em fatias próprias; não são gaps novos desta entrega.
 - **Persistência selada:** entregue via `SealedOathStore`
   (ver Persistência selada dos applets); sem chave raiz o firmware usa
   `MemoryOathStore` como antes.
