@@ -1517,8 +1517,7 @@ mod tests {
     fn reset_retries_successfully_after_the_store_recovers() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let mut key = [0u8; 10];
-        rng.fill_bytes(&mut key);
+        let key = rng.gen_array::<10>();
         let data = put_data(
             b"reset-me",
             TYPE_TOTP,
