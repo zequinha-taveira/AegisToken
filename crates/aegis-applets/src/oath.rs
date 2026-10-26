@@ -2103,12 +2103,17 @@ mod tests {
     fn repeated_failed_loads_stay_closed_without_leaking_ram() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let mut key = [0u8; 10];
-        rng.fill_bytes(&mut key);
+        let mut key = Vec::<u8, 10>::new();
+        while key.len() < 10 {
+            let bytes = rng.next_u32().to_be_bytes();
+            let remaining = 10 - key.len();
+            let take = remaining.min(bytes.len());
+            key.extend_from_slice(&bytes[..take]).unwrap();
+        }
         put_totp(&mut oath, &mut rng, b"30/ram");
-        assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
+        assert_eq!(set_access_code(&mut oath, &mut rng, key.as_slice()), Sw::OK);
         assert_eq!(oath.select().sw, Sw::OK);
-        let validate = validate_body(&key, &oath.auth_challenge);
+        let validate = validate_body(key.as_slice(), &oath.auth_challenge);
 
         oath.store_mut().set_load_fails(true);
         oath.store_mut().reset_calls();
