@@ -1453,8 +1453,10 @@ mod tests {
         assert_eq!(code(&response, TAG_TRUNCATED), 94287082);
 
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
-        let mut key = [0u8; 10];
-        rng.fill_bytes(&mut key);
+        let mut key = Vec::<u8, 10>::new();
+        let mut random_key = [0u8; 10];
+        rng.fill_bytes(&mut random_key);
+        key.extend_from_slice(&random_key).unwrap();
         let data = put_data(
             b"reset-me",
             TYPE_TOTP,
