@@ -1919,8 +1919,7 @@ mod tests {
     fn closed_applet_never_writes_or_overwrites_the_blob() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let mut key = [0u8; 10];
-        rng.fill_bytes(&mut key);
+        let key = rng.random::<[u8; 10]>();
         put_totp(&mut oath, &mut rng, b"30/keep");
         assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
         assert_eq!(oath.select().sw, Sw::OK);
