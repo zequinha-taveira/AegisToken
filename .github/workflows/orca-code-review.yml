@@ -19,6 +19,6 @@ jobs:
         # cannot start its proxy and would fail the job, so the step is
         # tolerant. The review is not a required check.
         continue-on-error: true
-        uses: Continuum-AI-Corp/Orca-Code-Review@v1.4.0
+        uses: Continuum-AI-Corp/Orca-Code-Review@v1.6.0
         with:
           orcarouter-api-key: ${{ secrets.ORCAROUTER_API_KEY }}
