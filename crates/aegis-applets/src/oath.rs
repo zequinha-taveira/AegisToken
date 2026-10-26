@@ -1969,8 +1969,7 @@ mod tests {
     fn reset_stays_available_and_fail_closed_while_the_read_fails() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let mut key = [0u8; 10];
-        rng.fill_bytes(&mut key);
+        let key = rng.random::<[u8; 10]>();
         put_totp(&mut oath, &mut rng, b"30/reset");
         assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
         assert_eq!(oath.select().sw, Sw::OK);
