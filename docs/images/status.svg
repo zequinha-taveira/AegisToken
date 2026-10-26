@@ -1,0 +1,198 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 620" width="100%" height="100%" style="background:#090d16; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+  <defs>
+    <!-- Gradients -->
+    <linearGradient id="shieldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#2563eb" />
+    </linearGradient>
+    <linearGradient id="headerGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="50%" stop-color="#818cf8" />
+      <stop offset="100%" stop-color="#c084fc" />
+    </linearGradient>
+    <linearGradient id="cardGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#161f30" />
+      <stop offset="100%" stop-color="#0e1524" />
+    </linearGradient>
+    <linearGradient id="barComplete" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#10b981" />
+      <stop offset="100%" stop-color="#34d399" />
+    </linearGradient>
+    <linearGradient id="barCyan" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0284c7" />
+      <stop offset="100%" stop-color="#38bdf8" />
+    </linearGradient>
+    <linearGradient id="barAmber" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#d97706" />
+      <stop offset="100%" stop-color="#fbbf24" />
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Outer Canvas Border -->
+  <rect x="2" y="2" width="916" height="616" rx="14" fill="#090d16" stroke="#1e293b" stroke-width="1.5" />
+
+  <!-- ==================== HEADER ==================== -->
+  <g transform="translate(32, 28)">
+    <!-- Aegis Shield Icon -->
+    <path d="M22 2 L38 8 C38 22 28 36 22 40 C16 36 6 22 6 8 Z" fill="url(#shieldGrad)" filter="url(#glow)" opacity="0.3" />
+    <path d="M22 4 L36 9.5 C36 21 27.5 33 22 37 C16.5 33 8 21 8 9.5 Z" fill="url(#shieldGrad)" stroke="#60a5fa" stroke-width="1.5" />
+    <path d="M22 12 L22 30 M15 19 L22 12 L29 19" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+
+    <!-- Title & Subtitle -->
+    <text x="52" y="22" font-size="20" font-weight="700" fill="url(#headerGrad)" letter-spacing="0.5">AegisToken Security Key</text>
+    <text x="52" y="38" font-size="12" font-weight="500" fill="#94a3b8">Universal RP2350 Firmware &amp; Ecosystem • Status &amp; Milestones Dashboard</text>
+
+    <!-- Version & Chip Badges -->
+    <g transform="translate(620, 6)">
+      <!-- Version Pill -->
+      <rect x="0" y="0" width="76" height="24" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1" />
+      <circle cx="10" cy="12" r="3.5" fill="#38bdf8" />
+      <text x="20" y="16" font-size="11" font-weight="600" fill="#e2e8f0">v0.2.1</text>
+
+      <!-- Target Chip Pill -->
+      <rect x="84" y="0" width="86" height="24" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1" />
+      <text x="94" y="16" font-size="11" font-weight="600" fill="#cbd5e1">RP2350</text>
+
+      <!-- License Pill -->
+      <rect x="178" y="0" width="62" height="24" rx="12" fill="#064e3b" stroke="#059669" stroke-width="1" />
+      <text x="188" y="16" font-size="11" font-weight="700" fill="#34d399">MIT</text>
+    </g>
+  </g>
+
+  <!-- Divider -->
+  <line x1="32" y1="84" x2="888" y2="84" stroke="#1e293b" stroke-width="1" />
+
+  <!-- ==================== MILESTONE CARDS ==================== -->
+  <!-- CARD 1: M1 -->
+  <g transform="translate(32, 98)">
+    <rect width="418" height="134" rx="10" fill="url(#cardGrad)" stroke="#1e293b" stroke-width="1" />
+    <circle cx="24" cy="28" r="10" fill="#065f46" stroke="#059669" stroke-width="1.5" />
+    <path d="M20 28 L23 31 L28 25" stroke="#34d399" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <text x="44" y="26" font-size="14" font-weight="700" fill="#f8fafc">M1 — Fundação FIDO2 / CTAP2 &amp; Passkeys</text>
+    <rect x="274" y="18" width="128" height="18" rx="9" fill="#064e3b" stroke="#059669" stroke-width="1" />
+    <text x="338" y="31" font-size="9.5" font-weight="700" fill="#34d399" text-anchor="middle">100% CONCLUÍDO</text>
+
+    <text x="24" y="56" font-size="11.5" fill="#94a3b8">• WebAuthn / FIDO2 Passkeys (credenciais residentes)</text>
+    <text x="24" y="74" font-size="11.5" fill="#94a3b8">• 2FA CTAP1/U2F à prova de phishing</text>
+    <text x="24" y="92" font-size="11.5" fill="#94a3b8">• ClientPIN e pinUvAuthToken</text>
+
+    <!-- Progress Bar -->
+    <rect x="24" y="112" width="370" height="6" rx="3" fill="#1e293b" />
+    <rect x="24" y="112" width="370" height="6" rx="3" fill="url(#barComplete)" />
+  </g>
+
+  <!-- CARD 2: M2 -->
+  <g transform="translate(470, 98)">
+    <rect width="418" height="134" rx="10" fill="url(#cardGrad)" stroke="#1e293b" stroke-width="1" />
+    <circle cx="24" cy="28" r="10" fill="#083344" stroke="#0284c7" stroke-width="1.5" />
+    <path d="M20 28 L23 31 L28 25" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <text x="44" y="26" font-size="14" font-weight="700" fill="#f8fafc">M2 — Identidade Corporativa e Applets CCID (PIV, OATH, OpenPGP)</text>
+    <rect x="258" y="18" width="144" height="18" rx="9" fill="#0c4a6e" stroke="#0284c7" stroke-width="1" />
+    <text x="330" y="31" font-size="9.5" font-weight="700" fill="#38bdf8" text-anchor="middle">90% FW / BANCADA</text>
+
+    <text x="24" y="56" font-size="11.5" fill="#94a3b8">• USB CCID (Classe 0x0B, ISO 7816-4) composto com HID</text>
+    <text x="24" y="74" font-size="11.5" fill="#94a3b8">• Applet PIV (NIST SP 800-73-4) para Smart Card Logon (Windows/Linux/macOS)</text>
+    <text x="24" y="92" font-size="11.5" fill="#94a3b8">• Applet OATH (TOTP e HOTP offline calculados no chip com toque)</text>
+
+    <!-- Progress Bar -->
+    <rect x="24" y="112" width="370" height="6" rx="3" fill="#1e293b" />
+    <rect x="24" y="112" width="333" height="6" rx="3" fill="url(#barCyan)" />
+  </g>
+
+  <!-- CARD 3: M3 -->
+  <g transform="translate(32, 244)">
+    <rect width="418" height="134" rx="10" fill="url(#cardGrad)" stroke="#1e293b" stroke-width="1" />
+    <circle cx="24" cy="28" r="10" fill="#451a03" stroke="#d97706" stroke-width="1.5" />
+    <circle cx="24" cy="28" r="3.5" fill="#fbbf24" />
+    <text x="44" y="26" font-size="14" font-weight="700" fill="#f8fafc">M3 — Ferramental de Host Unificado &amp; Desktop Manager</text>
+    <rect x="258" y="18" width="144" height="18" rx="9" fill="#78350f" stroke="#d97706" stroke-width="1" />
+    <text x="330" y="31" font-size="9.5" font-weight="700" fill="#fbbf24" text-anchor="middle">65% EM ANDAMENTO</text>
+
+    <text x="24" y="56" font-size="11.5" fill="#94a3b8">• CLI aegistoken-host unificado com comandos management, card, piv e oath</text>
+    <text x="24" y="74" font-size="11.5" fill="#94a3b8">• Acesso USB Management HID sem drivers WinUSB/Zadig via libusb inbox</text>
+    <text x="24" y="92" font-size="11.5" fill="#94a3b8">• Acesso CCID via PC/SC em Rust puro (pcsc crate MIT)</text>
+
+    <!-- Progress Bar -->
+    <rect x="24" y="112" width="370" height="6" rx="3" fill="#1e293b" />
+    <rect x="24" y="112" width="240" height="6" rx="3" fill="url(#barAmber)" />
+  </g>
+
+  <!-- CARD 4: M4 -->
+  <g transform="translate(470, 244)">
+    <rect width="418" height="134" rx="10" fill="url(#cardGrad)" stroke="#1e293b" stroke-width="1" />
+    <circle cx="24" cy="28" r="10" fill="#2e1065" stroke="#7c3aed" stroke-width="1.5" />
+    <circle cx="24" cy="28" r="3.5" fill="#c084fc" />
+    <text x="44" y="26" font-size="14" font-weight="700" fill="#f8fafc">M4 — Produção em Massa, Hardening Físico e Ciclo de Vida (OTP)</text>
+    <rect x="282" y="18" width="120" height="18" rx="9" fill="#3b0764" stroke="#7c3aed" stroke-width="1" />
+    <text x="342" y="31" font-size="9.5" font-weight="700" fill="#c084fc" text-anchor="middle">20% PLANEJADO</text>
+
+    <text x="24" y="56" font-size="11.5" fill="#94a3b8">• Secure Boot nativo com ECDSA secp256k1 via BootROM do RP2350</text>
+    <text x="24" y="74" font-size="11.5" fill="#94a3b8">• Gravação de bootkey hash na OTP (One-Time Programmable)</text>
+    <text x="24" y="92" font-size="11.5" fill="#94a3b8">• Anti-rollback estrito na partição de firmware</text>
+
+    <!-- Progress Bar -->
+    <rect x="24" y="112" width="370" height="6" rx="3" fill="#1e293b" />
+    <rect x="24" y="112" width="74" height="6" rx="3" fill="#8b5cf6" />
+  </g>
+
+  <!-- CARD 5: M5 -->
+  <g transform="translate(32, 390)">
+    <rect width="418" height="126" rx="10" fill="url(#cardGrad)" stroke="#1e293b" stroke-width="1" />
+    <circle cx="24" cy="28" r="10" fill="#1e293b" stroke="#475569" stroke-width="1.5" />
+    <circle cx="24" cy="28" r="3.5" fill="#94a3b8" />
+    <text x="44" y="26" font-size="14" font-weight="700" fill="#f8fafc">M5 — Expansão de Hardware (NFC, USB-C e Biometria)</text>
+    <rect x="274" y="18" width="128" height="18" rx="9" fill="#1e293b" stroke="#475569" stroke-width="1" />
+    <text x="338" y="31" font-size="9.5" font-weight="700" fill="#94a3b8" text-anchor="middle">0% LONGO PRAZO</text>
+
+    <text x="24" y="56" font-size="11.5" fill="#94a3b8">• Design de PCB dedicado com conector USB-C nativo</text>
+    <text x="24" y="74" font-size="11.5" fill="#94a3b8">• Encapsulamento inviolável (tamper-evident epóxi ou ultrassônico)</text>
+    <text x="24" y="92" font-size="11.5" fill="#94a3b8">• Antena NFC integrada para autenticação por aproximação em smartphones</text>
+
+    <!-- Progress Bar -->
+    <rect x="24" y="108" width="370" height="6" rx="3" fill="#1e293b" />
+    <rect x="24" y="108" width="0" height="6" rx="3" fill="#64748b" />
+  </g>
+
+  <!-- CARD 6: M6 -->
+  <g transform="translate(470, 390)">
+    <rect width="418" height="126" rx="10" fill="url(#cardGrad)" stroke="#1e293b" stroke-width="1" />
+    <circle cx="24" cy="28" r="10" fill="#1e1b4b" stroke="#4f46e5" stroke-width="1.5" />
+    <circle cx="24" cy="28" r="3.5" fill="#818cf8" />
+    <text x="44" y="26" font-size="14" font-weight="700" fill="#f8fafc">M6 — Prontidão Criptográfica Pós-Quântica (PQC)</text>
+    <rect x="298" y="18" width="104" height="18" rx="9" fill="#312e81" stroke="#4f46e5" stroke-width="1" />
+    <text x="350" y="31" font-size="9.5" font-weight="700" fill="#818cf8" text-anchor="middle">5% PESQUISA</text>
+
+    <text x="24" y="56" font-size="11.5" fill="#94a3b8">• Algoritmo ML-KEM (FIPS 203 / Kyber) para encapsulamento de chaves</text>
+    <text x="24" y="74" font-size="11.5" fill="#94a3b8">• Algoritmo ML-DSA (FIPS 204 / Dilithium) para assinaturas digitais</text>
+    <text x="24" y="92" font-size="11.5" fill="#94a3b8">• Extensões híbridas FIDO2/WebAuthn (ECC + PQC)</text>
+
+    <!-- Progress Bar -->
+    <rect x="24" y="108" width="370" height="6" rx="3" fill="#1e293b" />
+    <rect x="24" y="108" width="18" height="6" rx="3" fill="#6366f1" />
+  </g>
+
+  <!-- ==================== FOOTER: INVARIANTS & USB STACK ==================== -->
+  <g transform="translate(32, 532)">
+    <rect width="856" height="60" rx="8" fill="#0d131f" stroke="#1e293b" stroke-width="1" />
+    
+    <!-- USB Stack Pills -->
+    <text x="20" y="25" font-size="10.5" font-weight="700" fill="#64748b" letter-spacing="0.5">INTERFACES USB COMPOSTAS</text>
+    <g transform="translate(20, 32)">
+      <text font-size="11" font-weight="600" fill="#38bdf8">HID FIDO <tspan fill="#64748b">(0xF1D0)</tspan></text>
+      <text x="135" font-size="11" font-weight="600" fill="#818cf8">HID Management <tspan fill="#64748b">(0xFF00)</tspan></text>
+      <text x="300" font-size="11" font-weight="600" fill="#34d399">CCID Smart Card <tspan fill="#64748b">(0x0B)</tspan></text>
+    </g>
+
+    <!-- Invariants -->
+    <text x="500" y="25" font-size="10.5" font-weight="700" fill="#64748b" letter-spacing="0.5">INVARIANTES DE SEGURANÇA</text>
+    <g transform="translate(500, 32)">
+      <text font-size="11" font-weight="500" fill="#cbd5e1">&#x2714; Zero Key Export</text>
+      <text x="125" font-size="11" font-weight="500" fill="#cbd5e1">&#x2714; Touch Obrigat&#xF3;rio</text>
+      <text x="250" font-size="11" font-weight="500" fill="#cbd5e1">&#x2714; no_std / no_alloc</text>
+    </g>
+  </g>
+</svg>

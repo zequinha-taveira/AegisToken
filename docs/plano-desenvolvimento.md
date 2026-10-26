@@ -108,6 +108,29 @@ O foco deste plano é guiar a transição de um firmware validado em bancada par
 
 ---
 
+### Eixo 5: Governança, Rastreabilidade e Atualização Contínua de Status e Progresso do Ecossistema
+**Objetivo:** Estabelecer uma arquitetura de dados e automação para rastrear, validar e publicar com fidelidade o status dos marcos (*milestones*), capacidades ativas, interfaces e progresso do firmware e ferramentas.
+
+- **Etapa 5.1: Fonte Única da Verdade Estruturada (`docs/status.json`) — [CONCLUÍDA]**
+  - Implementação de esquema canônico em JSON com metadados do projeto, status de cada milestone (M1 a M6), porcentagem de progresso, capacidades ativas, interfaces USB compostas, applets e políticas de governança (zero GPL/LGPL, não-exportabilidade de chaves).
+  - Centralização de métricas: qualquer alteração de status parte obrigatoriamente deste arquivo.
+- **Etapa 5.2: Motor de Renderização Vetorial Automatizado (`scripts/update_status_svg.py` & `docs/images/status.svg`) — [CONCLUÍDA]**
+  - Criação do script em Python puro (`scripts/update_status_svg.py`), sem dependências externas (stdlib apenas), que consome `docs/status.json` e renderiza deterministicamente o painel visual SVG.
+  - O painel exibe graficamente os 6 milestones em grade 2x3, barras proporcionais de progresso, badges semânticos coloridos, interfaces USB e versão do firmware.
+- **Etapa 5.3: Gate de Validação Contínua no Pipeline de CI (`--check`)**
+  - Adicionar a etapa de checagem ao workflow do GitHub Actions (`.github/workflows/ci.yml`):
+    `python scripts/update_status_svg.py --check`
+  - Se um pull request alterar `docs/status.json` sem atualizar `docs/images/status.svg` (ou vice-versa), o CI falha imediatamente com aviso explicativo, impedindo descompassos na documentação.
+- **Etapa 5.4: Sincronização com o Ciclo de Release e Versionamento**
+  - Conectar a automação de release (`scripts/build-uf2.ps1 -Release` e `.github/workflows/release.yml`) para verificar se a versão em `[workspace.package].version` do `Cargo.toml`, `version.md` e `docs/status.json` coincidem antes de gerar a tag final `v*`.
+- **Etapa 5.5: Procedimento Operacional Padrão (SOP) de Atualização**
+  1. *Ao concluir uma tarefa:* O desenvolvedor atualiza `progress_percent` e/ou `status` no marco em `docs/status.json`.
+  2. *Execução local:* Roda `python scripts/update_status_svg.py` para sincronizar o vetor `docs/images/status.svg`.
+  3. *Atualização do Markdown:* Marca os checkboxes em `docs/MILESTONES.md` (`- [x]`) e registra a evidência em `validation.md` / `roadmap.md`.
+  4. *Validação:* Roda os gates (`cargo test`, `cargo fmt`, `python scripts/update_status_svg.py --check`).
+
+---
+
 ## 3. Matriz de Rastreabilidade de Bibliotecas Adotadas
 
 | Crate / Pacote | Linguagem | Licença | Finalidade no Projeto | Status de Adoção |
@@ -158,3 +181,4 @@ O foco deste plano é guiar a transição de um firmware validado em bancada par
 1. **Conformidade de Licenciamento:** Todo o repositório e suas dependências de produção/distribuição auditados e livres de licenças copyleft (`GPL`/`LGPL`).
 2. **Autonomia do Ferramental:** O `aegistoken-host` e o Desktop Manager conseguem inspecionar, provisionar e gerenciar 100% dos recursos do dispositivo (FIDO2, CCID/PIV, OATH, Management HID e Firmware Update).
 3. **Qualidade de Código e Testes:** Todos os novos componentes passam nos gates de compilação estrita: `cargo fmt --all --check`, `clippy --all-targets -- -D warnings` e cobertura de testes automatizados.
+4. **Rastreabilidade e Sincronismo de Status:** `docs/status.json` e o painel `docs/images/status.svg` mantidos 100% sincronizados em todos os commits, com validação automatizada via `python scripts/update_status_svg.py --check` no pipeline de CI.

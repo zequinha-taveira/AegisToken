@@ -9,6 +9,9 @@ com **descoberta automática de hardware** — sem seleção manual de placa.
 - Produto USB: `AegisToken FIDO2 USB Authenticator` (VID `0x1209`, PID `0x0001`)
 - Família de firmware: `Universal RP2350 Firmware`
 - Artefato de release: `rp2350-universal.uf2`
+- Marcos e Capacidades: [`docs/MILESTONES.md`](docs/MILESTONES.md) | [`docs/status.json`](docs/status.json)
+
+[![AegisToken Milestones Dashboard](docs/images/status.svg)](docs/MILESTONES.md)
 
 ## Interfaces USB
 
@@ -293,6 +296,8 @@ ou remapeamento para o driver HID genérico).
 
 ## Documentação
 
+- [`docs/MILESTONES.md`](docs/MILESTONES.md) — plano de marcos (M1..M6), capacidades da chave de segurança e cronograma de entrega.
+- [`docs/status.json`](docs/status.json) — base de dados canônica em JSON com status e progresso do ecossistema.
 - [`roadmap.md`](roadmap.md) — fases do projeto, decisões arquiteturais e status.
 - [`validation.md`](validation.md) — matriz AC-001..AC-021, evidências e
   limitações conhecidas.
