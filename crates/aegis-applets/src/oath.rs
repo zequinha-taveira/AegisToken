@@ -1852,8 +1852,7 @@ mod tests {
     fn failed_load_closes_the_applet_and_never_confirms_state_commands() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let mut key = [0u8; 10];
-        rng.fill_bytes(&mut key);
+        let key = rng.array::<10>();
         put_totp(&mut oath, &mut rng, b"30/closed");
         assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
         assert_eq!(oath.select().sw, Sw::OK);
