@@ -2047,8 +2047,7 @@ mod tests {
     fn a_good_reselect_reopens_and_preserves_credentials_and_access_code() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let mut key = [0u8; 10];
-        rng.fill_bytes(&mut key);
+        let key = random_key::<10>(&mut rng);
         let name = b"30/persist";
         put_totp(&mut oath, &mut rng, name);
         assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
