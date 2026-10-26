@@ -20,7 +20,7 @@ Documento vivo: cada fase é marcada conforme concluída e verificada.
 | 10 | Validação de hardware (AC-001..AC-015) | Concluída (bootrom/OTP pendentes) |
 | 11 | `aegis-applets`: APDU, CCID e roteamento de applets | Concluída (hardware pendente) |
 | 12 | PIV (NIST SP 800-73-4) | Concluída (hardware pendente; persistência selada entregue) |
-| 13 | OATH (TOTP/HOTP) | Concluída (hardware pendente; persistência selada e `RESET` fail-closed entregues) |
+| 13 | OATH (TOTP/HOTP) | Concluída (hardware pendente; persistência selada, `RESET` e leitura fail-closed entregues) |
 | 14 | OpenPGP card (v3.4) | Concluída (P-256 slice; hardware pendente; persistência selada entregue) |
 | 15 | SSH/Git signing + Ed25519 no CTAP2 | Concluída (firmware; hardware pendente) |
 | 16 | RSA (PIV/OpenPGP) | Em andamento (16a–16d em firmware; hardware pendente) |
@@ -1046,18 +1046,38 @@ adiado.
   persistir. Uma escrita por `RESET` (o `save_state()` redundante do blob
   vazio foi removido) e `P1`/`P2` fora do par canônico → `6D00` sem tocar a
   store. 7 testes novos, totalizando **245 testes** em `aegis-applets`.
+- **Leitura fail-closed (fatia `specs/oath-load-fail-closed.md`):** o contrato
+  de `OathStore::load` agora distingue `Some(0)` (store em branco, estado vazio
+  legítimo) de `None` (IO, corrupção ou blob indecifrável), e
+  `SealedOathStore::load` mapeia `Err → None` em vez de colapsar a falha em
+  "sem estado". `load_state` é a única autoridade sobre aberto/fechado: uma
+  leitura que falha (ou um blob que o decoder recusa) fecha o applet, que
+  responde `6F00` a todo comando de estado (`LIST`, `CALCULATE`,
+  `CALCULATE ALL`, `PUT`, `DELETE`, `SET CODE`, `VALIDATE` e
+  `confirm_presence`) e normaliza a RAM para o estado de boot — o "vazio" do
+  OATH é o lado permissivo. O `SELECT` continua respondendo `9000` com o FCI
+  (sem bloco de access code) e cada seleção é uma nova tentativa; o `RESET`
+  (`DE AD`) é a exceção deliberada (apaga sem revelar) e continua fail-closed
+  (`6A84` mantém o applet fechado). Nove testes novos (8 em `oath.rs`, 1 em
+  `sealed.rs`), totalizando **254 testes** em `aegis-applets`.
 
 **Pendências**
 
 - **AC-018 em hardware:** validação com `validate_oath.py`, `ykman oath` e
   `pcscd`/`usbccid` ainda pendente; a indução de falha de flash no `RESET`
-  (`6A84` com credenciais intactas) também não é exercida pelo script e fica
-  para dispositivo real.
-- **Follow-ups deliberados da fatia do `RESET` fail-closed:** a leitura da
-  store tratada como estado vazio no `load_state` (erro de `SELECT` não
-  recupera o blob anterior) e os bounds/ciclo de vida de `pending` em
-  `confirm_presence` (índice não checado) e `delete` (não limpa `pending`)
-  ficam em fatias próprias; não são gaps novos desta entrega.
+  (`6A84` com credenciais intactas) e na leitura (store ilegível → `6F00` com
+  `RESET` recuperando) também não é exercida pelo script e fica para
+  dispositivo real. Recomendação operacional: **reselecionar antes de
+  resetar** — durante uma falha transitória o `RESET` apaga credenciais que
+  um `SELECT` seguinte teria recuperado.
+- **Follow-ups deliberados fora desta fatia:** os bounds/ciclo de vida de
+  `pending` em `confirm_presence` (índice não checado) e `delete` (não limpa
+  `pending`); o fallback do firmware para `MemoryOathStore` quando
+  `SealedOathStore::open` falha (`main.rs` serve um applet vazio, mutável e
+  sem access code — decisão de firmware/HAL); e a robustez do `SealedBlob`
+  quando um slot de commit antigo passa no CRC mas não abre no GCM (derruba o
+  load inteiro e pode impedir o `RESET`, que fica fail-closed sem recuperação
+  pelo protocolo até reflash/recovery/update).
 - **Persistência selada:** entregue via `SealedOathStore`
   (ver Persistência selada dos applets); sem chave raiz o firmware usa
   `MemoryOathStore` como antes.

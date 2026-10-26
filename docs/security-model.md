@@ -210,6 +210,33 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   stays unauthenticated (YKOATH: it erases, it never reveals) and the erase is
   **logical** — the `SealedBlob` slot rotation may keep older sealed
   generations until they are overwritten.
+  The OATH **read** path is fail-closed as well: `OathStore::load` distinguishes
+  `Some(0)` (blank store — a virgin region or an erased record, a legitimate
+  empty state) from `None` (IO, corruption or an undecryptable record), so the
+  sealed adapter maps `Err` to `None` instead of collapsing it into "no state".
+  Any `None`, or a blob the decoder refuses, closes the applet for the session:
+  it answers `6F00` to every state command (`LIST`, `CALCULATE`,
+  `CALCULATE ALL`, `PUT`, `DELETE`, `SET CODE`, `VALIDATE`, `confirm_presence`)
+  and normalizes the volatile state to the boot state, so a failed read cannot
+  disable the access code or let a `PUT` overwrite the blob that was not read.
+  The direction is forced by the asymmetry with the other applets: the empty
+  OATH state is the **permissive** side, whereas the OpenPGP default is
+  restrictive and PIV answers `6F00` in its own `SELECT`. Accepted decisions,
+  not gaps: (a) `SELECT` keeps answering the FCI (`9000`) so the recovery path
+  stays reachable from the standard tooling, but the access-code block
+  (`TAG_CHALLENGE`/`0x7B`) is omitted and `authenticated` stays false while
+  closed; (b) `RESET` (`DE AD`) is the **necessary exception** — it erases and
+  reveals nothing, its own result stays fail-closed (`6A84` keeps the applet
+  closed) and, once the erase persists, the applet is open only over the empty
+  state that erase proved, with the next `SELECT` reading the store again;
+  (c) every `SELECT` is a fresh attempt and the refusal is volatile (never
+  persisted), so a recovered read reopens the applet with its credentials and
+  access code; (d) an unknown instruction while closed answers `6F00`, because
+  state availability precedes instruction refusal. The trigger (a sick flash)
+  sits outside the live threat model; this is robustness in the restrictive
+  direction. The operational cost is documented in `validation.md`: a `RESET`
+  during a transient failure erases credentials a later `SELECT` could have
+  recovered, so reselect before resetting.
 - **Secrets are sealed at rest.** Credential keys, OATH secrets, PIN-derived
   values and data objects are stored in sealed records (AES-256-GCM under the
   OTP root key); no applet response can export them.
