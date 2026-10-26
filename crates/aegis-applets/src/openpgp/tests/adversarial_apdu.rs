@@ -11,8 +11,12 @@
 use super::*;
 use std::vec::Vec;
 
-/// The session key the sender wraps in the fixture provisioning.
-pub(crate) const SESSION_KEY: [u8; 16] = [0x5A; 16];
+/// Generate a session key for fixture provisioning.
+pub(crate) fn session_key(rng: &mut impl rand_core::RngCore) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    rng.fill_bytes(&mut key);
+    key
+}
 
 /// The ephemeral scalar of the sender in the fixture provisioning.
 pub(crate) const EPHEMERAL_SCALAR: [u8; 32] = [9u8; 32];
@@ -695,7 +699,8 @@ fn oversized_ciphertext_answers_one_status_word_without_panicking() {
     let anchored = applet.ecdh_material().expect("the material is provisioned");
 
     let data = vec![0x44u8; 4300];
-    let ciphertext = streamed_body(&SESSION_KEY, &data);
+    let session_key = session_key(&mut rng);
+    let ciphertext = streamed_body(&session_key, &data);
     assert!(
         ciphertext.len() > pgp_sym::MAX_DATA,
         "the crafted body exceeds the decryptable size"
