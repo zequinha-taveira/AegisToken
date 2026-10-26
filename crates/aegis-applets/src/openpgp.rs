@@ -2249,8 +2249,6 @@ mod tests {
         )
         .unwrap();
         let kek = ecdh::kdf(&param, shared.raw_secret_bytes().as_slice(), 16).unwrap();
-
-        let session_key = [0x5Au8; 16];
         let checksum = session_key
             .iter()
             .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
