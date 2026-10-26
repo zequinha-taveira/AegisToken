@@ -2448,8 +2448,7 @@ mod tests {
         let mut authed = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         put_touch_totp(&mut authed, &mut rng, armed);
         put_totp(&mut authed, &mut rng, other);
-        let mut key = [0u8; 10];
-        rng.fill_bytes(&mut key);
+        let key = rng.bytes::<10>();
         assert_eq!(set_access_code(&mut authed, &mut rng, &key), Sw::OK);
         assert_eq!(authed.select().sw, Sw::OK);
         assert_eq!(validate_access_code(&mut authed, &mut rng, &key), Sw::OK);
