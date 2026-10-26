@@ -1953,7 +1953,8 @@ mod tests {
         let kek = ecdh::kdf(&param, shared.raw_secret_bytes().as_slice(), 16).unwrap();
 
         // m = symm_alg_ID || session key || checksum || padding.
-        let session_key = [0x5Au8; 16];
+        let mut session_key = [0u8; 16];
+        rng.fill_bytes(&mut session_key);
         let checksum = session_key
             .iter()
             .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
