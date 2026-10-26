@@ -1566,8 +1566,10 @@ mod tests {
     fn failed_reset_leaves_the_persisted_state_reachable_from_a_reload() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let mut key = [0u8; 10];
-        rng.fill_bytes(&mut key);
+        let mut key = Vec::<u8, 10>::new();
+        for _ in 0..10 {
+            key.push(rng.next_u32() as u8).unwrap();
+        }
         let data = put_data(
             b"keep-me",
             TYPE_TOTP,
