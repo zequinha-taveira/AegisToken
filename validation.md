@@ -285,6 +285,34 @@ continua fail-closed (`6A84` mantém o applet fechado).
 > **reselecionar antes de resetar** — durante uma falha transitória o `RESET`
 > apaga credenciais que um `SELECT` seguinte teria recuperado.
 
+### OATH: presença pendente com bound (fatia `specs/oath-pending-bounds.md`)
+
+O pedido de toque (`pending`) guarda um índice no vetor de credenciais. O
+`confirm_presence` valida o índice contra o `len` corrente antes de indexar e
+responde `6985` — o mesmo SW de "sem pedido pendente" — quando ele não vale
+mais, em vez de indexar fora do bound (panic que pararia o firmware inteiro) ou
+devolver o código de outra credencial. `PUT` e `DELETE` desarmam o pedido
+incondicionalmente na entrada do handler, inclusive quando o comando é recusado
+por autenticação (`6982`), dado (`6A80`), nome (`6984`) ou falha de gravação
+(`6A84`); `CALCULATE ALL` é somente leitura e não desarma, e o incremento de
+contador HOTP continua em `calculate_index`, depois do `take()`.
+
+| AC | Critério | Teste de host (`aegis-applets::oath`) | Status |
+|----|----------|---------------------------------------|--------|
+| AC-1 | `DELETE` de outra credencial desarma mesmo sem deslocar índice (G0): `confirm_presence` → `6985` com corpo vazio, e um novo `CALCULATE` + confirmação devolve o mesmo código de antes | `delete_of_another_credential_disarms_the_armed_touch` | **Verificado em host** |
+| AC-2 | `DELETE` da própria credencial armada (não-última e última) → `6985` sem dados, nunca o código de outra credencial nem panic; `LIST` sem ela e a sobrevivente ainda calcula | `deleting_the_armed_credential_never_returns_another_code_or_panics` | **Verificado em host** |
+| AC-3 | `DELETE` de outra credencial com a armada na última posição (G2) → `6985` sem panic; a armada segue listável e confirmável | `deleting_another_credential_while_the_armed_one_is_last_does_not_panic` | **Verificado em host** |
+| AC-4 | `DELETE` recusado (`6984` nome inexistente, `6A80` sem `TAG_NAME`, `6A84` falha de gravação com `clears() == 0`) e `PUT` (outra credencial e substituindo a armada) também desarmam → `6985` | `refused_delete_and_put_disarm_the_armed_touch` | **Verificado em host** |
+| AC-5 | Índice fora do `len` (`len`, `MAX_CREDENTIALS`, `99`) → `6985` com corpo vazio, sem panic, 0 `save`/0 `clear`, estado intacto, chamada repetida `6985` e applet utilizável depois | `out_of_bounds_pending_answers_6985_without_touching_the_store` | **Verificado em host** |
+| AC-6 | Caminho feliz e SWs existentes intactos (`confirm_presence` sem `pending` → `6985`, `deny_presence` → `6982`, applet fechado → `6F00`, testes de toque/`RESET` sem edição) e suíte sem regressão | suíte `aegis-applets` (**259**) | **Verificado em host** |
+| AC-7 | Contrato em `docs/security-model.md`, `roadmap.md` e `validation.md` | revisão estática | **Verificado** (documentação na mesma mudança) |
+
+> **Sem pendência física:** o interleaving (`DELETE`/`PUT` entre o arm e a
+> confirmação) não é alcançável pelo loop CCID atual — `Card::poll` serializa
+> a presença e nenhum frame novo é processado entre o `6FF0` e a resolução —,
+> então `scripts/validate_oath.py` não muda e não há caso novo a exercitar em
+> dispositivo real. A garantia é local do applet, não herdada do transporte.
+
 ## OpenPGP Card v3.4 (Fase 14–16)
 
 O applet OpenPGP usa o AID v3.4 e implementa PW1/PW3, retry counters, os DOs
@@ -817,6 +845,7 @@ acessível via `hidraw`.
 | AC-030 | PIV: persistência de PIN/PUK fail-closed (mutadores de PIN → `6A84` em falha de gravação; save por record — só o slot mutado; piso sticky por slot com clamp no `SELECT`; `VERIFY` ok/recusas não gravam) | Testes de host `aegis-applets::piv` (fatia `specs/piv-pin-persistence.md`) + `docs/security-model.md` | **Verificado em host** (13 testes novos); indução de falha de flash em hardware pendente (`validate_piv.py` não simula flash doente) |
 | AC-031 | OATH: `RESET` fail-closed (erase persistido antes da limpeza da RAM; recusa de gravação → `6A84` com credenciais/access code/flags intactos; uma escrita por comando, sem `save_state`; `pending` descartado nos dois caminhos; `P1`/`P2` fora de `DE AD` → `6D00` sem store) | Testes de host `aegis-applets::oath` (fatia `specs/oath-reset-fail-closed.md`) + `docs/security-model.md` | **Verificado em host** (7 testes novos); indução de falha de flash em hardware pendente (`validate_oath.py` não simula flash doente) |
 | AC-032 | OATH: leitura fail-closed (`OathStore::load` distingue `Some(0)` de `None`; `SealedOathStore` mapeia `Err → None`; falha de leitura ou blob recusado fecha o applet → `6F00` em todo comando de estado com RAM normalizada; `SELECT` retenta e segue `9000` sem bloco de access code; `RESET` é a exceção fail-open deliberada e continua fail-closed no `6A84`) | Testes de host `aegis-applets::oath`/`sealed` (fatia `specs/oath-load-fail-closed.md`) + `docs/security-model.md` | **Verificado em host** (9 testes novos); indução de falha de flash em hardware pendente (`validate_oath.py` não simula flash doente) |
+| AC-033 | OATH: presença pendente com bound e desarme na mutação (`confirm_presence` valida o índice de `pending` contra o `len` antes de indexar → `6985` colapsado no "sem pedido" — sem panic e sem código de outra credencial; `PUT`/`DELETE` desarmam incondicionalmente na entrada, inclusive nas recusas `6982`/`6984`/`6A80`/`6A84`; `CALCULATE ALL` não altera o conjunto e não desarma; sem SW novo e sem estado persistido novo) | Testes de host `aegis-applets::oath` (fatia `specs/oath-pending-bounds.md`) + `docs/security-model.md` | **Verificado em host** (5 testes novos, **259** no crate); sem pendência física — o interleaving não é alcançável pelo loop CCID atual (`Card::poll` serializa presença) e `validate_oath.py` não muda |
 
 ### Fases 7e — credential management e `changePIN` (host; hardware pendente)
 

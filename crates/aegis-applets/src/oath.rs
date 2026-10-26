@@ -139,6 +139,11 @@ struct Credential {
     secret: Vec<u8, MAX_SECRET>,
 }
 
+/// Armed touch request.
+///
+/// `index` is re-validated against the credential set when the request is
+/// consumed, and every handler that mutates the set drops the request first:
+/// the authorization belongs to the credential that asked for it.
 struct PendingCalculation {
     index: usize,
     challenge: [u8; 8],
@@ -395,6 +400,9 @@ impl<S: OathStore> Oath<S> {
     }
 
     fn put(&mut self, apdu: &Apdu<'_>) -> Response<'_> {
+        // A write can swap the secret behind the armed request, so the armed
+        // touch never survives it, even when the command is refused.
+        self.pending = None;
         if let Err(status) = self.require_auth() {
             return Response::status(status);
         }
@@ -431,6 +439,11 @@ impl<S: OathStore> Oath<S> {
     }
 
     fn delete(&mut self, apdu: &Apdu<'_>) -> Response<'_> {
+        // Unconditional, before any refusal and before `swap_remove`: a
+        // request belongs to the set as it was read, and a save that fails
+        // after the removal would otherwise leave it pointing at a shifted
+        // set (or past its end).
+        self.pending = None;
         if let Err(status) = self.require_auth() {
             return Response::status(status);
         }
@@ -495,6 +508,9 @@ impl<S: OathStore> Oath<S> {
     }
 
     fn calculate_all(&mut self, apdu: &Apdu<'_>) -> Response<'_> {
+        // Read-only over the credential set (an HOTP entry is reported without
+        // computing it), so this is the state command that leaves an armed
+        // touch alone.
         if let Err(status) = self.require_auth() {
             return Response::status(status);
         }
@@ -720,6 +736,12 @@ impl<S: OathStore> Applet for Oath<S> {
         let Some(pending) = self.pending.take() else {
             return Response::status(Sw::CONDITIONS_NOT_SATISFIED);
         };
+        // A stale index must never be indexed (a panic here halts the whole
+        // firmware) nor retargeted onto a stranger; it collapses into the same
+        // "no pending request" refusal.
+        if pending.index >= self.credentials.len() {
+            return Response::status(Sw::CONDITIONS_NOT_SATISFIED);
+        }
         self.calculate_index(pending.index, &pending.challenge, pending.truncated)
     }
 
@@ -2196,5 +2218,304 @@ mod tests {
         assert_eq!(status, Sw::OK);
         assert!(list.is_empty());
         put_totp(&mut oath, &mut rng, b"30/blank");
+    }
+
+    fn put_touch_totp<S: OathStore>(oath: &mut Oath<S>, rng: &mut TestRng, name: &[u8]) {
+        let data = put_data(
+            name,
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            6,
+            RFC_SECRET,
+            None,
+            PROPERTY_TOUCH,
+        );
+        assert_eq!(run(oath, rng, &frame(INS_PUT, 0, 0, &data)).1, Sw::OK);
+    }
+
+    fn arm_touch<S: OathStore>(
+        oath: &mut Oath<S>,
+        rng: &mut TestRng,
+        name: &[u8],
+        challenge: &[u8],
+    ) {
+        let request = calculate_data(name, Some(challenge));
+        assert_eq!(
+            run(oath, rng, &frame(INS_CALCULATE, 0, 1, &request)).1,
+            Sw::PRESENCE_REQUIRED
+        );
+    }
+
+    fn assert_touch_disarmed<S: OathStore>(oath: &mut Oath<S>, rng: &mut TestRng) {
+        let response = oath.confirm_presence(rng);
+        assert_eq!(response.sw, Sw::CONDITIONS_NOT_SATISFIED);
+        assert!(response.data.is_empty());
+    }
+
+    fn delete_data(name: &[u8]) -> Vec<u8, 128> {
+        let mut data = Vec::new();
+        append_tlv(&mut data, TAG_NAME, name);
+        data
+    }
+
+    #[test]
+    fn delete_of_another_credential_disarms_the_armed_touch() {
+        let mut oath = applet();
+        let mut rng = TestRng;
+        let armed = b"30/armed";
+        let other = b"30/other";
+        put_touch_totp(&mut oath, &mut rng, armed);
+        let data = put_data(other, TYPE_TOTP, ALGORITHM_SHA1, 6, b"different", None, 0);
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &data)).1,
+            Sw::OK
+        );
+
+        let challenge = 1u64.to_be_bytes();
+        arm_touch(&mut oath, &mut rng, armed, &challenge);
+        let response = oath.confirm_presence(&mut rng);
+        assert_eq!(response.sw, Sw::OK);
+        let expected = code(response.data, TAG_TRUNCATED);
+
+        // `other` is last, so removing it only truncates the vector: `armed`
+        // keeps its index and the refusal can only come from the disarm.
+        arm_touch(&mut oath, &mut rng, armed, &challenge);
+        assert_eq!(
+            run(
+                &mut oath,
+                &mut rng,
+                &frame(INS_DELETE, 0, 0, &delete_data(other))
+            )
+            .1,
+            Sw::OK
+        );
+        assert_touch_disarmed(&mut oath, &mut rng);
+
+        arm_touch(&mut oath, &mut rng, armed, &challenge);
+        let response = oath.confirm_presence(&mut rng);
+        assert_eq!(response.sw, Sw::OK);
+        assert_eq!(code(response.data, TAG_TRUNCATED), expected);
+    }
+
+    #[test]
+    fn deleting_the_armed_credential_never_returns_another_code_or_panics() {
+        let mut rng = TestRng;
+        let armed = b"30/armed";
+        let kept = b"30/kept";
+        let challenge = 1u64.to_be_bytes();
+
+        // Both geometries a raw index gets wrong: (a) `armed` is not last, so
+        // `swap_remove` moves `kept` into `pending.index` and the confirmation
+        // used to return `kept`'s code; (b) `armed` is last, so the stored
+        // index ends up equal to the new length and used to panic.
+        for armed_is_last in [false, true] {
+            let mut oath = applet();
+            if armed_is_last {
+                put_totp(&mut oath, &mut rng, kept);
+                put_touch_totp(&mut oath, &mut rng, armed);
+            } else {
+                put_touch_totp(&mut oath, &mut rng, armed);
+                put_totp(&mut oath, &mut rng, kept);
+            }
+            arm_touch(&mut oath, &mut rng, armed, &challenge);
+            assert_eq!(
+                run(
+                    &mut oath,
+                    &mut rng,
+                    &frame(INS_DELETE, 0, 0, &delete_data(armed))
+                )
+                .1,
+                Sw::OK
+            );
+            assert_touch_disarmed(&mut oath, &mut rng);
+
+            let (list, status) = run(&mut oath, &mut rng, &frame(INS_LIST, 0, 0, &[]));
+            assert_eq!(status, Sw::OK);
+            assert_eq!(tlv::find(&list, TAG_NAME_LIST).unwrap()[1..], *kept);
+            assert!(oath.find(armed).is_none());
+            let (_, status) = run(
+                &mut oath,
+                &mut rng,
+                &frame(INS_CALCULATE, 0, 1, &calculate_data(kept, Some(&challenge))),
+            );
+            assert_eq!(status, Sw::OK, "armed is last: {armed_is_last}");
+        }
+    }
+
+    #[test]
+    fn deleting_another_credential_while_the_armed_one_is_last_does_not_panic() {
+        let mut oath = applet();
+        let mut rng = TestRng;
+        let armed = b"30/armed";
+        let removed = b"30/removed";
+        let challenge = 1u64.to_be_bytes();
+        put_totp(&mut oath, &mut rng, removed);
+        put_touch_totp(&mut oath, &mut rng, armed);
+
+        // `armed` is last: removing the first entry moves it down and leaves
+        // `pending.index == len`, the other geometry that used to panic.
+        arm_touch(&mut oath, &mut rng, armed, &challenge);
+        assert_eq!(
+            run(
+                &mut oath,
+                &mut rng,
+                &frame(INS_DELETE, 0, 0, &delete_data(removed))
+            )
+            .1,
+            Sw::OK
+        );
+        assert_touch_disarmed(&mut oath, &mut rng);
+
+        let (list, status) = run(&mut oath, &mut rng, &frame(INS_LIST, 0, 0, &[]));
+        assert_eq!(status, Sw::OK);
+        assert_eq!(tlv::find(&list, TAG_NAME_LIST).unwrap()[1..], *armed);
+        arm_touch(&mut oath, &mut rng, armed, &challenge);
+        assert_eq!(oath.confirm_presence(&mut rng).sw, Sw::OK);
+    }
+
+    #[test]
+    fn refused_delete_and_put_disarm_the_armed_touch() {
+        let mut rng = TestRng;
+        let armed = b"30/armed";
+        let other = b"30/other";
+        let challenge = 1u64.to_be_bytes();
+
+        let mut oath = applet();
+        put_touch_totp(&mut oath, &mut rng, armed);
+        put_totp(&mut oath, &mut rng, other);
+
+        arm_touch(&mut oath, &mut rng, armed, &challenge);
+        assert_eq!(
+            run(
+                &mut oath,
+                &mut rng,
+                &frame(INS_DELETE, 0, 0, &delete_data(b"absent"))
+            )
+            .1,
+            Sw::OATH_OBJECT_NOT_FOUND
+        );
+        assert_touch_disarmed(&mut oath, &mut rng);
+
+        arm_touch(&mut oath, &mut rng, armed, &challenge);
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_DELETE, 0, 0, &[])).1,
+            Sw::WRONG_DATA
+        );
+        assert_touch_disarmed(&mut oath, &mut rng);
+
+        arm_touch(&mut oath, &mut rng, armed, &challenge);
+        put_totp(&mut oath, &mut rng, b"30/added");
+        assert_touch_disarmed(&mut oath, &mut rng);
+
+        arm_touch(&mut oath, &mut rng, armed, &challenge);
+        let data = put_data(
+            armed,
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            6,
+            b"fresh-secret",
+            None,
+            PROPERTY_TOUCH,
+        );
+        assert_eq!(
+            run(&mut oath, &mut rng, &frame(INS_PUT, 0, 0, &data)).1,
+            Sw::OK
+        );
+        assert_touch_disarmed(&mut oath, &mut rng);
+
+        let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
+        put_touch_totp(&mut oath, &mut rng, armed);
+        put_totp(&mut oath, &mut rng, other);
+        oath.store_mut().reset_calls();
+        oath.store_mut().set_save_fails(true);
+        arm_touch(&mut oath, &mut rng, armed, &challenge);
+        assert_eq!(
+            run(
+                &mut oath,
+                &mut rng,
+                &frame(INS_DELETE, 0, 0, &delete_data(other))
+            )
+            .1,
+            Sw::NOT_ENOUGH_MEMORY
+        );
+        assert_eq!(oath.store_mut().saves(), 1);
+        assert_eq!(oath.store_mut().clears(), 0);
+        assert_touch_disarmed(&mut oath, &mut rng);
+        oath.store_mut().set_save_fails(false);
+
+        // The disarm happens before authentication: a refused DELETE/PUT
+        // (`6982`) must not leave a request a later confirm could serve.
+        let mut authed = applet_with(FailingOathStore::new(MemoryOathStore::new()));
+        put_touch_totp(&mut authed, &mut rng, armed);
+        put_totp(&mut authed, &mut rng, other);
+        let mut key = [0u8; 10];
+        rng.fill_bytes(&mut key);
+        assert_eq!(set_access_code(&mut authed, &mut rng, &key), Sw::OK);
+        assert_eq!(authed.select().sw, Sw::OK);
+        assert_eq!(validate_access_code(&mut authed, &mut rng, &key), Sw::OK);
+
+        arm_touch(&mut authed, &mut rng, armed, &challenge);
+        authed.authenticated = false;
+        assert_eq!(
+            run(
+                &mut authed,
+                &mut rng,
+                &frame(INS_DELETE, 0, 0, &delete_data(other))
+            )
+            .1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        assert_touch_disarmed(&mut authed, &mut rng);
+
+        assert_eq!(validate_access_code(&mut authed, &mut rng, &key), Sw::OK);
+        arm_touch(&mut authed, &mut rng, armed, &challenge);
+        authed.authenticated = false;
+        let blocked = put_data(
+            other,
+            TYPE_TOTP,
+            ALGORITHM_SHA1,
+            6,
+            RFC_SECRET,
+            None,
+            PROPERTY_TOUCH,
+        );
+        assert_eq!(
+            run(&mut authed, &mut rng, &frame(INS_PUT, 0, 0, &blocked)).1,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
+        );
+        assert_touch_disarmed(&mut authed, &mut rng);
+    }
+
+    #[test]
+    fn out_of_bounds_pending_answers_6985_without_touching_the_store() {
+        let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
+        let mut rng = TestRng;
+        let name = b"30/bounded";
+        put_totp(&mut oath, &mut rng, name);
+        oath.store_mut().reset_calls();
+
+        let len = oath.credentials.len();
+        for index in [len, MAX_CREDENTIALS, 99] {
+            oath.pending = Some(PendingCalculation {
+                index,
+                challenge: [0u8; 8],
+                truncated: true,
+            });
+            assert_touch_disarmed(&mut oath, &mut rng);
+            assert!(oath.pending.is_none());
+            assert_touch_disarmed(&mut oath, &mut rng);
+        }
+        assert_eq!(oath.credentials.len(), len);
+        assert_eq!(oath.find(name), Some(0));
+        assert_eq!(oath.store_mut().saves(), 0);
+        assert_eq!(oath.store_mut().clears(), 0);
+
+        let request = calculate_data(name, Some(&1u64.to_be_bytes()));
+        let (_, status) = run(&mut oath, &mut rng, &frame(INS_CALCULATE, 0, 1, &request));
+        assert_eq!(status, Sw::OK);
+        assert_eq!(
+            oath.confirm_presence(&mut rng).sw,
+            Sw::CONDITIONS_NOT_SATISFIED
+        );
     }
 }

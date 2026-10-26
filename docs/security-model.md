@@ -237,6 +237,32 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   direction. The operational cost is documented in `validation.md`: a `RESET`
   during a transient failure erases credentials a later `SELECT` could have
   recovered, so reselect before resetting.
+  The OATH **pending touch request** is bounded and dropped by mutation.
+  `pending` holds an index into the credential vector plus the moving-factor
+  parameters, so `confirm_presence` re-checks the index against the current
+  length before indexing and answers `6985` when it no longer fits: indexing
+  outside the vector would panic in `no_std` and halt the whole firmware
+  (FIDO2, Management, PIV and OATH share one binary), and a shifted index would
+  return another credential's code under a touch granted for the first. Every
+  handler that changes the credential set drops the request first - `put`,
+  `delete` (unconditionally, before authentication, name resolution and the
+  store write, so a refused `DELETE` (`6982`/`6984`/`6A80`) or a failed save
+  (`6A84`) disarms too) - and so do the pre-existing paths that reset the
+  volatile state (`RESET`, RAM normalization) or restart the session
+  (`SELECT`), because the authorization belongs to the credential that asked
+  for it, not to whatever a later write stores. `CALCULATE ALL` is
+  read-only over the set (HOTP entries are reported without computing, so no
+  counter moves) and does not disarm, and neither does the HOTP counter bump in
+  `calculate_index`, which runs after the request was consumed. An invalid
+  index **collapses** into the same `6985` as "no pending request" (no oracle:
+  the card never says whether the credential was deleted or never requested)
+  and no new status word is introduced. **Trade-off:** a host that interleaves
+  a `PUT`/`DELETE` between the armed `CALCULATE` and the confirmation receives
+  `6985` and reissues the `CALCULATE`, the same handling as a cancelled touch.
+  This is defensive robustness, not a reachable exposure: `Card::poll`
+  serializes presence today (no frame is processed between the `6FF0` and the
+  confirmation), so the applet keeps the invariant locally instead of
+  inheriting it from the transport.
 - **Secrets are sealed at rest.** Credential keys, OATH secrets, PIN-derived
   values and data objects are stored in sealed records (AES-256-GCM under the
   OTP root key); no applet response can export them.

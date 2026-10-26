@@ -1060,6 +1060,17 @@ adiado.
   (`DE AD`) é a exceção deliberada (apaga sem revelar) e continua fail-closed
   (`6A84` mantém o applet fechado). Nove testes novos (8 em `oath.rs`, 1 em
   `sealed.rs`), totalizando **254 testes** em `aegis-applets`.
+- **`pending` com bound e desarme na mutação (fatia
+  `specs/oath-pending-bounds.md`):** o pedido de toque guarda um índice no
+  vetor de credenciais e o `confirm_presence` o valida contra o `len` corrente
+  antes de indexar — um índice velho responde `6985`, colapsado no mesmo SW de
+  "sem pedido pendente", em vez de indexar fora do bound (panic que pararia o
+  firmware inteiro) ou devolver o código de outra credencial. `PUT` e `DELETE`
+  desarmam o pedido incondicionalmente na entrada do handler, inclusive quando
+  o comando é recusado (`6982`/`6984`/`6A80`) ou a gravação falha (`6A84`);
+  `CALCULATE ALL` (somente leitura) e o incremento HOTP de `calculate_index`
+  (depois do `take()`) ficam fora do desarme. 5 testes novos, totalizando
+  **259 testes** em `aegis-applets`.
 
 **Pendências**
 
@@ -1070,11 +1081,10 @@ adiado.
   dispositivo real. Recomendação operacional: **reselecionar antes de
   resetar** — durante uma falha transitória o `RESET` apaga credenciais que
   um `SELECT` seguinte teria recuperado.
-- **Follow-ups deliberados fora desta fatia:** os bounds/ciclo de vida de
-  `pending` em `confirm_presence` (índice não checado) e `delete` (não limpa
-  `pending`); o fallback do firmware para `MemoryOathStore` quando
-  `SealedOathStore::open` falha (`main.rs` serve um applet vazio, mutável e
-  sem access code — decisão de firmware/HAL); e a robustez do `SealedBlob`
+- **Follow-ups deliberados fora desta fatia:** o fallback do firmware para
+  `MemoryOathStore` quando `SealedOathStore::open` falha (`main.rs` serve um
+  applet vazio, mutável e sem access code — decisão de firmware/HAL); e a
+  robustez do `SealedBlob`
   quando um slot de commit antigo passa no CRC mas não abre no GCM (derruba o
   load inteiro e pode impedir o `RESET`, que fica fail-closed sem recuperação
   pelo protocolo até reflash/recovery/update).
