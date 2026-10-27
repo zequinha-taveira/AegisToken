@@ -26,6 +26,11 @@
 # AEGIS_UPDATE_VENDOR_PUBKEY is missing, malformed or the development key, and
 # it turns the build-time gate on (AEGIS_RELEASE=1) for the firmware build.
 # Without it the script builds a development image, which is not safe to ship.
+#
+# UF2 conversion needs picotool >= 2.0 (`uf2 convert` and RP2350 images do not
+# exist in 1.x). The script resolves picotool before compiling and fails when it
+# is missing or too old, so it can never print `Wrote ...` for a stale UF2 left
+# by a previous build. Set PICOTOOL to the full path when it is not on PATH.
 
 param(
     [ValidateSet("universal", "rp2350a", "rp2350b", "rp2354a", "rp2354b")]
@@ -34,8 +39,28 @@ param(
     [switch]$Release
 )
 
+$ErrorActionPreference = "Stop"
+
 if ($BoardProfile -eq "yubikey5-lab") {
     Write-Warning "yubikey5-lab uses Yubico VID 0x1050 / PID 0x0407 (OTP+FIDO+CCID). Its OTP HID is experimental, not compatible with Yubico OTP / ykman otp. Authorized lab only; do not distribute."
+}
+
+# Resolve picotool and its version up front: a missing or 1.x binary would
+# otherwise be discovered only after the firmware build, and a failed native
+# command does not set $LASTEXITCODE, so the old check could report success
+# while leaving a stale UF2 in place.
+$picotool = if ($env:PICOTOOL) { $env:PICOTOOL } else { "picotool" }
+$picotoolCmd = Get-Command $picotool -CommandType Application -ErrorAction SilentlyContinue
+if (-not $picotoolCmd) {
+    throw ("picotool not found: install picotool >= 2.0 and put it on PATH, or set " +
+        "PICOTOOL to its full path. UF2 conversion of RP2350 images requires >= 2.0.")
+}
+$picotool = $picotoolCmd.Source
+$picotoolVersion = (& $picotool version | Out-String)
+$picotoolMatch = [regex]::Match($picotoolVersion, "v(\d+)\.(\d+)")
+if (-not $picotoolMatch.Success -or [int]$picotoolMatch.Groups[1].Value -lt 2) {
+    throw ("picotool >= 2.0 is required for 'uf2 convert' and RP2350 images; found: " +
+        $picotoolVersion.Trim())
 }
 
 $target = "thumbv8m.main-none-eabihf"
@@ -76,9 +101,18 @@ if ($Release) {
     }
     # Same policy as the build script (crates/aegis-build-support): a malformed
     # key or the development key is rejected before the firmware is compiled.
-    $check = & cargo run --quiet -p aegis-build-support --bin vendor-key-check 2>&1 |
-        ForEach-Object { $_.ToString() }
-    if ($LASTEXITCODE -ne 0) {
+    # vendor-key-check explains the rejection on stderr, so keep the error
+    # stream non-terminating here and report that reason with context.
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $check = & cargo run --quiet -p aegis-build-support --bin vendor-key-check 2>&1 |
+            ForEach-Object { $_.ToString() }
+        $checkExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    if ($checkExit -ne 0) {
         throw ("release gate: " + (($check -join "`n").Trim()))
     }
 } elseif (-not $env:AEGIS_UPDATE_VENDOR_PUBKEY) {
@@ -97,7 +131,13 @@ try {
     $env:AEGIS_RELEASE = $previousRelease
 }
 
-picotool uf2 convert $elf -t elf $out
+$LASTEXITCODE = 0
+& $picotool uf2 convert $elf -t elf $out
 if ($LASTEXITCODE -ne 0) { throw "picotool conversion failed ($LASTEXITCODE)" }
+$uf2 = Get-Item -LiteralPath $out -ErrorAction SilentlyContinue
+if (-not $uf2) { throw "picotool reported success but $out was not written" }
+if ($uf2.LastWriteTime -lt (Get-Item -LiteralPath $elf).LastWriteTime) {
+    throw "$out is older than ${elf}: the UF2 conversion did not run"
+}
 
 Write-Output "Wrote $out"

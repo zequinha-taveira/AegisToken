@@ -188,8 +188,11 @@ são testados no host. A HAL atual permanece isolada em `board-generic-rp2350`.
 - Toolchain Rust fixada em `rust-toolchain.toml` (canal `1.97.1`), com os
   componentes `rustfmt` e `clippy` e o alvo `thumbv8m.main-none-eabihf`.
 - [`probe-rs`](https://probe.rs) — flash e RTT.
-- [`picotool`](https://github.com/raspberrypi/picotool) — conversão de UF2 e
-  `picotool info`.
+- [`picotool`](https://github.com/raspberrypi/picotool) **>= 2.0** — conversão de
+  UF2 (`uf2 convert`, imagens RP2350) e `picotool info`. O
+  `scripts/build-uf2.ps1` resolve o binário antes de compilar e falha se ele
+  faltar ou for 1.x; use a variável `PICOTOOL` para apontar o caminho completo
+  quando ele não estiver no PATH.
 - Python 3 com `fido2`, `hidapi`, `cbor2` e `pyscard` para os scripts de
   validação.
 
