@@ -4,17 +4,19 @@
 Run with an AegisToken device connected. Requires ``python-fido2``.
 
     python scripts/validate_fido.py
-    python scripts/validate_fido.py --pin 123456
+    python scripts/validate_fido.py --pin-prompt
+    python scripts/validate_fido.py --pin-stdin < pin.txt
 
 When a check needs User Presence the script prints a prompt; press BOOTSEL
 within the 15 second presence timeout.
 
 Covers AC-002/AC-011/AC-013 (ES256) and AC-020 (Ed25519 `ed25519-sk` flows).
-With ``--pin`` the script also exercises the clientPIN rotation
-(``changePIN``), the CTAP2.1 credential management commands
+With a PIN flag (`--pin-stdin` or `--pin-prompt`) the script also exercises the
+clientPIN rotation (``changePIN``), the CTAP2.1 credential management commands
 (``enumerateRPs``/``enumerateCredentials``) and the negative cases of the
 PIN/UV auth token scope (legacy token in credential management, ``cm`` token
-bound to a relying party, cross-relying-party assertion).
+bound to a relying party, cross-relying-party assertion). A PIN is never
+accepted in argv.
 
 A token is spent by an operation that tests user presence, so the script
 fetches a fresh token for every operation that needs one.
@@ -24,11 +26,13 @@ Exit code is 0 when every check passes, 1 otherwise.
 
 from __future__ import annotations
 
+import getpass
 import hashlib
 import hmac
 import os
 import sys
 
+_FIDO_IMPORT_ERROR: ImportError | None = None
 try:
     from fido2.ctap1 import Ctap1
     from fido2.ctap2 import Ctap2
@@ -36,14 +40,24 @@ try:
     from fido2.ctap2.pin import ClientPin
     from fido2.hid import CtapHidDevice
 except ImportError as exc:  # pragma: no cover - tooling dependency
-    print("python-fido2 is required: pip install fido2")
-    print(exc)
-    sys.exit(2)
+    # Keep the module importable so the argument parser is testable on a host
+    # without python-fido2; `main()` reports the missing dependency and exits 2.
+    _FIDO_IMPORT_ERROR = exc
 
 RESULTS: list[tuple[str, bool, str]] = []
+SECRETS: list[str] = []
+
+
+def redact(text: str) -> str:
+    """Remove every acquired secret from text before it is printed."""
+    for secret in SECRETS:
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    return text
 
 
 def record(ac: str, passed: bool, detail: str = "") -> None:
+    detail = redact(detail)
     RESULTS.append((ac, passed, detail))
     flag = "PASS" if passed else "FAIL"
     print(f"[{flag}] {ac}" + (f" — {detail}" if detail else ""))
@@ -204,7 +218,8 @@ def check_change_pin(device, pin_value: str) -> None:
     """Rotate the PIN and rotate it back, proving `changePIN` end to end."""
     pin = ClientPin(Ctap2(device))
     last = pin_value[-1]
-    temporary = pin_value[:-1] + ("0" if last != "0" else "1")
+    replacement = "0" if last != "0" else "1"
+    temporary = pin_value[:-1] + replacement
     try:
         pin.change_pin(pin_value, temporary)
     except Exception as exc:  # noqa: BLE001
@@ -213,10 +228,13 @@ def check_change_pin(device, pin_value: str) -> None:
     try:
         pin.change_pin(temporary, pin_value)
     except Exception as exc:  # noqa: BLE001
+        # Never print the temporary PIN: describe how to reconstruct it from the
+        # PIN the user already knows.
         record(
             "clientPIN changePIN (restore)",
             False,
-            f"{exc} -- the device PIN is now '{temporary}'",
+            f"{exc} -- the device PIN is now the input PIN with its last digit "
+            f"set to {replacement}",
         )
         return
     record("clientPIN changePIN (round trip)", True)
@@ -330,18 +348,135 @@ def summarize() -> int:
     return 1 if failed else 0
 
 
-def parse_args(argv: list[str]) -> str | None:
-    """Return the PIN passed with `--pin`, if any."""
-    index = 0
-    while index < len(argv):
-        if argv[index] == "--pin" and index + 1 < len(argv):
-            return argv[index + 1]
-        index += 1
+USAGE = """\
+AegisToken — FIDO2 / U2F hardware validation.
+
+USAGE:
+  python scripts/validate_fido.py [--pin-stdin | --pin-prompt]
+
+PIN INPUT:
+  --pin-stdin    read the PIN from one stdin line (pipe)
+  --pin-prompt   read the PIN from a hidden terminal prompt
+
+Without a PIN flag the script runs the presence-only checks. A PIN is never
+accepted in argv. If a PIN was ever passed in argv, rotate it and clear the
+shell history.
+"""
+
+
+class UsageError(Exception):
+    """Invalid command line or secret channel combination."""
+
+
+def _split_option(arg: str) -> tuple[str, str | None]:
+    """Split `-opt=value`/`--opt=value`; other args have no value.
+
+    Any dash-prefixed token is split on the first `=`: a single-dash typo
+    (`-pin=secret`) must not smuggle the value into the error message.
+    """
+    if arg.startswith("-") and len(arg) > 1 and "=" in arg:
+        name, value = arg.split("=", 1)
+        return name, value
+    return arg, None
+
+
+def parse_args(argv: list[str]) -> tuple[bool, bool]:
+    """Parse the command line into `(pin_stdin, pin_prompt)`.
+
+    The parser never returns a secret: only the source of the PIN. `--pin` and
+    `--old-pin` are rejected in both `--opt value` and `--opt=value` forms.
+    """
+    pin_stdin = False
+    pin_prompt = False
+    for arg in argv:
+        name, inline = _split_option(arg)
+        if name == "--pin-stdin":
+            if inline is not None:
+                raise UsageError("option --pin-stdin takes no value")
+            pin_stdin = True
+        elif name == "--pin-prompt":
+            if inline is not None:
+                raise UsageError("option --pin-prompt takes no value")
+            pin_prompt = True
+        elif name in ("--pin", "--old-pin"):
+            raise UsageError(
+                f"option {name} is not accepted: a secret must never be passed in "
+                f"argv; use --pin-stdin or --pin-prompt"
+            )
+        elif name in ("--help", "-h"):
+            continue
+        elif name.startswith("-"):
+            # Report the option name only: `--x=secret` must not echo the value.
+            raise UsageError(f"unknown option: {name}")
+        else:
+            # Never echo a bare token: it could be a legacy secret.
+            raise UsageError("unexpected positional argument")
+    if pin_stdin and pin_prompt:
+        raise UsageError("--pin-stdin and --pin-prompt are mutually exclusive")
+    return pin_stdin, pin_prompt
+
+
+def read_stdin_secret(label: str) -> str:
+    """Read one secret line from stdin, without the trailing line ending."""
+    line = sys.stdin.readline()
+    if not line:
+        raise UsageError(f"stdin closed before the {label} was read")
+    value = line.rstrip("\r\n")
+    if not value:
+        raise UsageError(f"empty line on stdin: expected the {label}")
+    return value
+
+
+def _acquire_pin(pin_stdin: bool, pin_prompt: bool) -> str | None:
+    """Return the PIN according to the selected channel, or `None`."""
+    if pin_stdin:
+        if sys.stdin.isatty():
+            raise UsageError(
+                "--pin-stdin expects a pipe: redirect stdin or use --pin-prompt "
+                "(a terminal would echo the secret)"
+            )
+        return read_stdin_secret("PIN")
+    if pin_prompt:
+        if not sys.stdin.isatty():
+            raise UsageError(
+                "no terminal for the hidden prompt: use --pin-stdin with a pipe"
+            )
+        pin = getpass.getpass("PIN: ")
+        if not pin:
+            raise UsageError("empty PIN from the prompt")
+        return pin
     return None
 
 
-def main() -> int:
-    pin_value = parse_args(sys.argv[1:])
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+
+    # Help is processed before any secret is looked at: `--help --pin V` prints
+    # the usage and exits 0 without echoing the value.
+    if any(arg in ("--help", "-h") for arg in args):
+        print(USAGE)
+        return 0
+
+    try:
+        pin_stdin, pin_prompt = parse_args(args)
+    except UsageError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        print("        see --help", file=sys.stderr)
+        return 2
+
+    if _FIDO_IMPORT_ERROR is not None:
+        print("python-fido2 is required: pip install fido2", file=sys.stderr)
+        print(_FIDO_IMPORT_ERROR, file=sys.stderr)
+        return 2
+
+    try:
+        pin_value = _acquire_pin(pin_stdin, pin_prompt)
+    except UsageError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        print("        see --help", file=sys.stderr)
+        return 2
+    if pin_value is not None:
+        SECRETS.append(pin_value)
 
     device = find_device()
     record("AC-002 FIDO HID enumeration (accessible)", device is not None)

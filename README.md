@@ -331,7 +331,9 @@ python scripts/set_pin.py               # define/altera o PIN do clientPIN
 Os scripts imprimem `[PASS]/[FAIL]` por critério (AC) e retornam código de saída
 diferente de zero em falha. `set_pin.py` usa prompt oculto por padrão e
 `--pin-stdin`/`--old-pin-stdin` para automação; `--pin`/`--old-pin` em `argv`
-são recusados (exit 2). No Windows, a interface FIDO é reivindicada pelo
+são recusados (exit 2). O `validate_fido.py` segue a mesma regra: `--pin-prompt`
+(prompt oculto, TTY) ou `--pin-stdin` (pipe); sem flag ele roda só presença.
+No Windows, a interface FIDO é reivindicada pelo
 driver `fidohid`, que a mantém com exclusividade; veja
 [`validation.md`](validation.md) para as opções de acesso (WebAuthn no navegador
 ou remapeamento para o driver HID genérico).

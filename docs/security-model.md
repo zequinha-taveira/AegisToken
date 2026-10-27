@@ -364,22 +364,27 @@ defeats the on-device protections. The host tools follow these rules:
   line to other local processes (`ps`, `/proc/<pid>/cmdline`, Task Manager,
   WMI) and keeps it in shell history. `aegistoken-host` rejects `--key` and
   `--old-key` (and a positional key for `piv-set-mgmt-key`), and
-  `scripts/set_pin.py` rejects `--pin` and `--old-pin`, with exit code 2. The
-  refusal names the option but never echoes the value or a fragment of it.
+  `scripts/set_pin.py` and `scripts/validate_fido.py` reject `--pin` and
+  `--old-pin`, with exit code 2. The refusal names the option but never echoes
+  the value or a fragment of it.
 - **The channels are a hidden prompt or stdin.** With a terminal, the secret
-  is read through a hidden prompt (`rpassword`, host-only, Apache-2.0). For
-  automation it arrives on stdin (`--key-stdin`/`--old-key-stdin`,
-  `--pin-stdin`/`--old-pin-stdin`); the mode is all-or-nothing, and
-  `--change` reads the current secret first and the new one second. Without a
-  terminal and without the flags the tool fails instead of prompting or
-  echoing. Stdin keys are parsed by a shape-only parser that reports length
-  and encoding class, never the bytes.
-- **Errors and logs stay redacted.** `set_pin.py` removes every acquired
-  secret from the error text before printing it. No secret is written to a
-  temporary file, a config file or a log. In `set_pin.py`, `--help` is processed
-  before any secret is touched, so `--help --pin <value>` prints the usage
-  without reading or echoing the value; the Rust CLI rejects a secret option at
-  parse time even when `--help` is also present (it never reaches a prompt).
+  is read through a hidden prompt (`rpassword`/`getpass`, host-only,
+  Apache-2.0). For automation it arrives on stdin
+  (`--key-stdin`/`--old-key-stdin`, `--pin-stdin`/`--old-pin-stdin`,
+  `validate_fido.py --pin-stdin`); the mode is all-or-nothing, and `--change`
+  reads the current secret first and the new one second. `validate_fido.py`
+  without a PIN flag still runs the presence-only checks. Without a terminal
+  and without the flags the tool fails instead of prompting or echoing. Stdin
+  keys are parsed by a shape-only parser that reports length and encoding
+  class, never the bytes.
+- **Errors and logs stay redacted.** `set_pin.py` and `validate_fido.py` remove
+  every acquired secret from the error text before printing it. No secret is
+  written to a temporary file, a config file or a log. In `set_pin.py`,
+  `--help` is processed before any secret is touched, so `--help --pin <value>`
+  prints the usage without reading or echoing the value; the Rust CLI and
+  `validate_fido.py` reject a secret option at parse time even when `--help` is
+  also present (it never reaches a prompt). `validate_fido.py` also never prints
+  the temporary PIN used by its `changePIN` round trip.
 - **The OATH URI is a secret carrier too.** An `otpauth://` URI contains the
   shared `secret=`, so `aegistoken-host oath add` accepts it only from
   `--uri-stdin` (pipe) or the hidden prompt, refuses a positional URI without

@@ -59,7 +59,7 @@ codificação `getInfo`, resposta do Management HID e leitura de BOOTSEL; com
 ```powershell
 python scripts/validate_management.py   # Management HID (AC-003..AC-009)
 python scripts/validate_fido.py         # FIDO2/U2F (AC-002, AC-011, AC-013)
-python scripts/validate_fido.py --pin 123456   # + changePIN e credential management
+python scripts/validate_fido.py --pin-prompt   # + changePIN e credential management
 python scripts/validate_ccid.py         # CCID (AC-016)
 python scripts/validate_piv.py          # PIV (AC-017/AC-021)
 python scripts/validate_oath.py         # OATH/TOTP/HOTP (AC-018)
@@ -893,11 +893,13 @@ acessível via `hidraw`.
 | AC-033 | OATH: presença pendente com bound e desarme na mutação (`confirm_presence` valida o índice de `pending` contra o `len` antes de indexar → `6985` colapsado no "sem pedido" — sem panic e sem código de outra credencial; `PUT`/`DELETE` desarmam incondicionalmente na entrada, inclusive nas recusas `6982`/`6984`/`6A80`/`6A84`; `CALCULATE ALL` não altera o conjunto e não desarma; sem SW novo e sem estado persistido novo) | Testes de host `aegis-applets::oath` (fatia `specs/oath-pending-bounds.md`) + `docs/security-model.md` | **Verificado em host** (5 testes novos, **259** no crate); sem pendência física — o interleaving não é alcançável pelo loop CCID atual (`Card::poll` serializa presença) e `validate_oath.py` não muda |
 | AC-034 | Host: segredo nunca em `argv` (`aegistoken-host` recusa `--key`/`--old-key` e posicional do `piv-set-mgmt-key` sem ecoar o valor; canais são prompt oculto em TTY ou `--key-stdin`/`--old-key-stdin` por pipe; `--change` exige os dois flags, PIN atual primeiro; `set_pin.py` recusa `--pin`/`--old-pin` e posicional, exige TTY sem flags, e redige segredos na mensagem de erro; `--help` vence qualquer flag de segredo sem ler nem ecoar) | Testes de host `aegistoken-host::cli`/`secret` (18 novos) e Python `tests/test_set_pin_args.py` (20) + `specs/host-secrets-not-in-argv.md` | **Verificado em host** (host 33 testes, Python 20); prompt oculto real é smoke manual em TTY (documentado acima); sem dependência de hardware |
 | AC-035 | Host OATH: `oath_cmd` declarado em `main.rs` e testado; `oath list|code|add|delete|reset` no CLI; a URI `otpauth://` (segredo `secret=`) nunca entra em `argv` — `oath add` recusa positional sem eco, entra por `--uri-stdin` (pipe) ou prompt oculto (TTY); `--reader` vale para `oath`/`piv-set-mgmt-key` e `--uri-stdin` só para `oath add`; parser não ecoa URI nem caractere Base32 e `OtpAuthCredential` não deriva `Debug` | Testes de host `aegistoken-host::oath_cmd`/`cli` (13 novos + 14 do módulo antes não executados; 60 no crate) + `specs/oath-cli-wiring.md` | **Verificado em host** (60 testes; antes 33); execução em hardware pendente (sem leitor PC/SC) |
+| AC-036 | Host FIDO: `validate_fido.py` recusa `--pin`/`--old-pin` em argv sem eco; o PIN entra por `--pin-stdin` (pipe, recusa TTY) ou `--pin-prompt` (`getpass`, exige TTY), flags mutuamente exclusivas; sem flag = presença-apenas; `--help` vence sem ler o valor; o import de `python-fido2` é guardado (parser testável sem a dependência; execução sem ela retorna 2); `record()` redige o PIN e o `changePIN` não imprime o temporário | `tests/test_validate_fido_args.py` (24 testes) + `specs/validate-fido-pin-channel.md` | **Verificado em host** (pytest 56); execução em hardware pendente (sem RP2350) |
 
 ### Fases 7e — credential management e `changePIN` (host; hardware pendente)
 
 Cobertos por 225 testes de host em `aegis-core` (14 novos) e pelo validador
-`scripts/validate_fido.py --pin <PIN>`, que exercita em hardware:
+`scripts/validate_fido.py --pin-prompt` (ou `--pin-stdin`), que exercita em
+hardware:
 
 - `getPinUvAuthTokenUsingPinWithPermissions` com a permissão `cm`;
 - `changePIN` (rotação de ida e volta);
@@ -939,7 +941,8 @@ RP efetivo da credencial). Sem HAL, executor ou dependência de storage.
 
 **Limitação (gate de hardware pendente):** a validação de ponta a ponta em
 dispositivo físico continua **pendente** — não há RP2350 físico nesta sessão.
-`scripts/validate_fido.py --pin <PIN>` é o candidato natural: o validador foi
+`scripts/validate_fido.py --pin-prompt` (ou `--pin-stdin`) é o candidato
+natural: o validador foi
 estendido com os casos negativos desta fatia (token legado em credential
 management → 0x33; token `cm` com `rpId` → `enumerateRPsBegin` recusado;
 token `mc` vinculado a `example.com` em `getAssertion` de outro RP → 0x33) e
@@ -1200,10 +1203,16 @@ ser `true` (chaves CBOR 0x08/0x09/0x0A).
 
 ```powershell
 python scripts/validate_fido.py                 # sem PIN: fluxo só com presença
-python scripts/validate_fido.py --pin 123456    # com PIN: exige a prova do PIN
+python scripts/validate_fido.py --pin-prompt    # com PIN: prompt oculto (TTY)
+Get-Content pin.txt | python scripts/validate_fido.py --pin-stdin
 ```
 
-Com `--pin`, o script exercita: `getPinToken`/`getPinUvAuthTokenWithPermissions`,
+O PIN nunca entra em `argv`: `--pin-prompt` lê por prompt oculto (exige TTY) e
+`--pin-stdin` lê uma linha de um pipe (recusa TTY). `--pin`/`--old-pin` são
+recusados sem ecoar o valor; sem flag, o validador roda só presença.
+
+Com um PIN (`--pin-prompt`/`--pin-stdin`), o script exercita:
+`getPinToken`/`getPinUvAuthTokenWithPermissions`,
 `changePIN` (ida e volta), `enumerateRPs`/`enumerateCredentials` sobre uma
 credencial residente e os **casos negativos** do escopo do token (token legado
 em credential management → 0x33; token `cm` com `rpId` → `enumerateRPsBegin`
@@ -1349,7 +1358,8 @@ A validação com um cliente real revelou dois bugs de transporte, já corrigido
 - **PIN obrigatório quando configurado:** com PIN no dispositivo,
   `makeCredential`/`getAssertion` exigem a prova do PIN (`PinRequired` 0x36) e
   rejeitam um `pinUvAuthParam` inválido (`PinAuthInvalid` 0x33). O validador
-  precisa ser executado com `--pin <PIN>` nesse caso.
+  precisa ser executado com `--pin-prompt` (TTY) ou `--pin-stdin` (pipe) nesse
+  caso.
 - **Escopo do `pinUvAuthToken`:** o token é escopado por operação (`mc` para
   `makeCredential`, `ga` para `getAssertion`) e por RP (o *permissions RP ID*
   precisa casar com o `rp.id` da requisição); `enumerateRPsBegin` exige token
@@ -1373,9 +1383,9 @@ A validação com um cliente real revelou dois bugs de transporte, já corrigido
   Keygen probabilístico (Miller-Rabin 12 rounds, sem certificação FIPS);
   setup de Montgomery sobre módulos secretos e índice do scan de unpad são
   canais laterais residuais documentados em `crates/aegis-applets/src/rsa.rs`.
-- **Segredos de host (AC-034/AC-035):** a política vale para segredos ainda não
-  expostos. Um PIN/chave/URI que já passou por `argv` **não é apagado** do
-  histórico do shell nem de logs do SO: rotacione o segredo e limpe o histórico.
-  O `oath_cmd.rs` foi declarado no binário e os segredos OATH migraram para
-  stdin/prompt (AC-035). Fica como follow-up `validate_fido.py --pin` (validador
-  de hardware ainda aceita `--pin` em `argv`).
+- **Segredos de host (AC-034/AC-035/AC-036):** a política vale para segredos
+  ainda não expostos. Um PIN/chave/URI que já passou por `argv` **não é
+  apagado** do histórico do shell nem de logs do SO: rotacione o segredo e
+  limpe o histórico. O `oath_cmd.rs` foi declarado no binário e os segredos OATH
+  migraram para stdin/prompt (AC-035); o `validate_fido.py` passou a aceitar o
+  PIN por `--pin-prompt`/`--pin-stdin` e redige o valor (AC-036).

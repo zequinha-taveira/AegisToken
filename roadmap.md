@@ -36,11 +36,12 @@ Documento vivo: cada fase é marcada conforme concluída e verificada.
   `rusb`, libusb embutida), sem WinUSB/Zadig; no Windows usa o backend HID do
   libusb sobre o driver HID inbox.
 - **Segredos de host:** nunca em `argv` (visível a outros processos e no
-  histórico do shell). O canal é prompt oculto (`rpassword`, host-only) em TTY
-  ou stdin (`--key-stdin`/`--old-key-stdin`, `--pin-stdin`/`--old-pin-stdin`);
-  `--key`/`--old-key`/`--pin`/`--old-pin` são recusados (exit 1 no CLI, 2 no
-  `set_pin.py`)
-  (`specs/host-secrets-not-in-argv.md`, AC-034).
+  histórico do shell). O canal é prompt oculto (`rpassword`/`getpass`, host-only)
+  em TTY ou stdin (`--key-stdin`/`--old-key-stdin`, `--pin-stdin`/`--old-pin-stdin`,
+  `--uri-stdin`, e `--pin-stdin` do `validate_fido.py`); `--key`/`--old-key`/
+  `--pin`/`--old-pin` são recusados (exit 1 no CLI, 2 em `set_pin.py` e
+  `validate_fido.py`) (`specs/host-secrets-not-in-argv.md`,
+  `specs/oath-cli-wiring.md`, `specs/validate-fido-pin-channel.md`, AC-034/035/036).
 - **Desktop Manager:** ainda não existe crate de Desktop Manager nem integração
   de "Ejetar" no repositório; por ora há apenas o CLI de host
   (`aegistoken-host`).
@@ -556,13 +557,14 @@ adiado.
 - 228 testes de host em `aegis-core` (3 novos: ordem dos candidatos, contagem
   de credenciais e assinatura do próximo candidato), clippy limpo em host e
   alvo, build de firmware e UF2 gerados.
-- `scripts/validate_fido.py --pin <PIN>` prova o PIN em todas as operações e
-  exercita a rotação e a enumeração em hardware.
+- `scripts/validate_fido.py --pin-prompt` (ou `--pin-stdin`) prova o PIN em
+  todas as operações e exercita a rotação e a enumeração em hardware.
 
 **Limitações registradas**
 
 - Com PIN configurado, clientes que não provem o PIN recebem `PinRequired`:
-  é o comportamento esperado, mas exige que o validador use `--pin`.
+  é o comportamento esperado, mas exige que o validador use `--pin-prompt` ou
+  `--pin-stdin`.
 
 ### 7g — Escopo e ciclo de vida do `pinUvAuthToken` (CTAP2.1) (concluída)
 
@@ -616,7 +618,7 @@ adiado.
   `deleteCredential` restrito ao RP, token sem vínculo de RP apaga qualquer
   credencial e invalidação pelo reset), clippy limpo em host e alvo, build de
   firmware gerado.
-- Gate de hardware (`scripts/validate_fido.py --pin <PIN>`) **pendente**:
+- Gate de hardware (`scripts/validate_fido.py --pin-prompt`) **pendente**:
   não há RP2350 físico nesta sessão. O validador **já cobre** os casos
   negativos desta fatia (token legado em credential management → 0x33; token
   `cm` com `rpId` → `enumerateRPsBegin` recusado; token `mc` vinculado a
@@ -1640,10 +1642,10 @@ linha de comando (`aegistoken-host`) e estruturando a base tecnológica do futur
   `--uri-stdin` (pipe) ou prompt oculto (TTY), e o positional é recusado sem eco;
   `--reader` vale para `oath`/`piv-set-mgmt-key` (fatia `specs/oath-cli-wiring.md`).
 - **Etapa 2.5:** Avaliação do `nusb`.
-- **Follow-up da fatia host-secrets:** `scripts/validate_fido.py` ainda aceita
-  `--pin` em `argv` (preservado nesta fatia por ser o validador de hardware e
-  não um exemplo novo). Migrar para `--pin-stdin`/prompt na mesma disciplina do
-  `set_pin.py` e atualizar `validation.md`/`roadmap.md` junto.
+- **Follow-up da fatia host-secrets entregue:** `scripts/validate_fido.py` agora
+  aceita o PIN por `--pin-prompt` (TTY) ou `--pin-stdin` (pipe), recusa
+  `--pin`/`--old-pin` sem eco e redige o valor (AC-036,
+  `specs/validate-fido-pin-channel.md`).
 - **Eixo 3:** Protótipo do Desktop Manager em Rust (`tauri` v2).
 
 **Critério de saída**
