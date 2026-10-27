@@ -354,3 +354,34 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   the device is a YubiKey. Any VID/PID profile used to exercise tools that
   filter by Yubico identity is laboratory-only, requires authorization, and
   must never be distributed.
+
+## Host tooling
+
+The host side is part of the trust boundary: a secret that leaks on the host
+defeats the on-device protections. The host tools follow these rules:
+
+- **A secret is never accepted in `argv`.** The OS exposes a process command
+  line to other local processes (`ps`, `/proc/<pid>/cmdline`, Task Manager,
+  WMI) and keeps it in shell history. `aegistoken-host` rejects `--key` and
+  `--old-key` (and a positional key for `piv-set-mgmt-key`), and
+  `scripts/set_pin.py` rejects `--pin` and `--old-pin`, with exit code 2. The
+  refusal names the option but never echoes the value or a fragment of it.
+- **The channels are a hidden prompt or stdin.** With a terminal, the secret
+  is read through a hidden prompt (`rpassword`, host-only, Apache-2.0). For
+  automation it arrives on stdin (`--key-stdin`/`--old-key-stdin`,
+  `--pin-stdin`/`--old-pin-stdin`); the mode is all-or-nothing, and
+  `--change` reads the current secret first and the new one second. Without a
+  terminal and without the flags the tool fails instead of prompting or
+  echoing. Stdin keys are parsed by a shape-only parser that reports length
+  and encoding class, never the bytes.
+- **Errors and logs stay redacted.** `set_pin.py` removes every acquired
+  secret from the error text before printing it. No secret is written to a
+  temporary file, a config file or a log. In `set_pin.py`, `--help` is processed
+  before any secret is touched, so `--help --pin <value>` prints the usage
+  without reading or echoing the value; the Rust CLI rejects a secret option at
+  parse time even when `--help` is also present (it never reaches a prompt).
+- **A leaked secret is rotated, not deprecated.** There is no compatibility
+  opt-in for argv secrets: the only remediation is to rotate the exposed key
+  or PIN and clear the shell history. The `rpassword` dependency is
+  host-only and never enters the firmware workspace members.
+

@@ -35,6 +35,12 @@ Documento vivo: cada fase é marcada conforme concluída e verificada.
 - **Host:** `aegistoken-host` acessa o Management HID via **libusb** (crate
   `rusb`, libusb embutida), sem WinUSB/Zadig; no Windows usa o backend HID do
   libusb sobre o driver HID inbox.
+- **Segredos de host:** nunca em `argv` (visível a outros processos e no
+  histórico do shell). O canal é prompt oculto (`rpassword`, host-only) em TTY
+  ou stdin (`--key-stdin`/`--old-key-stdin`, `--pin-stdin`/`--old-pin-stdin`);
+  `--key`/`--old-key`/`--pin`/`--old-pin` são recusados (exit 1 no CLI, 2 no
+  `set_pin.py`)
+  (`specs/host-secrets-not-in-argv.md`, AC-034).
 - **Desktop Manager:** ainda não existe crate de Desktop Manager nem integração
   de "Ejetar" no repositório; por ora há apenas o CLI de host
   (`aegistoken-host`).
@@ -1618,6 +1624,13 @@ linha de comando (`aegistoken-host`) e estruturando a base tecnológica do futur
   comandos `piv-list` (inspeção X.509 detalhada dos slots 9A, 9C, 9D, 9E), `piv-import-cert`
   (importação PEM/DER com autenticação de chave de gestão) e `piv-set-mgmt-key`
   (troca de Management Key 3DES/AES). 15 testes unitários aprovados no host CLI.
+- **Fatia de hardening entregue — segredos de host fora de `argv`**
+  (`specs/host-secrets-not-in-argv.md`, AC-034): `aegistoken-host` recusa
+  `--key`/`--old-key` e o posicional do `piv-set-mgmt-key` sem ecoar o valor; a
+  chave entra por prompt oculto (`rpassword`, host-only, Apache-2.0) ou por
+  `--key-stdin`/`--old-key-stdin`; `scripts/set_pin.py` recusa `--pin`/`--old-pin`
+  e o posicional, exige TTY sem flags e redige segredos no erro. 18 testes novos
+  no host (33 no crate) e 20 em `tests/test_set_pin_args.py`.
 
 **Pendências e próximos passos**
 
@@ -1625,6 +1638,15 @@ linha de comando (`aegistoken-host`) e estruturando a base tecnológica do futur
   em `crates/aegistoken-host/src/oath_cmd.rs`, com parsing de `otpauth://` e testes de
   host).
 - **Etapa 2.5:** Avaliação do `nusb`.
+- **Follow-up da fatia host-secrets:** `scripts/validate_fido.py` ainda aceita
+  `--pin` em `argv` (preservado nesta fatia por ser o validador de hardware e
+  não um exemplo novo). Migrar para `--pin-stdin`/prompt na mesma disciplina do
+  `set_pin.py` e atualizar `validation.md`/`roadmap.md` junto.
+- **Follow-up da fatia host-secrets (OATH):** `crates/aegistoken-host/src/oath_cmd.rs`
+  continua fora do binário (não declarado em `main.rs`), então seus 15 testes não
+  rodam e a política de segredo fora de `argv` ainda não foi aplicada ao
+  `oath add`/`oath delete`. Declarar o módulo, migrar os segredos e cobrir com
+  testes (`specs/host-secrets-not-in-argv.md` §5.2).
 - **Eixo 3:** Protótipo do Desktop Manager em Rust (`tauri` v2).
 
 **Critério de saída**

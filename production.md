@@ -206,6 +206,9 @@ do próprio libusb (sem WinUSB/Zadig):
 cargo run -p aegistoken-host -- validate
 ```
 
+Operações que exigem a chave de gestão PIV nunca a recebem em `argv`: use o
+prompt oculto ou `--key-stdin`/`--old-key-stdin` com pipe (ver `README.md`).
+
 ## Publicação automatizada de releases (GitHub Actions)
 
 A publicação no GitHub segue o fluxo de [`.github/workflows/release.yml`](.github/workflows/release.yml):

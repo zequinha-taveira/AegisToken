@@ -12,7 +12,7 @@ use pcsc::{Card, Context, MAX_BUFFER_SIZE, Scope};
 use x509_cert::Certificate;
 use x509_cert::der::{Decode, DecodePem, Encode};
 
-use crate::card::{connect_card, format_hex, format_iso_status, parse_hex, select_applet};
+use crate::card::{connect_card, format_hex, format_iso_status, select_applet};
 
 /// Standard NIST SP 800-73-4 interop default 3DES management key (24 bytes).
 pub const DEFAULT_MGMT_KEY: [u8; 24] = [
@@ -332,7 +332,7 @@ pub fn piv_list(reader_filter: Option<&str>) -> Result<ExitCode, String> {
 pub fn piv_import_cert(
     slot_arg: &str,
     cert_path: &str,
-    mgmt_key_hex: Option<&str>,
+    mgmt_key: Option<&[u8]>,
     reader_filter: Option<&str>,
 ) -> Result<ExitCode, String> {
     let slot = resolve_slot(slot_arg)
@@ -378,8 +378,7 @@ pub fn piv_import_cert(
     select_applet("piv", reader_filter)?;
 
     // Resolve management key and authenticate
-    let (mgmt_key, alg) = if let Some(hex) = mgmt_key_hex {
-        let k = parse_hex(hex)?;
+    let (mgmt_key, alg) = if let Some(k) = mgmt_key {
         let alg = match k.len() {
             24 => ALG_TDES,
             16 => ALG_AES128,
@@ -391,7 +390,7 @@ pub fn piv_import_cert(
                 ));
             }
         };
-        (k, alg)
+        (k.to_vec(), alg)
     } else {
         (DEFAULT_MGMT_KEY.to_vec(), ALG_TDES)
     };
@@ -444,14 +443,15 @@ pub fn piv_import_cert(
 }
 
 /// Replace the PIV Management Key (`SET MANAGEMENT KEY`).
+///
+/// Both keys arrive already resolved as bytes: the CLI never accepts a secret
+/// from `argv`, so this layer never parses a secret string.
 pub fn piv_set_mgmt_key(
-    new_key_hex: &str,
-    old_key_hex: Option<&str>,
+    new_key: &[u8],
+    old_key: Option<&[u8]>,
     alg_arg: Option<&str>,
     reader_filter: Option<&str>,
 ) -> Result<ExitCode, String> {
-    let new_key = parse_hex(new_key_hex)?;
-
     let alg = if let Some(a) = alg_arg {
         match a.to_ascii_lowercase().as_str() {
             "tdes" | "3des" => ALG_TDES,
@@ -493,15 +493,14 @@ pub fn piv_set_mgmt_key(
         ));
     }
 
-    let (old_key, old_alg) = if let Some(hex) = old_key_hex {
-        let k = parse_hex(hex)?;
+    let (old_key, old_alg) = if let Some(k) = old_key {
         let o_alg = match k.len() {
             16 => ALG_AES128,
             24 => ALG_TDES,
             32 => ALG_AES256,
             _ => return Err(format!("invalid old key length {} bytes", k.len())),
         };
-        (k, o_alg)
+        (k.to_vec(), o_alg)
     } else {
         (DEFAULT_MGMT_KEY.to_vec(), ALG_TDES)
     };
@@ -521,7 +520,7 @@ pub fn piv_set_mgmt_key(
     // APDU: 00 FF FF FF <alg> 9B <len> <new_key>
     let mut apdu = Vec::with_capacity(7 + new_key.len());
     apdu.extend_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, alg, 0x9B, new_key.len() as u8]);
-    apdu.extend_from_slice(&new_key);
+    apdu.extend_from_slice(new_key);
 
     let mut rapdu_buf = [0; MAX_BUFFER_SIZE];
     let rapdu = card

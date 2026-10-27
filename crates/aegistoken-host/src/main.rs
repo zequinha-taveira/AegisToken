@@ -9,6 +9,7 @@ mod card;
 mod cli;
 mod framing;
 mod piv_cmd;
+mod secret;
 mod transport;
 
 use std::process::ExitCode;

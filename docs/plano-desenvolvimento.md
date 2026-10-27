@@ -50,10 +50,10 @@ O foco deste plano é guiar a transição de um firmware validado em bancada par
   - Crate **`x509-cert`** v0.3.0 e **`der`** v0.8.2 (RustCrypto, `MIT OR Apache-2.0`) adicionados às dependências do workspace e do `aegistoken-host`.
   - Módulo `crates/aegistoken-host/src/piv_cmd.rs` implementado com:
     - `piv-list [READER]`: varredura dos slots 9A, 9C, 9D e 9E com extração do objeto `53` / `70` e decodificação estruturada do certificado X.509 (Subject, Issuer, Serial, Validade NotBefore/NotAfter, Algoritmo da chave pública e tamanho).
-    - `piv-import-cert <SLOT> <CERT_FILE> [READER]`: importação de certificados X.509 (suporta arquivos PEM e DER binários), validação ASN.1 prévia, autenticação de Management Key e gravação via `PUT DATA`.
-    - `piv-set-mgmt-key <NEW_KEY_HEX> [READER]`: substituição da chave de gestão com suporte a 3DES (24B), AES-128 (16B), AES-192 (24B) e AES-256 (32B) via protocolo Yubico extension `SET MANAGEMENT KEY`.
+    - `piv-import-cert <SLOT> <CERT_FILE> [READER] [--key-stdin]`: importação de certificados X.509 (suporta arquivos PEM e DER binários), validação ASN.1 prévia, autenticação de Management Key e gravação via `PUT DATA`. A chave de gestão não padrão entra por stdin (`--key-stdin`), nunca em `argv`.
+    - `piv-set-mgmt-key [--reader SUBSTR] [--alg ALG] [--key-stdin [--old-key-stdin]]`: substituição da chave de gestão com suporte a 3DES (24B), AES-128 (16B), AES-192 (24B) e AES-256 (32B) via protocolo Yubico extension `SET MANAGEMENT KEY`. A chave nunca vem em `argv`: entra por prompt oculto (TTY) ou por stdin (`--key-stdin`/`--old-key-stdin`, com pipe).
     - Autenticação de Management Key (`authenticate_mgmt`) implementada via desafio e decifragem de nonce ECB (3DES e AES).
-  - 4 novos testes unitários adicionados cobrindo resolução de slots PIV, extração de TLV de certificado, decifragem TDES/AES e parsing de certificados PEM/DER. Total de 15 testes aprovados no `aegistoken-host`.
+  - 4 novos testes unitários adicionados cobrindo resolução de slots PIV, extração de TLV de certificado, decifragem TDES/AES e parsing de certificados PEM/DER. Total de 15 testes aprovados no `aegistoken-host` naquela etapa (hoje 33 no crate).
 - **Etapa 2.4: Gestão de Contas OATH/TOTP — [CONCLUÍDA]**
   - Subcomando `aegistoken-host oath` implementado em `crates/aegistoken-host/src/oath_cmd.rs`:
     - `oath list`: listar contas configuradas.

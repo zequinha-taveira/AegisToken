@@ -276,6 +276,27 @@ Opções globais: `--vid`/`--pid` (padrão `0x1209:0x0001`), `--interface N` e
 VID/PID da placa (ex.: `--vid 0x2E8A --pid 0x10B0`); rode
 `cargo run -p aegistoken-host -- --help` para a lista completa de comandos.
 
+**Segredos nunca vão em `argv`.** A linha de comando é visível para outros
+processos locais (`ps`, `/proc/<pid>/cmdline`, Gerenciador de Tarefas, WMI) e
+fica no histórico do shell. A chave de gestão PIV entra por prompt oculto (quando
+o stdin é um terminal) ou por pipe:
+
+```powershell
+# interativo: prompt oculto (nova chave, confirmação e chave atual)
+cargo run -p aegistoken-host -- piv-set-mgmt-key
+
+# automação: uma linha por chave, sem eco
+Get-Content new-key.txt | cargo run -p aegistoken-host -- piv-set-mgmt-key --key-stdin
+Get-Content keys.txt    | cargo run -p aegistoken-host -- piv-set-mgmt-key --key-stdin --old-key-stdin
+Get-Content key.txt     | cargo run -p aegistoken-host -- piv-import-cert 9A cert.pem --key-stdin
+```
+
+`--key`/`--old-key` são **recusados** (exit 1) com mensagem que não ecoa o
+valor. O filtro de leitor do `piv-set-mgmt-key` é `--reader <SUBSTR>`. Se uma
+chave já passou por `argv`, rotacione-a e limpe o histórico do shell. Apague os
+arquivos de segredo depois do uso e prefira o prompt ou um gerenciador de
+segredos.
+
 ## Validação
 
 ```powershell
@@ -289,7 +310,9 @@ python scripts/set_pin.py               # define/altera o PIN do clientPIN
 ```
 
 Os scripts imprimem `[PASS]/[FAIL]` por critério (AC) e retornam código de saída
-diferente de zero em falha. No Windows, a interface FIDO é reivindicada pelo
+diferente de zero em falha. `set_pin.py` usa prompt oculto por padrão e
+`--pin-stdin`/`--old-pin-stdin` para automação; `--pin`/`--old-pin` em `argv`
+são recusados (exit 2). No Windows, a interface FIDO é reivindicada pelo
 driver `fidohid`, que a mantém com exclusividade; veja
 [`validation.md`](validation.md) para as opções de acesso (WebAuthn no navegador
 ou remapeamento para o driver HID genérico).

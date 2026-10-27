@@ -64,6 +64,12 @@ O projeto AegisToken adota licenciamento duplo permissivo:
 
 > **Nota sobre licenças:** bibliotecas como `slint` possuem licença GPLv3/Comercial e devem ser **evitadas** para não conflitar com a política permissiva do AegisToken.
 
+### 2.6. CLI e Aquisição de Segredos
+
+| Crate | Licença | Maturidade / Status | Uso recomendado no AegisToken |
+|---|---|---|---|
+| **`rpassword`** | `Apache-2.0` | Madura e pequena (dependência `rtoolbox`). | **Atual (host-only)** - Prompt de senha sem eco no terminal para o `aegistoken-host`. Entra apenas no crate de host; nunca no workspace de firmware (`aegis-core`/`aegis-applets` continuam `no_std`). Segredos não são aceitos em `argv`; o canal de automação é stdin. |
+
 ---
 
 ## 3. Ecossistema Python

@@ -669,6 +669,23 @@ Opções globais: `--vid`/`--pid` (padrão `0x1209:0x0001`), `--interface N`
 `validate` roda a mesma bateria do `validate_management.py` e retorna código de
 saída diferente de zero em caso de falha.
 
+Comandos PIV que autenticam com a chave de gestão nunca recebem a chave em
+`argv` (exit 1 se tentar):
+
+```powershell
+# interativo: prompt oculto (nova chave duas vezes, depois a atual; vazio = padrão NIST)
+cargo run -p aegistoken-host -- piv-set-mgmt-key [--reader SUBSTR] [--alg ALG]
+
+# automação: uma linha por chave, nova primeiro e atual depois
+Get-Content new-key.txt | cargo run -p aegistoken-host -- piv-set-mgmt-key --key-stdin
+Get-Content keys.txt    | cargo run -p aegistoken-host -- piv-set-mgmt-key --key-stdin --old-key-stdin
+Get-Content key.txt     | cargo run -p aegistoken-host -- piv-import-cert 9A cert.pem --key-stdin
+```
+
+`--key-stdin`/`--old-key-stdin` exigem pipe (recusam TTY), e a chave do import é
+validada em 16/24/32 bytes **antes** de abrir o PC/SC. Apague o arquivo de
+segredo depois do uso; prefira o prompt ou um gerenciador de segredos.
+
 > **Sem WinUSB:** o `aegistoken-host` não instala nem usa driver WinUSB. No
 > Windows o libusb usa o **backend HID** (`hid.dll` + `CreateFile`/`ReadFile`
 > sobre o driver HID inbox); o nome `windows_winusb.c` no libusb é apenas o
@@ -707,13 +724,26 @@ e veja a linha `last FIDO command=0x.. status=0x.. (nome)`.
 Para criar/alterar o PIN diretamente (após liberar a interface FIDO):
 
 ```powershell
-python scripts/set_pin.py            # define o PIN (interativo)
-python scripts/set_pin.py --change   # troca o PIN (interativo)
+python scripts/set_pin.py            # define o PIN (prompt oculto)
+python scripts/set_pin.py --change   # troca o PIN (prompt oculto, atual e novo)
 python scripts/set_pin.py --retries  # tentativas restantes
-# não-interativo:
-python scripts/set_pin.py --set --pin 123456
-python scripts/set_pin.py --change --old-pin 123456 --pin 654321
+# não-interativo (stdin, nunca argv):
+python scripts/set_pin.py --set --pin-stdin < pin.txt
+python scripts/set_pin.py --change --old-pin-stdin --pin-stdin < pins.txt
 ```
+
+`--pin`/`--old-pin` são **recusados** com código 2 e mensagem que não ecoa o
+valor; `--change` por stdin exige os dois flags (PIN atual primeiro, depois o
+novo). Sem flags e sem TTY, o script falha em vez de prompt/eco. Se um PIN já
+passou por `argv`, troque-o e limpe o histórico do shell. Apague o arquivo de
+PIN depois do uso; prefira o prompt ou um gerenciador de segredos.
+
+**Smoke manual do prompt oculto (TTY real, sem placa):** rode
+`cargo run -p aegistoken-host -- piv-set-mgmt-key` e
+`python scripts/set_pin.py --set` num terminal e confirme que os caracteres
+digitados **não aparecem** na tela. Este passo é manual porque exige um TTY
+interativo; a decisão de fonte e a ausência de eco por `argv`/stdin são cobertas
+pelos testes automatizados (AC-034).
 
 ## Acesso cross-platform ao USB
 
@@ -846,6 +876,7 @@ acessível via `hidraw`.
 | AC-031 | OATH: `RESET` fail-closed (erase persistido antes da limpeza da RAM; recusa de gravação → `6A84` com credenciais/access code/flags intactos; uma escrita por comando, sem `save_state`; `pending` descartado nos dois caminhos; `P1`/`P2` fora de `DE AD` → `6D00` sem store) | Testes de host `aegis-applets::oath` (fatia `specs/oath-reset-fail-closed.md`) + `docs/security-model.md` | **Verificado em host** (7 testes novos); indução de falha de flash em hardware pendente (`validate_oath.py` não simula flash doente) |
 | AC-032 | OATH: leitura fail-closed (`OathStore::load` distingue `Some(0)` de `None`; `SealedOathStore` mapeia `Err → None`; falha de leitura ou blob recusado fecha o applet → `6F00` em todo comando de estado com RAM normalizada; `SELECT` retenta e segue `9000` sem bloco de access code; `RESET` é a exceção fail-open deliberada e continua fail-closed no `6A84`) | Testes de host `aegis-applets::oath`/`sealed` (fatia `specs/oath-load-fail-closed.md`) + `docs/security-model.md` | **Verificado em host** (9 testes novos); indução de falha de flash em hardware pendente (`validate_oath.py` não simula flash doente) |
 | AC-033 | OATH: presença pendente com bound e desarme na mutação (`confirm_presence` valida o índice de `pending` contra o `len` antes de indexar → `6985` colapsado no "sem pedido" — sem panic e sem código de outra credencial; `PUT`/`DELETE` desarmam incondicionalmente na entrada, inclusive nas recusas `6982`/`6984`/`6A80`/`6A84`; `CALCULATE ALL` não altera o conjunto e não desarma; sem SW novo e sem estado persistido novo) | Testes de host `aegis-applets::oath` (fatia `specs/oath-pending-bounds.md`) + `docs/security-model.md` | **Verificado em host** (5 testes novos, **259** no crate); sem pendência física — o interleaving não é alcançável pelo loop CCID atual (`Card::poll` serializa presença) e `validate_oath.py` não muda |
+| AC-034 | Host: segredo nunca em `argv` (`aegistoken-host` recusa `--key`/`--old-key` e posicional do `piv-set-mgmt-key` sem ecoar o valor; canais são prompt oculto em TTY ou `--key-stdin`/`--old-key-stdin` por pipe; `--change` exige os dois flags, PIN atual primeiro; `set_pin.py` recusa `--pin`/`--old-pin` e posicional, exige TTY sem flags, e redige segredos na mensagem de erro; `--help` vence qualquer flag de segredo sem ler nem ecoar) | Testes de host `aegistoken-host::cli`/`secret` (18 novos) e Python `tests/test_set_pin_args.py` (20) + `specs/host-secrets-not-in-argv.md` | **Verificado em host** (host 33 testes, Python 20); prompt oculto real é smoke manual em TTY (documentado acima); sem dependência de hardware |
 
 ### Fases 7e — credential management e `changePIN` (host; hardware pendente)
 
@@ -1326,3 +1357,9 @@ A validação com um cliente real revelou dois bugs de transporte, já corrigido
   Keygen probabilístico (Miller-Rabin 12 rounds, sem certificação FIPS);
   setup de Montgomery sobre módulos secretos e índice do scan de unpad são
   canais laterais residuais documentados em `crates/aegis-applets/src/rsa.rs`.
+- **Segredos de host (AC-034):** a política vale para segredos ainda não
+  expostos. Um PIN/chave que já passou por `argv` **não é apagado** do histórico
+  do shell nem de logs do SO: rotacione o segredo e limpe o histórico. Ficam
+  como follow-up `validate_fido.py --pin` (validador de hardware ainda aceita
+  `--pin` em `argv`) e `oath_cmd.rs` (fora da compilação, 15 testes não
+  executados).
