@@ -380,6 +380,12 @@ defeats the on-device protections. The host tools follow these rules:
   before any secret is touched, so `--help --pin <value>` prints the usage
   without reading or echoing the value; the Rust CLI rejects a secret option at
   parse time even when `--help` is also present (it never reaches a prompt).
+- **The OATH URI is a secret carrier too.** An `otpauth://` URI contains the
+  shared `secret=`, so `aegistoken-host oath add` accepts it only from
+  `--uri-stdin` (pipe) or the hidden prompt, refuses a positional URI without
+  echoing it, and the parser reports the shape of an invalid URI or Base32
+  input without echoing the value or a character of it. `OtpAuthCredential` has
+  no `Debug` implementation, so the decoded secret cannot be printed by `{:?}`.
 - **A leaked secret is rotated, not deprecated.** There is no compatibility
   opt-in for argv secrets: the only remediation is to rotate the exposed key
   or PIN and clear the shell history. The `rpassword` dependency is

@@ -53,13 +53,13 @@ O foco deste plano é guiar a transição de um firmware validado em bancada par
     - `piv-import-cert <SLOT> <CERT_FILE> [READER] [--key-stdin]`: importação de certificados X.509 (suporta arquivos PEM e DER binários), validação ASN.1 prévia, autenticação de Management Key e gravação via `PUT DATA`. A chave de gestão não padrão entra por stdin (`--key-stdin`), nunca em `argv`.
     - `piv-set-mgmt-key [--reader SUBSTR] [--alg ALG] [--key-stdin [--old-key-stdin]]`: substituição da chave de gestão com suporte a 3DES (24B), AES-128 (16B), AES-192 (24B) e AES-256 (32B) via protocolo Yubico extension `SET MANAGEMENT KEY`. A chave nunca vem em `argv`: entra por prompt oculto (TTY) ou por stdin (`--key-stdin`/`--old-key-stdin`, com pipe).
     - Autenticação de Management Key (`authenticate_mgmt`) implementada via desafio e decifragem de nonce ECB (3DES e AES).
-  - 4 novos testes unitários adicionados cobrindo resolução de slots PIV, extração de TLV de certificado, decifragem TDES/AES e parsing de certificados PEM/DER. Total de 15 testes aprovados no `aegistoken-host` naquela etapa (hoje 33 no crate).
+  - 4 novos testes unitários adicionados cobrindo resolução de slots PIV, extração de TLV de certificado, decifragem TDES/AES e parsing de certificados PEM/DER. Total de 15 testes aprovados no `aegistoken-host` naquela etapa (hoje 60 no crate).
 - **Etapa 2.4: Gestão de Contas OATH/TOTP — [CONCLUÍDA]**
   - Subcomando `aegistoken-host oath` implementado em `crates/aegistoken-host/src/oath_cmd.rs`:
-    - `oath list`: listar contas configuradas.
-    - `oath code <nome>`: calcular código TOTP (timestamp do host).
-    - `oath add <uri>`: cadastrar novas credenciais TOTP/HOTP a partir de URIs `otpauth://`.
-    - `oath delete <nome>` e `oath reset`: remover credencial / reiniciar o applet.
+    - `oath list [--reader SUBSTR]`: listar contas configuradas.
+    - `oath code <nome> [--reader SUBSTR]`: calcular código TOTP (timestamp do host).
+    - `oath add [--uri-stdin] [--reader SUBSTR]`: cadastrar credenciais TOTP/HOTP a partir de URIs `otpauth://`; a URI contém o segredo (`secret=`) e entra por stdin/prompt oculto, nunca em `argv` (positional recusado sem eco).
+    - `oath delete <nome> [--reader SUBSTR]` e `oath reset [--reader SUBSTR]`: remover credencial / reiniciar o applet.
   - Parsing de `otpauth://` coberto por testes de host no crate `aegistoken-host`.
 - **Etapa 2.5: Avaliação do `nusb` para eliminação de dependências C**
   - Avaliar a substituição do `rusb` (que compila a `libusb` C) pelo **`nusb`** (Rust puro, MIT OR Apache-2.0), simplificando cross-compilação e empacotamento em Windows/Linux/macOS sem toolchains C adicionais.

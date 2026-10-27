@@ -686,6 +686,21 @@ Get-Content key.txt     | cargo run -p aegistoken-host -- piv-import-cert 9A cer
 validada em 16/24/32 bytes **antes** de abrir o PC/SC. Apague o arquivo de
 segredo depois do uso; prefira o prompt ou um gerenciador de segredos.
 
+Os comandos OATH (`oath list|code|add|delete|reset`) usam PC/SC e a mesma
+política. A URI `otpauth://` do `oath add` contém o segredo compartilhado
+(`secret=`), então nunca entra em `argv`:
+
+```powershell
+cargo run -p aegistoken-host -- oath add                      # prompt oculto (TTY)
+Get-Content otpauth.txt | cargo run -p aegistoken-host -- oath add --uri-stdin
+cargo run -p aegistoken-host -- oath list --reader Aegis
+cargo run -p aegistoken-host -- oath code "30/Example:alice" --reader Aegis
+```
+
+`oath add <URI>` posicional é recusado sem ecoar o valor; `--uri-stdin` exige
+pipe (recusa TTY) e só vale para `oath add`. O filtro de leitor é `--reader`
+(também em `piv-set-mgmt-key`), nunca um positional.
+
 > **Sem WinUSB:** o `aegistoken-host` não instala nem usa driver WinUSB. No
 > Windows o libusb usa o **backend HID** (`hid.dll` + `CreateFile`/`ReadFile`
 > sobre o driver HID inbox); o nome `windows_winusb.c` no libusb é apenas o
@@ -877,6 +892,7 @@ acessível via `hidraw`.
 | AC-032 | OATH: leitura fail-closed (`OathStore::load` distingue `Some(0)` de `None`; `SealedOathStore` mapeia `Err → None`; falha de leitura ou blob recusado fecha o applet → `6F00` em todo comando de estado com RAM normalizada; `SELECT` retenta e segue `9000` sem bloco de access code; `RESET` é a exceção fail-open deliberada e continua fail-closed no `6A84`) | Testes de host `aegis-applets::oath`/`sealed` (fatia `specs/oath-load-fail-closed.md`) + `docs/security-model.md` | **Verificado em host** (9 testes novos); indução de falha de flash em hardware pendente (`validate_oath.py` não simula flash doente) |
 | AC-033 | OATH: presença pendente com bound e desarme na mutação (`confirm_presence` valida o índice de `pending` contra o `len` antes de indexar → `6985` colapsado no "sem pedido" — sem panic e sem código de outra credencial; `PUT`/`DELETE` desarmam incondicionalmente na entrada, inclusive nas recusas `6982`/`6984`/`6A80`/`6A84`; `CALCULATE ALL` não altera o conjunto e não desarma; sem SW novo e sem estado persistido novo) | Testes de host `aegis-applets::oath` (fatia `specs/oath-pending-bounds.md`) + `docs/security-model.md` | **Verificado em host** (5 testes novos, **259** no crate); sem pendência física — o interleaving não é alcançável pelo loop CCID atual (`Card::poll` serializa presença) e `validate_oath.py` não muda |
 | AC-034 | Host: segredo nunca em `argv` (`aegistoken-host` recusa `--key`/`--old-key` e posicional do `piv-set-mgmt-key` sem ecoar o valor; canais são prompt oculto em TTY ou `--key-stdin`/`--old-key-stdin` por pipe; `--change` exige os dois flags, PIN atual primeiro; `set_pin.py` recusa `--pin`/`--old-pin` e posicional, exige TTY sem flags, e redige segredos na mensagem de erro; `--help` vence qualquer flag de segredo sem ler nem ecoar) | Testes de host `aegistoken-host::cli`/`secret` (18 novos) e Python `tests/test_set_pin_args.py` (20) + `specs/host-secrets-not-in-argv.md` | **Verificado em host** (host 33 testes, Python 20); prompt oculto real é smoke manual em TTY (documentado acima); sem dependência de hardware |
+| AC-035 | Host OATH: `oath_cmd` declarado em `main.rs` e testado; `oath list|code|add|delete|reset` no CLI; a URI `otpauth://` (segredo `secret=`) nunca entra em `argv` — `oath add` recusa positional sem eco, entra por `--uri-stdin` (pipe) ou prompt oculto (TTY); `--reader` vale para `oath`/`piv-set-mgmt-key` e `--uri-stdin` só para `oath add`; parser não ecoa URI nem caractere Base32 e `OtpAuthCredential` não deriva `Debug` | Testes de host `aegistoken-host::oath_cmd`/`cli` (13 novos + 14 do módulo antes não executados; 60 no crate) + `specs/oath-cli-wiring.md` | **Verificado em host** (60 testes; antes 33); execução em hardware pendente (sem leitor PC/SC) |
 
 ### Fases 7e — credential management e `changePIN` (host; hardware pendente)
 
@@ -1357,9 +1373,9 @@ A validação com um cliente real revelou dois bugs de transporte, já corrigido
   Keygen probabilístico (Miller-Rabin 12 rounds, sem certificação FIPS);
   setup de Montgomery sobre módulos secretos e índice do scan de unpad são
   canais laterais residuais documentados em `crates/aegis-applets/src/rsa.rs`.
-- **Segredos de host (AC-034):** a política vale para segredos ainda não
-  expostos. Um PIN/chave que já passou por `argv` **não é apagado** do histórico
-  do shell nem de logs do SO: rotacione o segredo e limpe o histórico. Ficam
-  como follow-up `validate_fido.py --pin` (validador de hardware ainda aceita
-  `--pin` em `argv`) e `oath_cmd.rs` (fora da compilação, 15 testes não
-  executados).
+- **Segredos de host (AC-034/AC-035):** a política vale para segredos ainda não
+  expostos. Um PIN/chave/URI que já passou por `argv` **não é apagado** do
+  histórico do shell nem de logs do SO: rotacione o segredo e limpe o histórico.
+  O `oath_cmd.rs` foi declarado no binário e os segredos OATH migraram para
+  stdin/prompt (AC-035). Fica como follow-up `validate_fido.py --pin` (validador
+  de hardware ainda aceita `--pin` em `argv`).

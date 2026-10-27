@@ -297,6 +297,25 @@ chave já passou por `argv`, rotacione-a e limpe o histórico do shell. Apague o
 arquivos de segredo depois do uso e prefira o prompt ou um gerenciador de
 segredos.
 
+A URI `otpauth://` do `oath add` também carrega o segredo compartilhado
+(`secret=`), então nunca entra em `argv`:
+
+```powershell
+# interativo: prompt oculto
+cargo run -p aegistoken-host -- oath add
+
+# automação: a URI vem por stdin (pipe)
+Get-Content otpauth.txt | cargo run -p aegistoken-host -- oath add --uri-stdin
+
+# os demais subcomandos usam --reader, não um positional ambíguo
+cargo run -p aegistoken-host -- oath list --reader Aegis
+cargo run -p aegistoken-host -- oath code "30/Example:alice" --reader Aegis
+```
+
+`oath add <URI>` posicional é **recusado** sem ecoar o valor; `--uri-stdin` só
+vale para `oath add` e exige pipe (recusa TTY). `--reader` vale para `oath` e
+`piv-set-mgmt-key`.
+
 ## Validação
 
 ```powershell

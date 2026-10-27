@@ -1634,19 +1634,16 @@ linha de comando (`aegistoken-host`) e estruturando a base tecnológica do futur
 
 **Pendências e próximos passos**
 
-- **Etapa 2.4 entregue:** subcomando OATH/TOTP no CLI (`oath list|code|add|delete|reset`
-  em `crates/aegistoken-host/src/oath_cmd.rs`, com parsing de `otpauth://` e testes de
-  host).
+- **Etapa 2.4 entregue:** subcomando OATH/TOTP no CLI (`oath list|code|add|delete|reset`)
+  com `crates/aegistoken-host/src/oath_cmd.rs` declarado em `main.rs` e coberto por
+  16 testes. A URI `otpauth://` do `oath add` nunca entra em `argv`: vem de
+  `--uri-stdin` (pipe) ou prompt oculto (TTY), e o positional é recusado sem eco;
+  `--reader` vale para `oath`/`piv-set-mgmt-key` (fatia `specs/oath-cli-wiring.md`).
 - **Etapa 2.5:** Avaliação do `nusb`.
 - **Follow-up da fatia host-secrets:** `scripts/validate_fido.py` ainda aceita
   `--pin` em `argv` (preservado nesta fatia por ser o validador de hardware e
   não um exemplo novo). Migrar para `--pin-stdin`/prompt na mesma disciplina do
   `set_pin.py` e atualizar `validation.md`/`roadmap.md` junto.
-- **Follow-up da fatia host-secrets (OATH):** `crates/aegistoken-host/src/oath_cmd.rs`
-  continua fora do binário (não declarado em `main.rs`), então seus 15 testes não
-  rodam e a política de segredo fora de `argv` ainda não foi aplicada ao
-  `oath add`/`oath delete`. Declarar o módulo, migrar os segredos e cobrir com
-  testes (`specs/host-secrets-not-in-argv.md` §5.2).
 - **Eixo 3:** Protótipo do Desktop Manager em Rust (`tauri` v2).
 
 **Critério de saída**
