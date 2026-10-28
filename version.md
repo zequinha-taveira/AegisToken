@@ -35,6 +35,9 @@ O artefato de release é publicado automaticamente pelo workflow
 
 ## Histórico de releases
 
+O histórico completo (artefatos, destaques e canais nightly) está em
+[`CHANGELOG.md`](CHANGELOG.md). Resumo:
+
 | Versão | Tag | Data | Artefato | Status |
 |--------|-----|------|----------|--------|
 | 0.2.1 | `v0.2.1` | 2026-09-17 | `AegisToken-0.2.1.uf2` | Latest |
@@ -42,7 +45,9 @@ O artefato de release é publicado automaticamente pelo workflow
 | 0.1 | `v0.1` | 2026-09-11 | `AegisToken_pico2-0.1.uf2` | Superseded |
 | 0.0 | `v0.0` | 2026-09-11 | `AegisToken_pico2-0.0.uf2` | Pre-release |
 
-> A versão compilada no binário é a do `Cargo.toml` (`0.2.1`).
+> A versão compilada no binário é a do `Cargo.toml` (`0.2.1`). Ao lançar uma
+> nova release, atualize este resumo e o detalhe correspondente no
+> `CHANGELOG.md`.
 
 ## Compatibilidade e anti-rollback
 

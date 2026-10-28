@@ -344,6 +344,7 @@ ou remapeamento para o driver HID genérico).
 ## Documentação
 
 - [`docs/MILESTONES.md`](docs/MILESTONES.md) — plano de marcos (M1..M6), capacidades da chave de segurança e cronograma de entrega.
+- [`CHANGELOG.md`](CHANGELOG.md) — histórico de releases (v0.0…v0.2.1, canais nightly).
 - [`docs/status.json`](docs/status.json) — base de dados canônica em JSON com status e progresso do ecossistema.
 - [`roadmap.md`](roadmap.md) — fases do projeto, decisões arquiteturais e status.
 - [`validation.md`](validation.md) — matriz AC-001..AC-021, evidências e
