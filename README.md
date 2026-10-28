@@ -190,9 +190,11 @@ são testados no host. A HAL atual permanece isolada em `board-generic-rp2350`.
 - [`probe-rs`](https://probe.rs) — flash e RTT.
 - [`picotool`](https://github.com/raspberrypi/picotool) **>= 2.0** — conversão de
   UF2 (`uf2 convert`, imagens RP2350) e `picotool info`. O
-  `scripts/build-uf2.ps1` resolve o binário antes de compilar e falha se ele
-  faltar ou for 1.x; use a variável `PICOTOOL` para apontar o caminho completo
-  quando ele não estiver no PATH.
+  `scripts/build-uf2.ps1` resolve o conversor antes de compilar e falha se
+  nenhum servir; sem picotool 2.x ele cai para o
+  [`elf2uf2-rs`](https://github.com/JoNil/elf2uf2-rs) compilado do git (a versão
+  publicada 2.2.0 só conhece RP2040). Use `PICOTOOL`/`ELF2UF2` para apontar o
+  caminho completo quando a ferramenta não estiver no PATH.
 - Python 3 com `fido2`, `hidapi`, `cbor2` e `pyscard` para os scripts de
   validação.
 

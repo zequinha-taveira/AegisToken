@@ -30,8 +30,9 @@ do MVP em hardware RP2350A (e depois RP2350B).
 
 - `probe-rs` — flash e RTT (`probe-rs run --chip RP2350`).
 - `picotool` **>= 2.0** — conversão de UF2 (`uf2 convert`, imagens RP2350) e
-  `picotool info` (valida imagem RP2350); `scripts/build-uf2.ps1` falha antes de
-  compilar se faltar ou for 1.x, e aceita `PICOTOOL` com o caminho completo.
+  `picotool info` (valida imagem RP2350); `scripts/build-uf2.ps1` resolve o
+  conversor antes de compilar e, sem picotool 2.x, usa o `elf2uf2-rs` do git
+  (`--family rp2350-arm-s`); `PICOTOOL`/`ELF2UF2` aceitam o caminho completo.
 - `python-fido2` — validação FIDO2/U2F (`scripts/validate_fido.py`).
 - `hidapi` + `cbor2` — validação do Management HID (`scripts/validate_management.py`).
 - `pcsc_transport` (embutido, MIT OR Apache-2.0, ou `pyscard` como fallback) — validação CCID/ISO 7816 dos applets (`scripts/validate_ccid.py`).
@@ -1157,9 +1158,11 @@ real do build (a spec é `specs/release-requires-vendor-key.md`):
 | `& scripts/build-uf2.ps1 -Release` sem a chave | **falha antes** de compilar |
 | `& scripts/build-uf2.ps1 -Release` com chave malformada ou com a chave DEV | **falha antes** de compilar (mesma política do `build.rs`, via `vendor-key-check`) |
 | `& scripts/build-uf2.ps1 -Release` com chave válida | compila, gera o UF2 e restaura `AEGIS_RELEASE` no shell |
-| `& scripts/build-uf2.ps1` sem `picotool` no PATH | **falha antes** de compilar (`picotool not found …`) |
-| `& scripts/build-uf2.ps1` com `picotool` 1.x | **falha antes** de compilar (`picotool >= 2.0 is required …`) |
-| `picotool` que retorna 0 sem gravar o UF2 | **falha** (`… is older than …`), nunca reporta `Wrote` |
+| `& scripts/build-uf2.ps1` sem `picotool` e com `elf2uf2-rs` (git) | usa o fallback e gera o UF2 com family `rp2350-arm-s` |
+| `& scripts/build-uf2.ps1` sem `picotool` e sem `elf2uf2-rs` | **falha antes** de compilar (`no UF2 converter found …`) |
+| `PICOTOOL` explícito apontando para 1.x | **falha antes** de compilar (`PICOTOOL is set but unusable …`) |
+| `elf2uf2-rs` publicado (2.2.0, só RP2040) | **falha antes** de compilar (`does not support 'rp2350-arm-s' …`) |
+| conversor que retorna 0 sem gravar o UF2 | **falha** (`… is older than …`), nunca reporta `Wrote` |
 | Job de release do CI | tags versionadas compilam com `-Release`; nightlies seguem em modo de desenvolvimento |
 
 **Limitação:** o gate é opt-in por variável de ambiente/`-Release`; builds de

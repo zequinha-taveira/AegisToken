@@ -28,9 +28,11 @@
 # Without it the script builds a development image, which is not safe to ship.
 #
 # UF2 conversion needs picotool >= 2.0 (`uf2 convert` and RP2350 images do not
-# exist in 1.x). The script resolves picotool before compiling and fails when it
-# is missing or too old, so it can never print `Wrote ...` for a stale UF2 left
-# by a previous build. Set PICOTOOL to the full path when it is not on PATH.
+# exist in 1.x). The script resolves a converter before compiling and fails when
+# none is usable, so it can never print `Wrote ...` for a stale UF2 left by a
+# previous build. When picotool is absent or too old it falls back to elf2uf2-rs
+# built from git (the published 2.2.0 is RP2040-only). Set PICOTOOL or ELF2UF2
+# to the full path when the tool is not on PATH.
 
 param(
     [ValidateSet("universal", "rp2350a", "rp2350b", "rp2354a", "rp2354b")]
@@ -45,22 +47,49 @@ if ($BoardProfile -eq "yubikey5-lab") {
     Write-Warning "yubikey5-lab uses Yubico VID 0x1050 / PID 0x0407 (OTP+FIDO+CCID). Its OTP HID is experimental, not compatible with Yubico OTP / ykman otp. Authorized lab only; do not distribute."
 }
 
-# Resolve picotool and its version up front: a missing or 1.x binary would
-# otherwise be discovered only after the firmware build, and a failed native
-# command does not set $LASTEXITCODE, so the old check could report success
-# while leaving a stale UF2 in place.
+# Resolve a UF2 converter up front: a missing or 1.x tool would otherwise be
+# discovered only after the firmware build, and a failed native command does
+# not set $LASTEXITCODE, so an old check could report success while leaving a
+# stale UF2 in place. picotool >= 2.0 is preferred (`uf2 convert` and RP2350
+# support); the fallback is elf2uf2-rs built from git, because the published
+# 2.2.0 only knows RP2040. Set PICOTOOL/ELF2UF2 to use a binary outside PATH.
+$family = "rp2350-arm-s"
+$picotoolProblem = $null
 $picotool = if ($env:PICOTOOL) { $env:PICOTOOL } else { "picotool" }
 $picotoolCmd = Get-Command $picotool -CommandType Application -ErrorAction SilentlyContinue
 if (-not $picotoolCmd) {
-    throw ("picotool not found: install picotool >= 2.0 and put it on PATH, or set " +
-        "PICOTOOL to its full path. UF2 conversion of RP2350 images requires >= 2.0.")
+    $picotoolProblem = "picotool not found"
+} else {
+    $picotool = $picotoolCmd.Source
+    $picotoolVersion = (& $picotool version | Out-String)
+    $picotoolMatch = [regex]::Match($picotoolVersion, "v(\d+)\.(\d+)")
+    if (-not $picotoolMatch.Success -or [int]$picotoolMatch.Groups[1].Value -lt 2) {
+        $picotoolProblem = "picotool >= 2.0 is required for 'uf2 convert' and RP2350 images; found: " +
+            $picotoolVersion.Trim()
+    }
 }
-$picotool = $picotoolCmd.Source
-$picotoolVersion = (& $picotool version | Out-String)
-$picotoolMatch = [regex]::Match($picotoolVersion, "v(\d+)\.(\d+)")
-if (-not $picotoolMatch.Success -or [int]$picotoolMatch.Groups[1].Value -lt 2) {
-    throw ("picotool >= 2.0 is required for 'uf2 convert' and RP2350 images; found: " +
-        $picotoolVersion.Trim())
+
+$converter = $null
+if (-not $picotoolProblem) {
+    $converter = "picotool"
+} elseif ($env:PICOTOOL) {
+    # An explicit PICOTOOL is a configuration decision: do not silently switch.
+    throw ("PICOTOOL is set but unusable: " + $picotoolProblem)
+} else {
+    $elf2uf2 = if ($env:ELF2UF2) { $env:ELF2UF2 } else { "elf2uf2-rs" }
+    $elf2uf2Cmd = Get-Command $elf2uf2 -CommandType Application -ErrorAction SilentlyContinue
+    if (-not $elf2uf2Cmd) {
+        throw ("no UF2 converter found: " + $picotoolProblem + "; elf2uf2-rs is not on PATH " +
+            "either. Install picotool >= 2.0, or elf2uf2-rs from git (the published 2.2.0 is " +
+            "RP2040-only): cargo install --git https://github.com/JoNil/elf2uf2-rs elf2uf2-rs")
+    }
+    $elf2uf2 = $elf2uf2Cmd.Source
+    $elf2uf2Help = (& $elf2uf2 convert --help | Out-String)
+    if ($elf2uf2Help -notmatch [regex]::Escape($family)) {
+        throw ("elf2uf2-rs does not support '$family' (RP2350); install the git build with " +
+            "'cargo install --git https://github.com/JoNil/elf2uf2-rs elf2uf2-rs'. " + $picotoolProblem)
+    }
+    $converter = "elf2uf2-rs"
 }
 
 $target = "thumbv8m.main-none-eabihf"
@@ -132,8 +161,13 @@ try {
 }
 
 $LASTEXITCODE = 0
-& $picotool uf2 convert $elf -t elf $out
-if ($LASTEXITCODE -ne 0) { throw "picotool conversion failed ($LASTEXITCODE)" }
+if ($converter -eq "picotool") {
+    & $picotool uf2 convert $elf -t elf $out
+} else {
+    # -v off suppresses the per-block progress bar of elf2uf2-rs.
+    & $elf2uf2 -v off convert -f $family $elf $out
+}
+if ($LASTEXITCODE -ne 0) { throw "$converter conversion failed ($LASTEXITCODE)" }
 $uf2 = Get-Item -LiteralPath $out -ErrorAction SilentlyContinue
 if (-not $uf2) { throw "picotool reported success but $out was not written" }
 if ($uf2.LastWriteTime -lt (Get-Item -LiteralPath $elf).LastWriteTime) {
