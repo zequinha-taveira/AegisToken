@@ -17,8 +17,53 @@ use embassy_time::{Duration, Timer, block_for};
 /// Polling period for the button, in milliseconds.
 const POLL_MS: u64 = 1;
 
-/// INFROM_PAD bit in `IO_QSPI` `GPIO_STATUS`.
-const INFROM_PAD_BIT: u32 = 1 << 17;
+/// QSPI chip-select input bit in `SIO` `GPIO_HI_IN` (RP2350 datasheet §12.1.2).
+///
+/// The RP2350 does not route the QSPI pads to the `IO_QSPI` status register in
+/// a way software can observe: `INFROMPAD` stays zero even while the pad is
+/// driven high. The pad input is only exposed through the single-cycle IO
+/// block's high bank, which observes GPIO32-47, the QSPI pins and the USB pins.
+/// Reading `INFROMPAD` made every boot look like a held BOOTSEL.
+const QSPI_CSN_BIT: u32 = 1 << 27;
+
+/// Input enable bit in the RP2350 `PADS_QSPI` pad control register.
+#[cfg(target_arch = "arm")]
+const PAD_IE: u32 = 1 << 6;
+/// Pull-up enable bit in the RP2350 `PADS_QSPI` pad control register.
+#[cfg(target_arch = "arm")]
+const PAD_PUE: u32 = 1 << 3;
+/// Pull-down enable bit in the RP2350 `PADS_QSPI` pad control register.
+#[cfg(target_arch = "arm")]
+const PAD_PDE: u32 = 1 << 2;
+/// Pad isolation bit in the RP2350 `PADS_QSPI` pad control register.
+#[cfg(target_arch = "arm")]
+const PAD_ISO: u32 = 1 << 8;
+
+/// Pad control value that makes the QSPI chip-select pad readable.
+///
+/// The sampler releases the XIP driver, so the pad floats. Without an input
+/// buffer and a pull-up the released pad reads low, which is indistinguishable
+/// from a pressed BOOTSEL. The isolation bit gates the input path as well.
+#[cfg(target_arch = "arm")]
+#[must_use]
+pub const fn bootsel_pad_ctrl(original: u32) -> u32 {
+    (original | PAD_IE | PAD_PUE) & !(PAD_PDE | PAD_ISO)
+}
+
+/// Configure the QSPI chip-select pad for sampling.
+///
+/// Runs with XIP enabled, before [`read_bootsel_pad`] disables it. The pull-up
+/// is left enabled afterwards: it only matters while the XIP driver is
+/// released, and a defined level on chip select is preferable to a floating
+/// one. BOOTSEL pulls the pad low through a series resistor, so it wins over
+/// the internal pull-up when pressed.
+#[cfg(target_arch = "arm")]
+fn configure_bootsel_pad() {
+    let ctrl = bootsel_pad_ctrl(embassy_rp::pac::PADS_QSPI.gpio(1).read().0);
+    embassy_rp::pac::PADS_QSPI
+        .gpio(1)
+        .write_value(embassy_rp::pac::pads::regs::GpioCtrl(ctrl));
+}
 
 /// An instantaneous, active-low presence button.
 pub trait Button {
@@ -56,6 +101,14 @@ impl Button for GpioButton {
 /// output driver is temporarily released so the BOOTSEL resistor can pull the
 /// pad low, then `INFROM_PAD` is sampled and the control register restored.
 ///
+/// The caller must first run [`configure_bootsel_pad`]: a released pad without
+/// input enable and pull-up floats low and always reads as pressed.
+///
+/// Sample the QSPI chip-select pad with the output driver released.
+///
+/// Returns the `SIO` `GPIO_HI_IN` word in the low half and the `IO_QSPI`
+/// status word in the high half, so the diagnostics can compare both paths.
+///
 /// # Safety
 ///
 /// Must run from RAM (see the link section): flash XIP is disabled for the
@@ -63,48 +116,63 @@ impl Button for GpioButton {
 #[cfg(target_arch = "arm")]
 #[inline(never)]
 #[unsafe(link_section = ".data.ram_func")]
-unsafe fn read_bootsel_pad() -> u32 {
+unsafe fn read_bootsel_pad(ctrl: u32) -> u64 {
     let cs_ptr = embassy_rp::pac::IO_QSPI.gpio(1).as_ptr() as *mut u32;
-    let result: u32;
+    let sio_ptr = embassy_rp::pac::SIO.as_ptr() as *mut u32;
+    let hi: u32;
+    let io: u32;
     // SAFETY: see the function contract; the caller ensures RAM residency and
     // that interrupts are masked.
     unsafe {
         core::arch::asm!(
             ".equiv GPIO_STATUS, 0x0",
-            ".equiv GPIO_CTRL, 0x4",
+            ".equiv GPIO_CTRL,   0x4",
+            ".equiv GPIO_HI_IN,  0x8",
             "ldr {orig}, [{cs}, $GPIO_CTRL]",
-            // OEOVER = DISABLE (0b10 << 14) releases the chip-select output; the
-            // same value doubles as the settle-loop counter.
-            "str {magic}, [{cs}, $GPIO_CTRL]",
+            // Release the output driver for the duration of the sample; the
+            // delay loop lets the pad settle before it is read.
+            "str {ctrl}, [{cs}, $GPIO_CTRL]",
             "2:",
-            "subs {magic}, #8",
+            "subs {count}, #8",
             "bne 2b",
-            "ldr {magic}, [{cs}, $GPIO_STATUS]",
+            "ldr {hi}, [{sio}, $GPIO_HI_IN]",
+            "ldr {io}, [{cs}, $GPIO_STATUS]",
             "str {orig}, [{cs}, $GPIO_CTRL]",
             cs = in(reg) cs_ptr,
+            sio = in(reg) sio_ptr,
+            ctrl = in(reg) ctrl,
             orig = out(reg) _,
-            magic = inout(reg) 0x8000u32 => result,
+            count = inout(reg) 4096u32 => _,
+            hi = out(reg) hi,
+            io = out(reg) io,
             options(nostack),
         );
     }
-    result
+    ((io as u64) << 32) | u64::from(hi)
 }
+
+/// `IO_QSPI` control value that releases the chip-select output driver.
+#[cfg(target_arch = "arm")]
+const OE_RELEASED: u32 = 0b10 << 14;
 
 /// Sample the BOOTSEL button; `true` means pressed.
 #[must_use]
 pub fn bootsel_pressed() -> bool {
     #[cfg(target_arch = "arm")]
-    let status = critical_section::with(|_| {
+    let sample = critical_section::with(|_| {
+        // The pad is configured with XIP still enabled; the sample below runs
+        // from RAM with XIP off.
+        configure_bootsel_pad();
         // SAFETY: the routine is RAM-resident and interrupts are disabled by
         // the critical section, so no flash fetch occurs while XIP is off.
-        unsafe { read_bootsel_pad() }
+        unsafe { read_bootsel_pad(OE_RELEASED) }
     });
 
     #[cfg(not(target_arch = "arm"))]
-    let status = 0u32;
+    let sample = 0u64;
 
-    // BOOTSEL is active low.
-    (status & INFROM_PAD_BIT) == 0
+    // BOOTSEL is active low: it pulls the chip select low.
+    (sample as u32 & QSPI_CSN_BIT) == 0
 }
 
 /// The BOOTSEL button.

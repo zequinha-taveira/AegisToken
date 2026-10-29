@@ -210,6 +210,11 @@ fn handle_frame<const RESPONSE: usize, const MESSAGE: usize>(
             ccid::Response::parameters(sequence, ccid::PROTOCOL_T0, &ccid::T0_PARAMETERS)
                 .encode_into(out)?
         }
+        Request::SetDataRateAndClock { sequence, data, .. } => {
+            // The APDU transport is USB bulk, so there is no serial data rate
+            // to apply; echoing the requested values confirms the setting.
+            ccid::Response::data_rate_and_clock(sequence, data).encode_into(out)?
+        }
         Request::XfrBlock { sequence, data, .. } => {
             if !*powered {
                 ccid::Response::data_block_failed(sequence).encode_into(out)?
@@ -379,6 +384,24 @@ mod tests {
     }
 
     #[test]
+    fn set_data_rate_and_clock_is_accepted() {
+        let mut fixture = Fixture::new();
+        with_card(&mut fixture, |card| {
+            let mut payload = [0u8; ccid::DATA_RATE_AND_CLOCK_LEN];
+            payload[..4].copy_from_slice(&115_200u32.to_le_bytes());
+            payload[4..].copy_from_slice(&4_000u32.to_le_bytes());
+            let response = poll_one(
+                card,
+                &frame(ccid::PC_TO_RDR_SET_DATA_RATE_AND_CLOCK, 6, &payload),
+            );
+            assert_eq!(response[0], ccid::RDR_TO_PC_DATA_RATE_AND_CLOCK);
+            assert_eq!(response[7], ccid::STATUS_OK);
+            assert_eq!(response[8], ccid::ERROR_NONE);
+            assert_eq!(&response[10..], &payload);
+        });
+    }
+
+    #[test]
     fn xfr_block_requires_power() {
         let mut fixture = Fixture::new();
         with_card(&mut fixture, |card| {
@@ -462,11 +485,16 @@ mod tests {
             let response = poll_one(card, &frame(0x99, 9, &[]));
             assert_eq!(response[0], ccid::RDR_TO_PC_SLOT_STATUS);
             assert_eq!(response[7], ccid::STATUS_FAILED | ccid::ICC_STATUS_INACTIVE);
+            // An unsupported command reports "command not supported", not a
+            // sequencing error: hosts continue the session on 0x00 and abort
+            // on 0x01.
+            assert_eq!(response[8], ccid::ERROR_UNSUPPORTED);
             // Non-zero slot.
             let mut outside_slot = frame(ccid::PC_TO_RDR_GET_SLOT_STATUS, 10, &[]);
             outside_slot[5] = 3;
             let response = poll_one(card, &outside_slot);
             assert_eq!(response[7], ccid::STATUS_FAILED | ccid::ICC_STATUS_INACTIVE);
+            assert_eq!(response[8], ccid::ERROR_UNSUPPORTED);
         });
     }
 

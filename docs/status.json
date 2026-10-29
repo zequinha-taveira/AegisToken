@@ -12,9 +12,9 @@
       "chip_variants": ["RP2350A", "RP2350B", "RP2354A", "RP2354B"],
       "core": "ARM Cortex-M33 (ARMv8-M Mainline with TrustZone)",
       "rust_target": "thumbv8m.main-none-eabihf",
-      "toolchain": "nightly-2026-09-17"
+      "toolchain": "1.97.1"
     },
-    "last_updated": "2026-10-26"
+    "last_updated": "2026-10-29"
   },
   "summary": {
     "overall_health": "stable",

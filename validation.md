@@ -37,7 +37,11 @@ do MVP em hardware RP2350A (e depois RP2350B).
 - `hidapi` + `cbor2` — validação do Management HID (`scripts/validate_management.py`).
 - `pcsc_transport` (embutido, MIT OR Apache-2.0, ou `pyscard` como fallback) — validação CCID/ISO 7816 dos applets (`scripts/validate_ccid.py`).
 - `aegistoken-host` — CLI de host em Rust sobre **libusb** para o Management HID,
-  sem WinUSB/Zadig (ver abaixo).
+  sem WinUSB/Zadig (ver abaixo). No Windows, o `fidohid.inf` aplica um descritor
+  de segurança restritivo (`D:P(A;;GA;;;BA)(A;;GA;;;SY)(A;;GA;;;CryptSvc)`) às
+  interfaces HID: usuário padrão recebe `ERROR_ACCESS_DENIED` (5) e a validação
+  Management/FIDO por HID exige um processo elevado. O CCID (PC/SC) não é
+  afetado.
 - Autoteste on-target no boot (log via defmt/RTT).
 
 ## Build e flash

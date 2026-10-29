@@ -121,6 +121,13 @@ The `pinUvAuthToken` is a live proof of user verification and is scoped:
   execution state: any state that is not a boot destination yields a plan
   without FIDO and without CCID, keeping Management. The plan never enables
   FIDO where `state::fido_allowed` denies it.
+- **The BOOTSEL sample must be electrically meaningful.** BOOTSEL is read from
+  the QSPI chip-select pad with the XIP driver released. Before sampling, the
+  firmware enables that pad's input buffer and pull-up and clears its
+  isolation bit: a released pad without them floats and reads low, which is
+  indistinguishable from a pressed button and would silently select Recovery,
+  muting FIDO and CCID. The pad configuration is reapplied on every sample and
+  an unstable multi-sample reading counts as "released".
 - **Known limits.** The FIDO and CCID interfaces still enumerate in recovery
   (suppressing enumeration would require changing the USB descriptors); the
   observable effect is "enumerated and mute". The recovery *session*
