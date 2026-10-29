@@ -39,12 +39,17 @@ const REQ_GET_DATA_RATES: u8 = 0x03;
 
 /// CCID functional descriptor (CCID rev 1.1, §5.1), 54 bytes.
 ///
-/// Advertises a single slot, T=0 only, automatic activation and voltage
-/// selection, and short/extended-APDU exchange with the actual reassembly
-/// capacity of the applet transport.
+/// Advertises a single slot, T=0 only and the APDU exchange level the applet
+/// transport actually implements, bounded by its reassembly capacity.
 ///
-/// `dwFeatures = 0x0806_0000`: bits 17/18 (automatic activation/voltage)
-/// plus exchange level 2 (short and extended APDUs) in bits 26-27.
+/// `dwFeatures` carries the APDU exchange level in bits 16-18 (CCID rev 1.1
+/// §5.2): bit 17 is short APDU level, bit 18 extended APDU level, and both
+/// together declare "short and extended", which is what the APDU parser
+/// accepts. Bit 27 declares that the reader can apply a data rate: hosts then
+/// send `PC_to_RDR_SetDataRateAndClockFrequency`, which the card accepts and
+/// echoes. The APDU transport is USB bulk, so there is no serial rate to
+/// change, but refusing the request makes hosts abort the card session while
+/// they set the protocol up.
 static CCID_DESCRIPTOR: [u8; 54] = [
     0x36, 0x21, // bLength, bDescriptorType
     0x10, 0x01, // bcdCCID = 1.10
@@ -69,8 +74,19 @@ static CCID_DESCRIPTOR: [u8; 54] = [
     0x01, // bMaxCCIDBusySlots
 ];
 
+/// `dwFeatures`: short and extended APDU exchange plus data-rate setting.
+pub const CCID_FEATURES: u32 = 0x0806_0000;
+
 // The functional descriptor is defined by CCID rev 1.1 §5.1 as exactly 54 bytes.
 const _: () = assert!(CCID_DESCRIPTOR.len() == 54);
+const _: () = assert!(
+    u32::from_le_bytes([
+        CCID_DESCRIPTOR[40],
+        CCID_DESCRIPTOR[41],
+        CCID_DESCRIPTOR[42],
+        CCID_DESCRIPTOR[43]
+    ]) == CCID_FEATURES
+);
 const _: () = assert!(
     u32::from_le_bytes([
         CCID_DESCRIPTOR[44],
@@ -201,6 +217,18 @@ impl<'d, D: Driver<'d>> CcidClass<'d, D> {
         for chunk in data.chunks(usize::from(MAX_PACKET_SIZE)) {
             self.write_ep.write(chunk).await?;
         }
+        // A transfer whose last packet is exactly the endpoint size is not
+        // terminated; the host keeps waiting for a short packet and times out.
+        // Close the transfer with a zero-length packet.
+        if needs_zlp(data.len()) {
+            self.write_ep.write(&[]).await?;
+        }
         Ok(())
     }
+}
+
+/// Whether a transfer of `len` bytes needs a trailing zero-length packet.
+#[must_use]
+pub const fn needs_zlp(len: usize) -> bool {
+    len % MAX_PACKET_SIZE as usize == 0
 }

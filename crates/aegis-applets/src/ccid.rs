@@ -40,6 +40,8 @@ pub const PC_TO_RDR_ESCAPE: u8 = 0x6B;
 pub const PC_TO_RDR_XFR_BLOCK: u8 = 0x6F;
 /// `PC_to_RDR_Abort` message type.
 pub const PC_TO_RDR_ABORT: u8 = 0x72;
+/// `PC_to_RDR_SetDataRateAndClockFrequency` message type.
+pub const PC_TO_RDR_SET_DATA_RATE_AND_CLOCK: u8 = 0x73;
 
 /// `RDR_to_PC_DataBlock` message type.
 pub const RDR_TO_PC_DATA_BLOCK: u8 = 0x80;
@@ -49,6 +51,8 @@ pub const RDR_TO_PC_SLOT_STATUS: u8 = 0x81;
 pub const RDR_TO_PC_PARAMETERS: u8 = 0x82;
 /// `RDR_to_PC_Escape` message type.
 pub const RDR_TO_PC_ESCAPE: u8 = 0x83;
+/// `RDR_to_PC_DataRateAndClockFrequency` message type.
+pub const RDR_TO_PC_DATA_RATE_AND_CLOCK: u8 = 0x84;
 
 /// `bStatus`: command processed without error.
 pub const STATUS_OK: u8 = 0x00;
@@ -56,8 +60,18 @@ pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_FAILED: u8 = 0x40;
 /// `bError`: no error.
 pub const ERROR_NONE: u8 = 0x00;
-/// `bError`: an error occurred.
+/// `bError`: the command is not supported by this card.
+///
+/// CCID rev 1.1 gives `0x00` the meaning "command not supported". Hosts treat
+/// it as an expected refusal and continue the session; `0x01` means the
+/// command arrived out of sequence and makes them abort.
+pub const ERROR_UNSUPPORTED: u8 = 0x00;
+/// `bError`: the command arrived out of sequence.
 pub const ERROR_OCCURRED: u8 = 0x01;
+
+/// `PC_to_RDR_SetDataRateAndClockFrequency` payload length: `dwDataRate` plus
+/// `dwClockFrequency`.
+pub const DATA_RATE_AND_CLOCK_LEN: usize = 8;
 
 /// `bClockStatus` / ICC status: the card is active.
 pub const ICC_STATUS_ACTIVE: u8 = 0x00;
@@ -164,6 +178,19 @@ pub enum Request<'a> {
     GetParameters { slot: u8, sequence: u8 },
     /// `ResetParameters` restores default T=0 parameters.
     ResetParameters { slot: u8, sequence: u8 },
+    /// `SetDataRateAndClockFrequency`: the host applies a data rate and clock.
+    ///
+    /// The card has no serial link of its own — APDUs travel over USB bulk —
+    /// so the request is accepted and the applied values echoed. Refusing it
+    /// makes hosts abort the card session while setting up the protocol.
+    SetDataRateAndClock {
+        /// `bSlot`.
+        slot: u8,
+        /// `bSeq`.
+        sequence: u8,
+        /// `dwDataRate` followed by `dwClockFrequency`, little-endian.
+        data: &'a [u8],
+    },
     /// `XfrBlock`: an APDU exchange.
     XfrBlock {
         /// `bSlot`.
@@ -230,6 +257,13 @@ impl<'a> Request<'a> {
                 slot: header.slot,
                 sequence: header.sequence,
             }),
+            PC_TO_RDR_SET_DATA_RATE_AND_CLOCK if payload.len() == DATA_RATE_AND_CLOCK_LEN => {
+                Ok(Self::SetDataRateAndClock {
+                    slot: header.slot,
+                    sequence: header.sequence,
+                    data: payload,
+                })
+            }
             PC_TO_RDR_XFR_BLOCK => Ok(Self::XfrBlock {
                 slot: header.slot,
                 sequence: header.sequence,
@@ -260,6 +294,7 @@ impl<'a> Request<'a> {
             | Self::SetParameters { sequence, .. }
             | Self::GetParameters { sequence, .. }
             | Self::ResetParameters { sequence, .. }
+            | Self::SetDataRateAndClock { sequence, .. }
             | Self::XfrBlock { sequence, .. }
             | Self::Escape { sequence, .. }
             | Self::Abort { sequence, .. } => *sequence,
@@ -276,6 +311,7 @@ impl<'a> Request<'a> {
             | Self::SetParameters { slot, .. }
             | Self::GetParameters { slot, .. }
             | Self::ResetParameters { slot, .. }
+            | Self::SetDataRateAndClock { slot, .. }
             | Self::XfrBlock { slot, .. }
             | Self::Escape { slot, .. }
             | Self::Abort { slot, .. } => *slot,
@@ -349,9 +385,22 @@ impl<'a> Response<'a> {
             message_type: RDR_TO_PC_SLOT_STATUS,
             sequence,
             status: STATUS_FAILED | ICC_STATUS_INACTIVE,
-            error: ERROR_OCCURRED,
+            error: ERROR_UNSUPPORTED,
             specific: [0; 3],
             data: &[],
+        }
+    }
+
+    /// A `RDR_to_PC_DataRateAndClockFrequency` echoing the applied values.
+    #[must_use]
+    pub const fn data_rate_and_clock(sequence: u8, data: &'a [u8]) -> Self {
+        Self {
+            message_type: RDR_TO_PC_DATA_RATE_AND_CLOCK,
+            sequence,
+            status: STATUS_OK,
+            error: ERROR_NONE,
+            specific: [0; 3],
+            data,
         }
     }
 
@@ -375,7 +424,7 @@ impl<'a> Response<'a> {
             message_type: RDR_TO_PC_PARAMETERS,
             sequence,
             status: STATUS_FAILED,
-            error: ERROR_OCCURRED,
+            error: ERROR_UNSUPPORTED,
             specific: [0; 3],
             data: &[],
         }
@@ -663,6 +712,38 @@ mod tests {
                 data: &[0xDE],
             })
         );
+    }
+
+    #[test]
+    fn parses_set_data_rate_and_clock() {
+        let payload = [0x00, 0xC2, 0x01, 0x00, 0xA0, 0x0F, 0x00, 0x00];
+        let bytes = frame(PC_TO_RDR_SET_DATA_RATE_AND_CLOCK, 11, [0; 3], &payload);
+        assert_eq!(
+            Request::parse(&bytes),
+            Ok(Request::SetDataRateAndClock {
+                slot: 0,
+                sequence: 11,
+                data: &payload,
+            })
+        );
+        // The payload is exactly dwDataRate + dwClockFrequency.
+        let short = frame(PC_TO_RDR_SET_DATA_RATE_AND_CLOCK, 11, [0; 3], &payload[..4]);
+        assert_eq!(Request::parse(&short), Err(CcidError::UnsupportedMessage));
+    }
+
+    #[test]
+    fn data_rate_and_clock_response_echoes_values() {
+        let payload = [0x00, 0xC2, 0x01, 0x00, 0xA0, 0x0F, 0x00, 0x00];
+        let response = Response::data_rate_and_clock(11, &payload);
+        let mut out = [0u8; 32];
+        let len = response.encode_into(&mut out).unwrap();
+        assert_eq!(len, HEADER_LEN + payload.len());
+        assert_eq!(out[0], RDR_TO_PC_DATA_RATE_AND_CLOCK);
+        assert_eq!(&out[1..5], &(payload.len() as u32).to_le_bytes());
+        assert_eq!(out[6], 11);
+        assert_eq!(out[7], STATUS_OK);
+        assert_eq!(out[8], ERROR_NONE);
+        assert_eq!(&out[HEADER_LEN..len], &payload);
     }
 
     #[test]
