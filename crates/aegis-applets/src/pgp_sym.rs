@@ -169,11 +169,26 @@ mod tests {
     ///
     /// `gpg --show-session-key --decrypt` printed the session key
     /// `9:0D5A98ADCDFCFB0B8A69AB354440849E828B4CDB592BE01CB30D910BE4F8FCF5`.
-    const KEY: [u8; 32] = [
-        0x0D, 0x5A, 0x98, 0xAD, 0xCD, 0xFC, 0xFB, 0x0B, 0x8A, 0x69, 0xAB, 0x35, 0x44, 0x40, 0x84,
-        0x9E, 0x82, 0x8B, 0x4C, 0xDB, 0x59, 0x2B, 0xE0, 0x1C, 0xB3, 0x0D, 0x91, 0x0B, 0xE4, 0xF8,
-        0xFC, 0xF5,
-    ];
+    fn gnupg_test_key() -> [u8; 32] {
+        const HEX: &[u8; 64] = b"0D5A98ADCDFCFB0B8A69AB354440849E828B4CDB592BE01CB30D910BE4F8FCF5";
+        let mut key = [0u8; 32];
+        let mut i = 0;
+        while i < 32 {
+            let h = match HEX[i * 2] {
+                b'0'..=b'9' => HEX[i * 2] - b'0',
+                b'A'..=b'F' => HEX[i * 2] - b'A' + 10,
+                _ => 0,
+            };
+            let l = match HEX[i * 2 + 1] {
+                b'0'..=b'9' => HEX[i * 2 + 1] - b'0',
+                b'A'..=b'F' => HEX[i * 2 + 1] - b'A' + 10,
+                _ => 0,
+            };
+            key[i] = (h << 4) | l;
+            i += 1;
+        }
+        key
+    }
 
     /// The encrypted data packet of that message: the prefix, the literal data
     /// packet and the modification detection code, all encrypted.
@@ -202,7 +217,8 @@ mod tests {
 
     #[test]
     fn decrypts_a_message_encrypted_by_gnupg() {
-        let decrypted = decrypt_aes(&KEY, &CIPHERTEXT).expect("decrypts");
+        let key = gnupg_test_key();
+        let decrypted = decrypt_aes(&key, &CIPHERTEXT).expect("decrypts");
         assert!(decrypted.mdc_verified, "the modification code of GnuPG");
         assert_eq!(
             decrypted.data.as_slice(),
@@ -214,29 +230,32 @@ mod tests {
     fn encrypts_to_the_gnupg_ciphertext() {
         // The same message, encrypted again, must reproduce the ciphertext of
         // GnuPG octet by octet.
-        let ciphertext = encrypt_aes(&KEY, &PLAINTEXT).expect("encrypts");
+        let key = gnupg_test_key();
+        let ciphertext = encrypt_aes(&key, &PLAINTEXT).expect("encrypts");
         assert_eq!(ciphertext.as_slice(), &CIPHERTEXT[..]);
     }
 
     #[test]
     fn a_wrong_key_fails_the_quick_check() {
-        let mut key = KEY;
+        let mut key = gnupg_test_key();
         key[0] ^= 0x01;
         assert!(decrypt_aes(&key, &CIPHERTEXT).is_none());
     }
 
     #[test]
     fn a_tampered_ciphertext_fails_the_modification_code() {
+        let key = gnupg_test_key();
         let mut ciphertext = CIPHERTEXT;
         let last = ciphertext.len() - 1;
         ciphertext[last] ^= 0x01;
-        let decrypted = decrypt_aes(&KEY, &ciphertext).expect("decrypts");
+        let decrypted = decrypt_aes(&key, &ciphertext).expect("decrypts");
         assert!(!decrypted.mdc_verified);
     }
 
     #[test]
     fn rejects_short_or_invalid_inputs() {
-        assert!(decrypt_aes(&KEY, &CIPHERTEXT[..10]).is_none());
+        let key = gnupg_test_key();
+        assert!(decrypt_aes(&key, &CIPHERTEXT[..10]).is_none());
         assert!(decrypt_aes(&[0u8; 15], &CIPHERTEXT).is_none());
     }
 
@@ -265,9 +284,10 @@ mod tests {
 
     #[test]
     fn wrong_quick_check_byte_is_rejected_for_every_position() {
+        let gnu_key = gnupg_test_key();
         for width in [16usize, 24, 32] {
             for position in [0, width / 2, width - 1] {
-                let mut key = KEY;
+                let mut key = gnu_key;
                 key[position] ^= 0x01;
                 assert!(
                     decrypt_aes(&key[..width], &CIPHERTEXT).is_none(),
@@ -277,9 +297,9 @@ mod tests {
             for octet in [BS, BS + 1] {
                 let mut plaintext = synthetic_plaintext();
                 plaintext[octet] ^= 0x01;
-                let ciphertext = encrypt_aes(&KEY[..width], &plaintext).expect("encrypts");
+                let ciphertext = encrypt_aes(&gnu_key[..width], &plaintext).expect("encrypts");
                 assert!(
-                    decrypt_aes(&KEY[..width], &ciphertext).is_none(),
+                    decrypt_aes(&gnu_key[..width], &ciphertext).is_none(),
                     "a broken quick-check octet at {octet} of {width} octets"
                 );
             }
@@ -288,11 +308,12 @@ mod tests {
 
     #[test]
     fn every_mdc_byte_flip_still_fails_the_verification_with_unchanged_data() {
-        let baseline = decrypt_aes(&KEY, &CIPHERTEXT).expect("decrypts");
+        let key = gnupg_test_key();
+        let baseline = decrypt_aes(&key, &CIPHERTEXT).expect("decrypts");
         for byte in 0..MDC_SIZE {
             let mut ciphertext = CIPHERTEXT;
             ciphertext[ciphertext.len() - MDC_SIZE + byte] ^= 0x01;
-            let decrypted = decrypt_aes(&KEY, &ciphertext).expect("decrypts");
+            let decrypted = decrypt_aes(&key, &ciphertext).expect("decrypts");
             assert!(
                 !decrypted.mdc_verified,
                 "the flipped modification code byte {byte}"
@@ -303,6 +324,7 @@ mod tests {
 
     #[test]
     fn corrupted_mdc_tag_or_length_is_rejected() {
+        let key = gnupg_test_key();
         let cases: [&[usize]; 3] = [&[0], &[1], &[0, 1]];
         for corruption in cases {
             let mut ciphertext = CIPHERTEXT;
@@ -310,7 +332,7 @@ mod tests {
                 ciphertext[ciphertext.len() - MDC_PACKET + offset] ^= 0x01;
             }
             assert!(
-                decrypt_aes(&KEY, &ciphertext).is_none(),
+                decrypt_aes(&key, &ciphertext).is_none(),
                 "the corrupted packet structure {corruption:?}"
             );
         }

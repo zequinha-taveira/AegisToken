@@ -1075,7 +1075,7 @@ pub(crate) mod test_support {
             rp_id: rp_id.map(|id| FixedString::new(id).expect("rp id fits")),
         };
         let response = client_pin.get_pin_token(&request, &mut state, &mut rng)?;
-        let mut token = [0u8; 32];
+        let mut token: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(1));
         let length = aes_cbc_decrypt(&shared, &response.token, &mut token).unwrap();
         assert_eq!(length, 32);
         Ok(IssuedToken {
@@ -1102,7 +1102,14 @@ pub(crate) mod test_support {
 
     /// Build the `pinUvAuthParam` of a request with the issued token.
     pub(crate) fn auth_param(token: &[u8; 32], message: &[u8]) -> [u8; 32] {
-        hmac_sha256(token, message)
+        use hmac::Mac;
+        let mut mac =
+            <HmacSha256 as KeyInit>::new_from_slice(token).expect("HMAC accepts any key length");
+        mac.update(message);
+        let out = mac.finalize().into_bytes();
+        let mut result = [0u8; 32];
+        result.copy_from_slice(&out);
+        result
     }
 }
 
@@ -1214,14 +1221,14 @@ mod tests {
             .unwrap();
 
         // Decrypt the returned token.
-        let mut token: [u8; 32] = Default::default();
+        let mut token: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(1));
         let length = aes_cbc_decrypt(&shared, &response.token, &mut token).unwrap();
         assert_eq!(length, 32);
         assert_eq!(state.retries, DEFAULT_RETRIES);
 
         // The issued token authorises makeCredential/getAssertion.
         let message = [0xABu8; 32];
-        let param = hmac_sha256(&token, &message);
+        let param = auth_param(&token, &message);
         assert!(authenticator.verify_pin_uv_auth_param(&param, &message));
         assert!(authenticator.verify_pin_uv_auth_param(&param[..16], &message));
         for invalid_length in [0, 1, 15, 17, 31] {

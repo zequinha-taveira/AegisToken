@@ -250,12 +250,13 @@ pub fn aes_key_unwrap(kek: &[u8], wrapped: &[u8]) -> Option<Vec<u8, MAX_UNWRAPPE
 mod tests {
     use super::*;
 
-    /// RFC 3394 §4.1: 128 bits of key data with a 128-bit KEK.
-    const RFC3394_128: (&[u8; 16], &[u8; 16], &[u8; 24]) = (
-        &[
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
-            0x0E, 0x0F,
-        ],
+    #[inline]
+    fn rfc3394_kek<const N: usize>() -> [u8; N] {
+        core::array::from_fn(|i| i as u8)
+    }
+
+    /// RFC 3394 §4.1: 128 bits of key data with a 128-bit KEK (0x00..=0x0F).
+    const RFC3394_128: (&[u8; 16], &[u8; 24]) = (
         &[
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
             0xEE, 0xFF,
@@ -266,12 +267,8 @@ mod tests {
         ],
     );
 
-    /// RFC 3394 §4.2: 128 bits of key data with a 192-bit KEK.
-    const RFC3394_192_KEK: (&[u8; 24], &[u8; 16], &[u8; 24]) = (
-        &[
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
-            0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-        ],
+    /// RFC 3394 §4.2: 128 bits of key data with a 192-bit KEK (0x00..=0x17).
+    const RFC3394_192_KEK: (&[u8; 16], &[u8; 24]) = (
         &[
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
             0xEE, 0xFF,
@@ -281,13 +278,8 @@ mod tests {
             0xAE, 0xD2, 0x46, 0x8A, 0xB8, 0xA1, 0x7A, 0xD8, 0x4E, 0x5D,
         ],
     );
-    /// RFC 3394 §4.3: 128 bits of key data with a 256-bit KEK.
-    const RFC3394_256_KEK: (&[u8; 32], &[u8; 16], &[u8; 24]) = (
-        &[
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
-            0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
-            0x1C, 0x1D, 0x1E, 0x1F,
-        ],
+    /// RFC 3394 §4.3: 128 bits of key data with a 256-bit KEK (0x00..=0x1F).
+    const RFC3394_256_KEK: (&[u8; 16], &[u8; 24]) = (
         &[
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
             0xEE, 0xFF,
@@ -297,12 +289,8 @@ mod tests {
             0x8A, 0x2A, 0x93, 0xC8, 0x19, 0x1E, 0x7D, 0x6E, 0x8A, 0xE7,
         ],
     );
-    /// RFC 3394 §4.4: 192 bits of key data with a 192-bit KEK.
-    const RFC3394_192: (&[u8; 24], &[u8; 24], &[u8; 32]) = (
-        &[
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
-            0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-        ],
+    /// RFC 3394 §4.4: 192 bits of key data with a 192-bit KEK (0x00..=0x17).
+    const RFC3394_192: (&[u8; 24], &[u8; 32]) = (
         &[
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
             0xEE, 0xFF, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
@@ -316,48 +304,67 @@ mod tests {
 
     #[test]
     fn unwraps_the_rfc3394_vectors() {
-        let (kek, expected, wrapped) = RFC3394_128;
-        assert_eq!(aes_key_unwrap(kek, wrapped).unwrap().as_slice(), expected);
-        let (kek, expected, wrapped) = RFC3394_192_KEK;
-        assert_eq!(aes_key_unwrap(kek, wrapped).unwrap().as_slice(), expected);
-        let (kek, expected, wrapped) = RFC3394_256_KEK;
-        assert_eq!(aes_key_unwrap(kek, wrapped).unwrap().as_slice(), expected);
-        let (kek, expected, wrapped) = RFC3394_192;
-        assert_eq!(aes_key_unwrap(kek, wrapped).unwrap().as_slice(), expected);
+        let kek128 = rfc3394_kek::<16>();
+        let kek192 = rfc3394_kek::<24>();
+        let kek256 = rfc3394_kek::<32>();
+        let (expected, wrapped) = RFC3394_128;
+        assert_eq!(
+            aes_key_unwrap(&kek128, wrapped).unwrap().as_slice(),
+            expected
+        );
+        let (expected, wrapped) = RFC3394_192_KEK;
+        assert_eq!(
+            aes_key_unwrap(&kek192, wrapped).unwrap().as_slice(),
+            expected
+        );
+        let (expected, wrapped) = RFC3394_256_KEK;
+        assert_eq!(
+            aes_key_unwrap(&kek256, wrapped).unwrap().as_slice(),
+            expected
+        );
+        let (expected, wrapped) = RFC3394_192;
+        assert_eq!(
+            aes_key_unwrap(&kek192, wrapped).unwrap().as_slice(),
+            expected
+        );
     }
 
     #[test]
     fn wraps_to_the_rfc3394_vectors() {
-        // The sender side must produce the ciphertexts of the RFC.
-        let (kek, data, wrapped) = RFC3394_128;
-        assert_eq!(aes_key_wrap(kek, data).unwrap().as_slice(), wrapped);
-        let (kek, data, wrapped) = RFC3394_192_KEK;
-        assert_eq!(aes_key_wrap(kek, data).unwrap().as_slice(), wrapped);
-        let (kek, data, wrapped) = RFC3394_256_KEK;
-        assert_eq!(aes_key_wrap(kek, data).unwrap().as_slice(), wrapped);
-        let (kek, data, wrapped) = RFC3394_192;
-        assert_eq!(aes_key_wrap(kek, data).unwrap().as_slice(), wrapped);
+        let kek128 = rfc3394_kek::<16>();
+        let kek192 = rfc3394_kek::<24>();
+        let kek256 = rfc3394_kek::<32>();
+        let (data, wrapped) = RFC3394_128;
+        assert_eq!(aes_key_wrap(&kek128, data).unwrap().as_slice(), wrapped);
+        let (data, wrapped) = RFC3394_192_KEK;
+        assert_eq!(aes_key_wrap(&kek192, data).unwrap().as_slice(), wrapped);
+        let (data, wrapped) = RFC3394_256_KEK;
+        assert_eq!(aes_key_wrap(&kek256, data).unwrap().as_slice(), wrapped);
+        let (data, wrapped) = RFC3394_192;
+        assert_eq!(aes_key_wrap(&kek192, data).unwrap().as_slice(), wrapped);
     }
 
     #[test]
     fn rejects_a_tampered_wrapping() {
-        let (kek, _, wrapped) = RFC3394_128;
+        let kek128 = rfc3394_kek::<16>();
+        let (_, wrapped) = RFC3394_128;
         let mut tampered = *wrapped;
         tampered[0] ^= 0x01;
-        assert!(aes_key_unwrap(kek, &tampered).is_none());
+        assert!(aes_key_unwrap(&kek128, &tampered).is_none());
 
         // The integrity check lives in the last block.
         let mut tampered = *wrapped;
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
-        assert!(aes_key_unwrap(kek, &tampered).is_none());
+        assert!(aes_key_unwrap(&kek128, &tampered).is_none());
     }
 
     #[test]
     fn rejects_invalid_lengths() {
-        let (kek, _, wrapped) = RFC3394_128;
-        assert!(aes_key_unwrap(kek, &wrapped[..20]).is_none());
-        assert!(aes_key_unwrap(kek, &[]).is_none());
+        let kek128 = rfc3394_kek::<16>();
+        let (_, wrapped) = RFC3394_128;
+        assert!(aes_key_unwrap(&kek128, &wrapped[..20]).is_none());
+        assert!(aes_key_unwrap(&kek128, &[]).is_none());
         assert!(aes_key_unwrap(&[0u8; 15], wrapped).is_none());
     }
 

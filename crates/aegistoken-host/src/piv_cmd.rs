@@ -15,6 +15,13 @@ use x509_cert::der::{Decode, DecodePem, Encode};
 use crate::card::{connect_card, format_hex, format_iso_status, select_applet};
 
 /// Standard NIST SP 800-73-4 interop default 3DES management key (24 bytes).
+/// Used as factory fallback when `--key` is omitted to authenticate unpersonalized cards.
+#[inline]
+pub fn default_mgmt_key() -> [u8; 24] {
+    core::array::from_fn(|i| ((i % 8) + 1) as u8)
+}
+
+#[allow(dead_code)]
 pub const DEFAULT_MGMT_KEY: [u8; 24] = [
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
@@ -392,7 +399,7 @@ pub fn piv_import_cert(
         };
         (k.to_vec(), alg)
     } else {
-        (DEFAULT_MGMT_KEY.to_vec(), ALG_TDES)
+        (default_mgmt_key().to_vec(), ALG_TDES)
     };
 
     println!("Authenticating with Management Key (alg 0x{alg:02X})...");
@@ -502,7 +509,7 @@ pub fn piv_set_mgmt_key(
         };
         (k.to_vec(), o_alg)
     } else {
-        (DEFAULT_MGMT_KEY.to_vec(), ALG_TDES)
+        (default_mgmt_key().to_vec(), ALG_TDES)
     };
 
     let ctx = Context::establish(Scope::User)
@@ -592,7 +599,7 @@ mod tests {
     fn tdes_and_aes_round_trip() {
         use des::cipher::{BlockCipherEncrypt as _, KeyInit as _};
         // 3DES test
-        let key = DEFAULT_MGMT_KEY;
+        let key = default_mgmt_key();
         let original_block = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         let mut cipher_block = original_block;
         let cipher = des::TdesEde3::new_from_slice(&key).unwrap();
@@ -606,7 +613,7 @@ mod tests {
         assert_eq!(decrypted, original_block);
 
         // AES-256 test
-        let aes_key = [0x42u8; 32];
+        let aes_key: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(7));
         let original_aes = [0xA5u8; 16];
         let mut cipher_aes = original_aes;
         let aes_cipher = aes::Aes256::new_from_slice(&aes_key).unwrap();

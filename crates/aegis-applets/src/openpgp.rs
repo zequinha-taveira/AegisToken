@@ -2233,7 +2233,8 @@ mod tests {
             Sw::OK
         );
 
-        let ephemeral = p256::SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let eph_bytes: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(9));
+        let ephemeral = p256::SecretKey::from_slice(&eph_bytes).unwrap();
         let ephemeral_point = ephemeral.public_key().to_sec1_point(false);
         let card_public = p256::PublicKey::from_sec1_bytes(card_point).unwrap();
         let shared =
@@ -2600,7 +2601,8 @@ mod tests {
             Sw::OK
         );
 
-        let ephemeral = p256::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let eph_bytes: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(7));
+        let ephemeral = p256::SecretKey::from_slice(&eph_bytes).unwrap();
         let ephemeral_point = ephemeral.public_key().to_sec1_point(false);
         let card_public = p256::PublicKey::from_sec1_bytes(card_point).unwrap();
         let shared =
@@ -2743,7 +2745,8 @@ mod tests {
             Sw::OK
         );
 
-        let external = p256::SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let ext_bytes: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(1));
+        let external = p256::SecretKey::from_slice(&ext_bytes).unwrap();
         use p256::elliptic_curve::sec1::ToSec1Point;
         let external_point = external.public_key().to_sec1_point(false);
         let mut point_tlv = Vec::<u8, 128>::new();
