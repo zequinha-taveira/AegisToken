@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "project": {
+    "name": "AegisToken",
+    "title": "AegisToken Universal RP2350 Security Key",
+    "description": "Universal open-source firmware and host tooling for RP2350 hardware security keys (FIDO2/WebAuthn, PIV, OATH TOTP, OpenPGP).",
+    "version": "0.2.1",
+    "canonical_version_file": "Cargo.toml",
+    "license": "MIT OR Apache-2.0",
+    "target_platform": {
+      "chip_family": "RP2350",
+      "chip_variants": ["RP2350A", "RP2350B", "RP2354A", "RP2354B"],
+      "core": "ARM Cortex-M33 (ARMv8-M Mainline with TrustZone)",
+      "rust_target": "thumbv8m.main-none-eabihf",
+      "toolchain": "nightly-2026-09-17"
+    },
+    "last_updated": "2026-10-26"
+  },
+  "summary": {
+    "overall_health": "stable",
+    "firmware_status": "active_development",
+    "host_cli_status": "feature_complete_alpha",
+    "desktop_gui_status": "planned",
+    "hardware_validation_status": "in_progress",
+    "completed_milestones": 1,
+    "active_milestones": 2,
+    "total_milestones": 6
+  },
+  "milestones": [
+    {
+      "id": "M1",
+      "name": "Fundação FIDO2 / CTAP2 & Passkeys",
+      "status": "completed",
+      "progress_percent": 100,
+      "target_window": "2026 Q1-Q2",
+      "capabilities": [
+        "WebAuthn / FIDO2 Passkeys (credenciais residentes)",
+        "2FA CTAP1/U2F à prova de phishing",
+        "ClientPIN e pinUvAuthToken",
+        "Algoritmos assimétricos P-256 (ES256) e Ed25519 (EdDSA)",
+        "Detecção contextual de presença (BOOTSEL / botão) com anti-replay"
+      ],
+      "deliverables": {
+        "fido_hid_interface": true,
+        "ctap2_parser": true,
+        "sealed_storage": true,
+        "host_unit_tests": true
+      }
+    },
+    {
+      "id": "M2",
+      "name": "Identidade Corporativa e Applets CCID (PIV, OATH, OpenPGP)",
+      "status": "completed_firmware",
+      "hardware_validation": "in_progress",
+      "progress_percent": 90,
+      "target_window": "2026 Q3",
+      "capabilities": [
+        "USB CCID (Classe 0x0B, ISO 7816-4) composto com HID",
+        "Applet PIV (NIST SP 800-73-4) para Smart Card Logon (Windows/Linux/macOS)",
+        "Applet OATH (TOTP e HOTP offline calculados no chip com toque)",
+        "Applet OpenPGP Card (v3.4) para assinatura Git e chaves SSH de hardware",
+        "Suporte a chaves RSA-2048/3072 com blinding constante e ECC P-256/P-384"
+      ],
+      "deliverables": {
+        "ccid_transport": true,
+        "aid_router": true,
+        "piv_slots": true,
+        "oath_engine": true,
+        "openpgp_engine": true,
+        "hardware_bench_validation": false
+      }
+    },
+    {
+      "id": "M3",
+      "name": "Ferramental de Host Unificado & Desktop Manager",
+      "status": "in_progress",
+      "progress_percent": 65,
+      "target_window": "2026 Q3-Q4",
+      "capabilities": [
+        "CLI aegistoken-host unificado com comandos management, card, piv e oath",
+        "Acesso USB Management HID sem drivers WinUSB/Zadig via libusb inbox",
+        "Acesso CCID via PC/SC em Rust puro (pcsc crate MIT)",
+        "Desktop Manager multiplataforma (Tauri v2 + Rust)",
+        "Leitor visual de QR Code para importar contas TOTP",
+        "Assistente visual de geração de CSR e importação de certificados PIV",
+        "Personalização e pré-visualização de cores e efeitos do LED em tempo real"
+      ],
+      "deliverables": {
+        "host_cli_management": true,
+        "host_cli_pcsc_card": true,
+        "host_cli_piv": true,
+        "host_cli_oath": true,
+        "tauri_desktop_gui": false,
+        "os_installers_msi_deb_dmg": false
+      }
+    },
+    {
+      "id": "M4",
+      "name": "Produção em Massa, Hardening Físico e Ciclo de Vida (OTP)",
+      "status": "planned",
+      "progress_percent": 20,
+      "target_window": "2026 Q4 - 2027 Q1",
+      "capabilities": [
+        "Secure Boot nativo com ECDSA secp256k1 via BootROM do RP2350",
+        "Gravação de bootkey hash na OTP (One-Time Programmable)",
+        "Anti-rollback estrito na partição de firmware",
+        "Transição de ciclo de vida Factory -> Commissioning -> Active",
+        "Selagem definitiva de VID/PID e strings USB",
+        "Certificado e chave de atestação FIDO MDS injetados em lote"
+      ],
+      "deliverables": {
+        "secure_boot_scripts": true,
+        "otp_provisioner": false,
+        "lifecycle_lock": true,
+        "factory_provisioning_suite": false
+      }
+    },
+    {
+      "id": "M5",
+      "name": "Expansão de Hardware (NFC, USB-C e Biometria)",
+      "status": "planned",
+      "progress_percent": 0,
+      "target_window": "2027 Q1-Q2",
+      "capabilities": [
+        "Design de PCB dedicado com conector USB-C nativo",
+        "Encapsulamento inviolável (tamper-evident epóxi ou ultrassônico)",
+        "Antena NFC integrada para autenticação por aproximação em smartphones",
+        "Sensor biométrico de impressão digital capacitivo para User Verification local"
+      ],
+      "deliverables": {
+        "pcb_schematics": false,
+        "nfc_controller_driver": false,
+        "biometric_sensor_driver": false,
+        "case_cad_files": false
+      }
+    },
+    {
+      "id": "M6",
+      "name": "Prontidão Criptográfica Pós-Quântica (PQC)",
+      "status": "research",
+      "progress_percent": 5,
+      "target_window": "2027 Q3+",
+      "capabilities": [
+        "Algoritmo ML-KEM (FIPS 203 / Kyber) para encapsulamento de chaves",
+        "Algoritmo ML-DSA (FIPS 204 / Dilithium) para assinaturas digitais",
+        "Extensões híbridas FIDO2/WebAuthn (ECC + PQC)",
+        "Suporte a subchaves híbridas no applet OpenPGP Card"
+      ],
+      "deliverables": {
+        "pqc_crate_benchmarks": false,
+        "hybrid_ctap2_draft": false,
+        "hybrid_openpgp_draft": false
+      }
+    }
+  ],
+  "usb_interfaces": [
+    {
+      "name": "HID FIDO",
+      "usage_page": "0xF1D0",
+      "class": "HID",
+      "report_size_bytes": 64,
+      "status": "operational",
+      "purpose": "CTAP1/U2F e CTAP2/WebAuthn"
+    },
+    {
+      "name": "HID Management",
+      "usage_page": "0xFF00",
+      "class": "HID",
+      "report_size_bytes": 64,
+      "status": "operational",
+      "purpose": "Configuração, provisionamento, diagnóstico e atualização de firmware"
+    },
+    {
+      "name": "CCID Smart Card",
+      "usage_page": null,
+      "class": "CCID (0x0B)",
+      "protocol": "ISO 7816-4",
+      "status": "operational",
+      "purpose": "Applets PIV, OATH e OpenPGP"
+    },
+    {
+      "name": "HID OTP Lab",
+      "usage_page": "0xFF51",
+      "class": "HID",
+      "report_size_bytes": 64,
+      "status": "lab_only",
+      "purpose": "Diagnóstico experimental (perfil yubikey5-lab)"
+    }
+  ],
+  "applets": [
+    {
+      "id": "fido2",
+      "name": "FIDO2 / WebAuthn",
+      "aid": null,
+      "transport": "HID FIDO",
+      "status": "complete",
+      "algorithms": ["P-256", "Ed25519", "SHA-256", "HMAC-SHA-256", "AES-256-GCM"]
+    },
+    {
+      "id": "piv",
+      "name": "PIV (NIST SP 800-73-4)",
+      "aid": "A000000308000010000100",
+      "transport": "USB CCID",
+      "status": "complete_in_firmware",
+      "algorithms": ["RSA-2048", "RSA-3072", "ECC P-256", "ECC P-384", "3DES", "AES-128", "AES-256"],
+      "slots": ["9A", "9C", "9D", "9E"]
+    },
+    {
+      "id": "oath",
+      "name": "OATH TOTP/HOTP",
+      "aid": "A0000005272101",
+      "transport": "USB CCID",
+      "status": "complete_in_firmware",
+      "algorithms": ["HMAC-SHA1", "HMAC-SHA256", "HMAC-SHA512"]
+    },
+    {
+      "id": "openpgp",
+      "name": "OpenPGP Card v3.4",
+      "aid": "D276000124010304",
+      "transport": "USB CCID",
+      "status": "complete_in_firmware",
+      "algorithms": ["RSA-2048", "RSA-3072", "ECC P-256", "Ed25519"]
+    }
+  ],
+  "crates": [
+    {
+      "name": "aegis-core",
+      "path": "crates/aegis-core",
+      "type": "portable_domain",
+      "no_std": true,
+      "no_alloc": true,
+      "status": "passing"
+    },
+    {
+      "name": "aegis-applets",
+      "path": "crates/aegis-applets",
+      "type": "smart_card_applets",
+      "no_std": true,
+      "no_alloc": true,
+      "status": "passing"
+    },
+    {
+      "name": "board-generic-rp2350",
+      "path": "crates/board-generic-rp2350",
+      "type": "hal_isolation",
+      "no_std": true,
+      "no_alloc": true,
+      "status": "passing"
+    },
+    {
+      "name": "firmware-universal-rp2350",
+      "path": "crates/firmware-universal-rp2350",
+      "type": "embedded_binary",
+      "no_std": true,
+      "no_alloc": true,
+      "status": "passing"
+    },
+    {
+      "name": "aegistoken-host",
+      "path": "crates/aegistoken-host",
+      "type": "host_cli",
+      "no_std": false,
+      "no_alloc": false,
+      "status": "passing"
+    }
+  ],
+  "governance": {
+    "license_policy": "MIT OR Apache-2.0",
+    "forbidden_licenses": ["GPL-1.0", "GPL-2.0", "GPL-3.0", "LGPL-2.0", "LGPL-2.1", "LGPL-3.0", "AGPL-3.0"],
+    "key_export_policy": "Zero private key export (Strict on-chip generation and sealed storage)",
+    "user_presence_policy": "Mandatory physical touch verification for critical cryptographic operations"
+  }
+}

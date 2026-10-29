@@ -50,16 +50,16 @@ O foco deste plano é guiar a transição de um firmware validado em bancada par
   - Crate **`x509-cert`** v0.3.0 e **`der`** v0.8.2 (RustCrypto, `MIT OR Apache-2.0`) adicionados às dependências do workspace e do `aegistoken-host`.
   - Módulo `crates/aegistoken-host/src/piv_cmd.rs` implementado com:
     - `piv-list [READER]`: varredura dos slots 9A, 9C, 9D e 9E com extração do objeto `53` / `70` e decodificação estruturada do certificado X.509 (Subject, Issuer, Serial, Validade NotBefore/NotAfter, Algoritmo da chave pública e tamanho).
-    - `piv-import-cert <SLOT> <CERT_FILE> [READER]`: importação de certificados X.509 (suporta arquivos PEM e DER binários), validação ASN.1 prévia, autenticação de Management Key e gravação via `PUT DATA`.
-    - `piv-set-mgmt-key <NEW_KEY_HEX> [READER]`: substituição da chave de gestão com suporte a 3DES (24B), AES-128 (16B), AES-192 (24B) e AES-256 (32B) via protocolo Yubico extension `SET MANAGEMENT KEY`.
+    - `piv-import-cert <SLOT> <CERT_FILE> [READER] [--key-stdin]`: importação de certificados X.509 (suporta arquivos PEM e DER binários), validação ASN.1 prévia, autenticação de Management Key e gravação via `PUT DATA`. A chave de gestão não padrão entra por stdin (`--key-stdin`), nunca em `argv`.
+    - `piv-set-mgmt-key [--reader SUBSTR] [--alg ALG] [--key-stdin [--old-key-stdin]]`: substituição da chave de gestão com suporte a 3DES (24B), AES-128 (16B), AES-192 (24B) e AES-256 (32B) via protocolo Yubico extension `SET MANAGEMENT KEY`. A chave nunca vem em `argv`: entra por prompt oculto (TTY) ou por stdin (`--key-stdin`/`--old-key-stdin`, com pipe).
     - Autenticação de Management Key (`authenticate_mgmt`) implementada via desafio e decifragem de nonce ECB (3DES e AES).
-  - 4 novos testes unitários adicionados cobrindo resolução de slots PIV, extração de TLV de certificado, decifragem TDES/AES e parsing de certificados PEM/DER. Total de 15 testes aprovados no `aegistoken-host`.
+  - 4 novos testes unitários adicionados cobrindo resolução de slots PIV, extração de TLV de certificado, decifragem TDES/AES e parsing de certificados PEM/DER. Total de 15 testes aprovados no `aegistoken-host` naquela etapa (hoje 60 no crate).
 - **Etapa 2.4: Gestão de Contas OATH/TOTP — [CONCLUÍDA]**
   - Subcomando `aegistoken-host oath` implementado em `crates/aegistoken-host/src/oath_cmd.rs`:
-    - `oath list`: listar contas configuradas.
-    - `oath code <nome>`: calcular código TOTP (timestamp do host).
-    - `oath add <uri>`: cadastrar novas credenciais TOTP/HOTP a partir de URIs `otpauth://`.
-    - `oath delete <nome>` e `oath reset`: remover credencial / reiniciar o applet.
+    - `oath list [--reader SUBSTR]`: listar contas configuradas.
+    - `oath code <nome> [--reader SUBSTR]`: calcular código TOTP (timestamp do host).
+    - `oath add [--uri-stdin] [--reader SUBSTR]`: cadastrar credenciais TOTP/HOTP a partir de URIs `otpauth://`; a URI contém o segredo (`secret=`) e entra por stdin/prompt oculto, nunca em `argv` (positional recusado sem eco).
+    - `oath delete <nome> [--reader SUBSTR]` e `oath reset [--reader SUBSTR]`: remover credencial / reiniciar o applet.
   - Parsing de `otpauth://` coberto por testes de host no crate `aegistoken-host`.
 - **Etapa 2.5: Avaliação do `nusb` para eliminação de dependências C**
   - Avaliar a substituição do `rusb` (que compila a `libusb` C) pelo **`nusb`** (Rust puro, MIT OR Apache-2.0), simplificando cross-compilação e empacotamento em Windows/Linux/macOS sem toolchains C adicionais.
@@ -105,6 +105,29 @@ O foco deste plano é guiar a transição de um firmware validado em bancada par
   - Padronizar todo o tratamento de primitivas no ecossistema de crates `RustCrypto` (`p256`, `p384`, `ed25519-dalek`, `x25519-dalek`, `crypto-bigint`, `der`, `aes-gcm`).
 - **Etapa 4.2: Roadmap de Criptografia Pós-Quântica (PQC)**
   - Pesquisar e monitorar a maturidade das implementações Rust sob `MIT OR Apache-2.0` dos padrões FIPS 203 (ML-KEM) e FIPS 204 (ML-DSA) para futura inclusão no CTAP2 (extensões híbridas) e OpenPGP.
+
+---
+
+### Eixo 5: Governança, Rastreabilidade e Atualização Contínua de Status e Progresso do Ecossistema
+**Objetivo:** Estabelecer uma arquitetura de dados e automação para rastrear, validar e publicar com fidelidade o status dos marcos (*milestones*), capacidades ativas, interfaces e progresso do firmware e ferramentas.
+
+- **Etapa 5.1: Fonte Única da Verdade Estruturada (`docs/status.json`) — [CONCLUÍDA]**
+  - Implementação de esquema canônico em JSON com metadados do projeto, status de cada milestone (M1 a M6), porcentagem de progresso, capacidades ativas, interfaces USB compostas, applets e políticas de governança (zero GPL/LGPL, não-exportabilidade de chaves).
+  - Centralização de métricas: qualquer alteração de status parte obrigatoriamente deste arquivo.
+- **Etapa 5.2: Motor de Renderização Vetorial Automatizado (`scripts/update_status_svg.py` & `docs/images/status.svg`) — [CONCLUÍDA]**
+  - Criação do script em Python puro (`scripts/update_status_svg.py`), sem dependências externas (stdlib apenas), que consome `docs/status.json` e renderiza deterministicamente o painel visual SVG.
+  - O painel exibe graficamente os 6 milestones em grade 2x3, barras proporcionais de progresso, badges semânticos coloridos, interfaces USB e versão do firmware.
+- **Etapa 5.3: Gate de Validação Contínua no Pipeline de CI (`--check`)**
+  - Adicionar a etapa de checagem ao workflow do GitHub Actions (`.github/workflows/ci.yml`):
+    `python scripts/update_status_svg.py --check`
+  - Se um pull request alterar `docs/status.json` sem atualizar `docs/images/status.svg` (ou vice-versa), o CI falha imediatamente com aviso explicativo, impedindo descompassos na documentação.
+- **Etapa 5.4: Sincronização com o Ciclo de Release e Versionamento**
+  - Conectar a automação de release (`scripts/build-uf2.ps1 -Release` e `.github/workflows/release.yml`) para verificar se a versão em `[workspace.package].version` do `Cargo.toml`, `version.md` e `docs/status.json` coincidem antes de gerar a tag final `v*`.
+- **Etapa 5.5: Procedimento Operacional Padrão (SOP) de Atualização**
+  1. *Ao concluir uma tarefa:* O desenvolvedor atualiza `progress_percent` e/ou `status` no marco em `docs/status.json`.
+  2. *Execução local:* Roda `python scripts/update_status_svg.py` para sincronizar o vetor `docs/images/status.svg`.
+  3. *Atualização do Markdown:* Marca os checkboxes em `docs/MILESTONES.md` (`- [x]`) e registra a evidência em `validation.md` / `roadmap.md`.
+  4. *Validação:* Roda os gates (`cargo test`, `cargo fmt`, `python scripts/update_status_svg.py --check`).
 
 ---
 
@@ -158,3 +181,4 @@ O foco deste plano é guiar a transição de um firmware validado em bancada par
 1. **Conformidade de Licenciamento:** Todo o repositório e suas dependências de produção/distribuição auditados e livres de licenças copyleft (`GPL`/`LGPL`).
 2. **Autonomia do Ferramental:** O `aegistoken-host` e o Desktop Manager conseguem inspecionar, provisionar e gerenciar 100% dos recursos do dispositivo (FIDO2, CCID/PIV, OATH, Management HID e Firmware Update).
 3. **Qualidade de Código e Testes:** Todos os novos componentes passam nos gates de compilação estrita: `cargo fmt --all --check`, `clippy --all-targets -- -D warnings` e cobertura de testes automatizados.
+4. **Rastreabilidade e Sincronismo de Status:** `docs/status.json` e o painel `docs/images/status.svg` mantidos 100% sincronizados em todos os commits, com validação automatizada via `python scripts/update_status_svg.py --check` no pipeline de CI.

@@ -156,7 +156,14 @@ def wrap_session_key(
 
 
 def openpgp_cfb_encrypt(session_key: bytes, plaintext: bytes) -> bytes:
-    """The OpenPGP CFB of RFC 4880 §13.9, with the resynchronization."""
+    """The OpenPGP CFB of RFC 4880 section 13.9.
+
+    The stream starts with an all-zero feedback register and runs over the
+    whole plaintext with the block boundaries of the stream: the two octets of
+    the prefix that repeat the two before them are inside the stream (they are
+    the quick check of the session key, and this is what a real sender such as
+    GnuPG produces).
+    """
     bs = 16
     if len(plaintext) < bs + 2:
         raise ValueError("the plaintext must carry the BS+2 octet prefix")
@@ -164,20 +171,12 @@ def openpgp_cfb_encrypt(session_key: bytes, plaintext: bytes) -> bytes:
     encryptor = cipher.encryptor()
     out = bytearray()
     fr = b"\x00" * bs
-    fre = encryptor.update(fr)
-    first = bytes(x ^ y for x, y in zip(fre, plaintext[:bs]))
-    out += first
-    fr = first
-    fre = encryptor.update(fr)
-    out += bytes(x ^ y for x, y in zip(fre[:2], plaintext[bs : bs + 2]))
-    fr = bytes(out[2 : bs + 2])
-    rest = plaintext[bs + 2 :]
-    for offset in range(0, len(rest), bs):
-        block = rest[offset : offset + bs]
+    for offset in range(0, len(plaintext), bs):
+        block = plaintext[offset : offset + bs]
         fre = encryptor.update(fr)
         cipher_block = bytes(x ^ y for x, y in zip(fre, block))
         out += cipher_block
-        fr = cipher_block
+        fr = cipher_block.ljust(bs, b"\x00")
     return bytes(out)
 
 

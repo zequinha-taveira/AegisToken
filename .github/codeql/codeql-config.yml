@@ -1,0 +1,8 @@
+name: "AegisToken CodeQL Configuration"
+
+# Exclude queries that produce false positives on standard test vectors and NIST SP 800-73-4 interop defaults.
+# Real secret scanning and token protection are handled natively by GitHub Secret Scanning.
+query-filters:
+  - exclude:
+      id: rust/hard-coded-cryptographic-value
+

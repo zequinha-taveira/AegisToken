@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pcsc::{Card, Context, MAX_BUFFER_SIZE, Scope};
 
-use crate::card::{connect_card, format_hex, format_iso_status, AID_OATH};
+use crate::card::{AID_OATH, connect_card, format_iso_status};
 
 // ── YKOATH TLV tags ────────────────────────────────────────────────────────
 
@@ -145,7 +145,7 @@ fn select_oath(card: &Card) -> Result<Vec<u8>, String> {
 
 // ── Public commands ────────────────────────────────────────────────────────
 
-/// `oath-list [READER]` — list all stored OATH credentials.
+/// `oath list [--reader SUBSTR]` — list all stored OATH credentials.
 pub fn oath_list(reader_filter: Option<&str>) -> Result<ExitCode, String> {
     let ctx = Context::establish(Scope::User)
         .map_err(|e| format!("failed to establish PC/SC context: {e}"))?;
@@ -159,10 +159,7 @@ pub fn oath_list(reader_filter: Option<&str>) -> Result<ExitCode, String> {
     // LIST: CLA=00 INS=A1 P1=00 P2=00
     let (body, sw1, sw2) = transmit(&card, &[0x00, 0xA1, 0x00, 0x00])?;
     if (sw1, sw2) != (0x90, 0x00) {
-        return Err(format!(
-            "LIST failed: {}",
-            format_iso_status(sw1, sw2)
-        ));
+        return Err(format!("LIST failed: {}", format_iso_status(sw1, sw2)));
     }
 
     if body.is_empty() {
@@ -199,7 +196,7 @@ pub fn oath_list(reader_filter: Option<&str>) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `oath-code <NAME> [READER]` — calculate a TOTP/HOTP code.
+/// `oath code <NAME> [--reader SUBSTR]` — calculate a TOTP/HOTP code.
 pub fn oath_code(name: &str, reader_filter: Option<&str>) -> Result<ExitCode, String> {
     let ctx = Context::establish(Scope::User)
         .map_err(|e| format!("failed to establish PC/SC context: {e}"))?;
@@ -228,15 +225,9 @@ pub fn oath_code(name: &str, reader_filter: Option<&str>) -> Result<ExitCode, St
     let (body, sw1, sw2) = transmit(&card, &apdu)?;
     if (sw1, sw2) != (0x90, 0x00) {
         if (sw1, sw2) == (0x69, 0x84) {
-            return Err(format!(
-                "credential '{}' not found on device",
-                name
-            ));
+            return Err(format!("credential '{}' not found on device", name));
         }
-        return Err(format!(
-            "CALCULATE failed: {}",
-            format_iso_status(sw1, sw2)
-        ));
+        return Err(format!("CALCULATE failed: {}", format_iso_status(sw1, sw2)));
     }
 
     let truncated_value = tlv_find(&body, TAG_TRUNCATED)
@@ -255,12 +246,19 @@ pub fn oath_code(name: &str, reader_filter: Option<&str>) -> Result<ExitCode, St
     let code = binary % modulus;
 
     let remaining = u64::from(period) - (now.as_secs() % u64::from(period));
-    println!("{code:0>width$}  (valid for {remaining}s)", width = digits as usize);
+    println!(
+        "{code:0>width$}  (valid for {remaining}s)",
+        width = digits as usize
+    );
 
     Ok(ExitCode::SUCCESS)
 }
 
-/// `oath-add <URI> [READER]` — add a credential from an `otpauth://` URI.
+/// `oath add [--uri-stdin] [--reader SUBSTR]` — add a credential from an
+/// `otpauth://` URI.
+///
+/// The URI contains the shared secret, so the CLI acquires it from stdin or a
+/// hidden prompt and passes it here; it is never accepted from `argv`.
 pub fn oath_add(uri: &str, reader_filter: Option<&str>) -> Result<ExitCode, String> {
     let cred = parse_otpauth_uri(uri)?;
 
@@ -302,7 +300,11 @@ pub fn oath_add(uri: &str, reader_filter: Option<&str>) -> Result<ExitCode, Stri
         ));
     }
 
-    let kind_str = if cred.kind == TYPE_TOTP { "TOTP" } else { "HOTP" };
+    let kind_str = if cred.kind == TYPE_TOTP {
+        "TOTP"
+    } else {
+        "HOTP"
+    };
     let algo_str = algorithm_name(cred.algorithm);
     println!(
         "Credential added: {} ({}, {}, {} digits)",
@@ -311,7 +313,7 @@ pub fn oath_add(uri: &str, reader_filter: Option<&str>) -> Result<ExitCode, Stri
     Ok(ExitCode::SUCCESS)
 }
 
-/// `oath-delete <NAME> [READER]` — delete a credential by name.
+/// `oath delete <NAME> [--reader SUBSTR]` — delete a credential by name.
 pub fn oath_delete(name: &str, reader_filter: Option<&str>) -> Result<ExitCode, String> {
     let ctx = Context::establish(Scope::User)
         .map_err(|e| format!("failed to establish PC/SC context: {e}"))?;
@@ -344,7 +346,7 @@ pub fn oath_delete(name: &str, reader_filter: Option<&str>) -> Result<ExitCode, 
     Ok(ExitCode::SUCCESS)
 }
 
-/// `oath-reset [READER]` — factory-reset the OATH applet (erase all credentials).
+/// `oath reset [--reader SUBSTR]` — factory-reset the OATH applet (erase all credentials).
 pub fn oath_reset(reader_filter: Option<&str>) -> Result<ExitCode, String> {
     let ctx = Context::establish(Scope::User)
         .map_err(|e| format!("failed to establish PC/SC context: {e}"))?;
@@ -357,10 +359,7 @@ pub fn oath_reset(reader_filter: Option<&str>) -> Result<ExitCode, String> {
     // RESET: CLA=00 INS=04 P1=DE P2=AD
     let (_body, sw1, sw2) = transmit(&card, &[0x00, 0x04, 0xDE, 0xAD])?;
     if (sw1, sw2) != (0x90, 0x00) {
-        return Err(format!(
-            "RESET failed: {}",
-            format_iso_status(sw1, sw2)
-        ));
+        return Err(format!("RESET failed: {}", format_iso_status(sw1, sw2)));
     }
 
     println!("OATH applet reset. All credentials erased.");
@@ -370,7 +369,9 @@ pub fn oath_reset(reader_filter: Option<&str>) -> Result<ExitCode, String> {
 // ── otpauth:// URI parsing ─────────────────────────────────────────────────
 
 /// Parsed credential from an `otpauth://` URI.
-#[derive(Debug, Clone)]
+///
+/// Deliberately not `Debug`: the struct carries the decoded shared secret and a
+/// derived `Debug` would make `{:?}` a one-line secret leak.
 pub struct OtpAuthCredential {
     /// Label used as the credential name on device (e.g. "30/issuer:account").
     pub label: String,
@@ -382,8 +383,6 @@ pub struct OtpAuthCredential {
     pub digits: u8,
     /// Decoded secret bytes.
     pub secret: Vec<u8>,
-    /// Period in seconds (only meaningful for TOTP; default 30).
-    pub period: u32,
     /// Initial counter (only meaningful for HOTP; default 0).
     pub counter: u32,
 }
@@ -393,7 +392,7 @@ pub fn parse_otpauth_uri(uri: &str) -> Result<OtpAuthCredential, String> {
     // Strip scheme
     let rest = uri
         .strip_prefix("otpauth://")
-        .ok_or_else(|| format!("URI must start with 'otpauth://': {uri}"))?;
+        .ok_or_else(|| "URI must start with 'otpauth://'".to_string())?;
 
     // Type
     let (kind_str, rest) = rest
@@ -506,7 +505,6 @@ pub fn parse_otpauth_uri(uri: &str) -> Result<OtpAuthCredential, String> {
         algorithm,
         digits,
         secret,
-        period,
         counter,
     })
 }
@@ -515,16 +513,11 @@ pub fn parse_otpauth_uri(uri: &str) -> Result<OtpAuthCredential, String> {
 
 /// Extract the TOTP period from a YKOATH credential name like "30/issuer:user".
 fn credential_period(name: &str) -> u32 {
-    if let Some(slash_pos) = name.find('/') {
-        if slash_pos > 0 {
-            if let Ok(p) = name[..slash_pos].parse::<u32>() {
-                if p > 0 {
-                    return p;
-                }
-            }
-        }
-    }
-    30
+    name.find('/')
+        .filter(|slash_pos| *slash_pos > 0)
+        .and_then(|slash_pos| name[..slash_pos].parse::<u32>().ok())
+        .filter(|period| *period > 0)
+        .unwrap_or(30)
 }
 
 fn algorithm_name(algo: u8) -> &'static str {
@@ -542,8 +535,8 @@ fn percent_decode(input: &str) -> String {
     let mut chars = input.bytes();
     while let Some(byte) = chars.next() {
         if byte == b'%' {
-            let hi = chars.next().and_then(|c| hex_digit(c));
-            let lo = chars.next().and_then(|c| hex_digit(c));
+            let hi = chars.next().and_then(hex_digit);
+            let lo = chars.next().and_then(hex_digit);
             if let (Some(h), Some(l)) = (hi, lo) {
                 out.push((h << 4 | l) as char);
             } else {
@@ -576,10 +569,7 @@ fn parse_query(query: &str) -> Vec<(String, String)> {
         .split('&')
         .filter_map(|pair| {
             let (key, value) = pair.split_once('=')?;
-            Some((
-                percent_decode(key),
-                percent_decode(value),
-            ))
+            Some((percent_decode(key), percent_decode(value)))
         })
         .collect()
 }
@@ -615,7 +605,7 @@ fn base32_value(ch: char) -> Result<u8, String> {
         'A'..='Z' => Ok(ch as u8 - b'A'),
         'a'..='z' => Ok(ch as u8 - b'a'),
         '2'..='7' => Ok(ch as u8 - b'2' + 26),
-        _ => Err(format!("invalid Base32 character: '{ch}'")),
+        _ => Err("invalid Base32 character".to_string()),
     }
 }
 
@@ -629,26 +619,26 @@ mod tests {
 
     #[test]
     fn base32_rfc4648_vectors() {
-        // RFC 4648 test vectors
+        // RFC 4648 §10 test vectors.
         assert_eq!(base32_decode("MY").unwrap(), b"f");
-        assert_eq!(base32_decode("MFRA").unwrap(), b"fo");
-        assert_eq!(base32_decode("MFRGG").unwrap(), b"foo");
-        assert_eq!(base32_decode("MFRGGZA").unwrap(), b"foob");
-        assert_eq!(base32_decode("MFRGGZDF").unwrap(), b"fooba");
-        assert_eq!(base32_decode("MFRGGZDFY").unwrap(), b"foobar");
+        assert_eq!(base32_decode("MZXQ").unwrap(), b"fo");
+        assert_eq!(base32_decode("MZXW6").unwrap(), b"foo");
+        assert_eq!(base32_decode("MZXW6YQ").unwrap(), b"foob");
+        assert_eq!(base32_decode("MZXW6YTB").unwrap(), b"fooba");
+        assert_eq!(base32_decode("MZXW6YTBOI").unwrap(), b"foobar");
     }
 
     #[test]
     fn base32_padding_stripped() {
         assert_eq!(
             base32_decode("JBSWY3DPEHPK3PXP").unwrap(),
-            b"Hello!DEj\xdc\xf7"
+            b"Hello!\xde\xad\xbe\xef"
         );
     }
 
     #[test]
     fn base32_case_insensitive() {
-        assert_eq!(base32_decode("mfrggzdf").unwrap(), b"fooba");
+        assert_eq!(base32_decode("mzxw6ytb").unwrap(), b"fooba");
     }
 
     #[test]
@@ -661,16 +651,14 @@ mod tests {
 
     #[test]
     fn parse_totp_minimal() {
-        let cred = parse_otpauth_uri(
-            "otpauth://totp/Example:alice@example.com?secret=JBSWY3DPEHPK3PXP",
-        )
-        .unwrap();
+        let cred =
+            parse_otpauth_uri("otpauth://totp/Example:alice@example.com?secret=JBSWY3DPEHPK3PXP")
+                .unwrap();
         assert_eq!(cred.kind, TYPE_TOTP);
         assert!(cred.label.starts_with("30/"));
         assert!(cred.label.contains("Example:alice@example.com"));
         assert_eq!(cred.algorithm, ALGORITHM_SHA1);
         assert_eq!(cred.digits, 6);
-        assert_eq!(cred.period, 30);
         assert!(!cred.secret.is_empty());
     }
 
@@ -683,17 +671,15 @@ mod tests {
         assert_eq!(cred.kind, TYPE_TOTP);
         assert_eq!(cred.algorithm, ALGORITHM_SHA256);
         assert_eq!(cred.digits, 8);
-        assert_eq!(cred.period, 60);
         assert!(cred.label.starts_with("60/"));
         assert!(cred.label.contains("Example:alice"));
     }
 
     #[test]
     fn parse_hotp() {
-        let cred = parse_otpauth_uri(
-            "otpauth://hotp/Counter%20Test?secret=JBSWY3DPEHPK3PXP&counter=42",
-        )
-        .unwrap();
+        let cred =
+            parse_otpauth_uri("otpauth://hotp/Counter%20Test?secret=JBSWY3DPEHPK3PXP&counter=42")
+                .unwrap();
         assert_eq!(cred.kind, TYPE_HOTP);
         assert_eq!(cred.counter, 42);
         assert!(!cred.label.contains('/'));
@@ -711,14 +697,8 @@ mod tests {
 
     #[test]
     fn parse_rejects_bad_digits() {
-        assert!(parse_otpauth_uri(
-            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&digits=5"
-        )
-        .is_err());
-        assert!(parse_otpauth_uri(
-            "otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&digits=9"
-        )
-        .is_err());
+        assert!(parse_otpauth_uri("otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&digits=5").is_err());
+        assert!(parse_otpauth_uri("otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&digits=9").is_err());
     }
 
     // -- credential_period ------------------------------------------------
@@ -740,10 +720,7 @@ mod tests {
         append_tlv(&mut buf, TAG_CHALLENGE, &[0xDE, 0xAD]);
 
         assert_eq!(tlv_find(&buf, TAG_NAME), Some(b"test".as_slice()));
-        assert_eq!(
-            tlv_find(&buf, TAG_CHALLENGE),
-            Some([0xDE, 0xAD].as_slice())
-        );
+        assert_eq!(tlv_find(&buf, TAG_CHALLENGE), Some([0xDE, 0xAD].as_slice()));
         assert_eq!(tlv_find(&buf, 0x99), None);
     }
 
@@ -778,5 +755,26 @@ mod tests {
         assert_eq!(percent_decode("hello%20world"), "hello world");
         assert_eq!(percent_decode("foo+bar"), "foo bar");
         assert_eq!(percent_decode("a%2Fb"), "a/b");
+    }
+
+    // -- secret redaction -------------------------------------------------
+
+    #[test]
+    fn bad_scheme_error_does_not_echo_the_uri() {
+        let uri = "http://example.com/?secret=S3NT1NEL";
+        let error = parse_otpauth_uri(uri).err().expect("rejected");
+        assert!(error.contains("otpauth://"), "{error}");
+        assert!(!error.contains(uri), "{error}");
+        assert!(!error.contains("S3NT1NEL"), "{error}");
+    }
+
+    #[test]
+    fn invalid_base32_error_does_not_echo_the_character() {
+        let error = parse_otpauth_uri("otpauth://totp/Test?secret=AAAA!")
+            .err()
+            .expect("rejected");
+        assert!(error.contains("Base32"), "{error}");
+        assert!(!error.contains('!'), "{error}");
+        assert!(!error.contains("AAAA"), "{error}");
     }
 }

@@ -39,6 +39,9 @@ board-generic-rp2350 = { path = "crates/board-generic-rp2350", default-features 
 # backend, which talks to the device through the inbox HID driver).
 rusb = { version = "0.9", default-features = false, features = ["vendored"] }
 pcsc = "2.9"
+# Host-only, hidden interactive prompt for secrets. Never accepted via argv;
+# stdin is the non-interactive channel. Apache-2.0.
+rpassword = "7.5"
 iso7816 = "0.2.2"
 x509-cert = "0.3"
 

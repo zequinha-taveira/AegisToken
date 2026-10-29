@@ -136,10 +136,146 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   material (certificates, data objects) may be imported.
 - **PIN state is persistent and fail-closed.** Retry counters, blocked states
   and unblock flows are sealed with the OTP-derived key and survive power
-  cycles; every failed attempt decrements before any other work.
+  cycles; every failed attempt decrements before any other work. Unblock is
+  fail-closed at each applet's command handler: the OpenPGP `RESET RETRY
+  COUNTER` (`P1=0x02, P2=0x81`) requires the admin PIN already verified in
+  the session (`pw3_verified`) and answers `6982` without touching any state
+  otherwise; the resetting-code path (`P1=0x00`) answers `6A81` while the
+  code is not provisioned; unknown parameters answer `6A86`; a successful
+  unblock restores the PW1 counter, never touches the admin PIN and does not
+  consume the PW3 session (it survives until `select()`). The PIN slot itself
+  writes the new hash without knowing about sessions — the authorization is
+  the caller's obligation (PIV verifies the PUK, OpenPGP requires the PW3).
+  Admin mutations are session-gated: in OpenPGP, `CHANGE REFERENCE DATA` of
+  the **PW3** (`P2=0x83`) also requires the admin session (`pw3_verified`)
+  and answers `6982` before touching the slot, the counter, the session
+  flags or the store (a session refusal neither consumes a retry nor
+  persists); the current PIN in the command body remains a second factor
+  (`slot.change` still verifies it) and the session survives the swap (only
+  `select()` clears it). The **PW1** change (`P2=0x81`/`0x82`) keeps the
+  current-PIN-in-data authority — card-spec/ecosystem behavior. The body is
+  the card-spec one, the exact concatenation `current‖new` with no delimiter
+  (`Lnew = Lc − Lold`): a body outside the format window `12 ≤ Lc ≤ 254` is
+  refused with `6A80` before touching the slot (no attempt consumed, no
+  save), and inside it the length known in the card is resolved by scanning
+  the slot's stored hash — a read that consumes no attempt; a body no
+  candidate delimits costs exactly one attempt (`63Cx` persisted), the same
+  price a fixed-width change already charged for a wrong current PIN.
+  A failed save in a PIN-mutating OpenPGP handler is **observable**: `VERIFY`
+  (when it consumes an attempt), `CHANGE REFERENCE DATA`, `RESET RETRY
+  COUNTER` and an accepted `PUT DATA` answer `6A84` instead of confirming a
+  mutation that the store refused (a successful `VERIFY` moves nothing
+  persistable and emits no save). The in-session RAM state stays
+  restrictive and each reload is clamped to a per-slot sticky floor — the
+  lowest retry counter known to be persisted or consumed in the session.
+  **Trade-offs:** the floor is intra-session (it survives `select()`, is
+  zeroed on a power cycle), and writing ahead of every attempt is
+  deliberately rejected for flash wear. Until a good save re-anchors the
+  floor, a power cycle can therefore restore the persisted counter when the
+  save of the consumed attempt failed — this is the documented degradation
+  model for a failing flash, not an unintended gap.
+  The PIV applet follows the same rule on its own per-slot records: a `VERIFY`
+  that consumes an attempt, `CHANGE REFERENCE DATA` and `RESET RETRY COUNTER`
+  answer `6A84` when the save of the mutated record fails, and only the record
+  of the slot that changed is written (`RECORD_PIN`/`RECORD_PUK`), so a
+  refused save is attributable to one slot and is never confirmed as
+  `63Cx`/`9000`. A successful `VERIFY`, an empty `VERIFY` and the parameter,
+  length, format and blocked refusals (`6A86`, `6A88`, `6A80`, `6985`, `6700`,
+  `6983`) save nothing. Its reloads are clamped to the same sticky per-slot
+  floor (`pin_floor`/`puk_floor`, independent per slot): a failed save lowers
+  the floor to the RAM counter — an unblock that did not persist can never
+  raise it, so the next `SELECT` stays blocked — and a later good save
+  re-anchors it. This matters more in PIV because a CCID stack reselects the
+  AID per operation, so the floor is what closes the re-select window; between
+  power cycles the persisted state governs, under the same trade-offs
+  (intra-session floor, write-ahead rejected for flash wear).
+  The OATH applet applies the same fail-closed rule to `RESET`
+  (`P1=0xDE, P2=0xAD`), with the order inverted: the store erase (`clear`) is
+  committed **before** any volatile cleanup, and a store refusal answers
+  `6A84` instead of `9000` — credentials, access code and the authentication
+  flags stay exactly as they were, and only an armed touch request (`pending`)
+  is dropped. The order is what closes the hole here, because the empty OATH
+  volatile state is the **permissive** side (`require_auth` releases when
+  `auth_key` is empty), unlike the restrictive PIV/OpenPGP floor: clearing RAM
+  first and failing the erase would silently disable the access code for the
+  session and let the next save persist a state without it. There is no floor
+  and no rollback: either the erase persisted and the RAM is cleared, or
+  nothing changes. The happy path is a **single** write (the redundant
+  `save_state()` of the empty blob was removed: it duplicated the erase and
+  its failure had no correct answer), the removed persisted state is the whole
+  blob (credentials, access code, HMAC algorithm/challenge; the in-session
+  `auth_algorithm` lingers in RAM untouched, since it never leaves the blob
+  on its own), and `P1`/`P2` outside the canonical pair answer `6D00` without
+  touching the store. `INS_RESET`
+  stays unauthenticated (YKOATH: it erases, it never reveals) and the erase is
+  **logical** — the `SealedBlob` slot rotation may keep older sealed
+  generations until they are overwritten.
+  The OATH **read** path is fail-closed as well: `OathStore::load` distinguishes
+  `Some(0)` (blank store — a virgin region or an erased record, a legitimate
+  empty state) from `None` (IO, corruption or an undecryptable record), so the
+  sealed adapter maps `Err` to `None` instead of collapsing it into "no state".
+  Any `None`, or a blob the decoder refuses, closes the applet for the session:
+  it answers `6F00` to every state command (`LIST`, `CALCULATE`,
+  `CALCULATE ALL`, `PUT`, `DELETE`, `SET CODE`, `VALIDATE`, `confirm_presence`)
+  and normalizes the volatile state to the boot state, so a failed read cannot
+  disable the access code or let a `PUT` overwrite the blob that was not read.
+  The direction is forced by the asymmetry with the other applets: the empty
+  OATH state is the **permissive** side, whereas the OpenPGP default is
+  restrictive and PIV answers `6F00` in its own `SELECT`. Accepted decisions,
+  not gaps: (a) `SELECT` keeps answering the FCI (`9000`) so the recovery path
+  stays reachable from the standard tooling, but the access-code block
+  (`TAG_CHALLENGE`/`0x7B`) is omitted and `authenticated` stays false while
+  closed; (b) `RESET` (`DE AD`) is the **necessary exception** — it erases and
+  reveals nothing, its own result stays fail-closed (`6A84` keeps the applet
+  closed) and, once the erase persists, the applet is open only over the empty
+  state that erase proved, with the next `SELECT` reading the store again;
+  (c) every `SELECT` is a fresh attempt and the refusal is volatile (never
+  persisted), so a recovered read reopens the applet with its credentials and
+  access code; (d) an unknown instruction while closed answers `6F00`, because
+  state availability precedes instruction refusal. The trigger (a sick flash)
+  sits outside the live threat model; this is robustness in the restrictive
+  direction. The operational cost is documented in `validation.md`: a `RESET`
+  during a transient failure erases credentials a later `SELECT` could have
+  recovered, so reselect before resetting.
+  The OATH **pending touch request** is bounded and dropped by mutation.
+  `pending` holds an index into the credential vector plus the moving-factor
+  parameters, so `confirm_presence` re-checks the index against the current
+  length before indexing and answers `6985` when it no longer fits: indexing
+  outside the vector would panic in `no_std` and halt the whole firmware
+  (FIDO2, Management, PIV and OATH share one binary), and a shifted index would
+  return another credential's code under a touch granted for the first. Every
+  handler that changes the credential set drops the request first - `put`,
+  `delete` (unconditionally, before authentication, name resolution and the
+  store write, so a refused `DELETE` (`6982`/`6984`/`6A80`) or a failed save
+  (`6A84`) disarms too) - and so do the pre-existing paths that reset the
+  volatile state (`RESET`, RAM normalization) or restart the session
+  (`SELECT`), because the authorization belongs to the credential that asked
+  for it, not to whatever a later write stores. `CALCULATE ALL` is
+  read-only over the set (HOTP entries are reported without computing, so no
+  counter moves) and does not disarm, and neither does the HOTP counter bump in
+  `calculate_index`, which runs after the request was consumed. An invalid
+  index **collapses** into the same `6985` as "no pending request" (no oracle:
+  the card never says whether the credential was deleted or never requested)
+  and no new status word is introduced. **Trade-off:** a host that interleaves
+  a `PUT`/`DELETE` between the armed `CALCULATE` and the confirmation receives
+  `6985` and reissues the `CALCULATE`, the same handling as a cancelled touch.
+  This is defensive robustness, not a reachable exposure: `Card::poll`
+  serializes presence today (no frame is processed between the `6FF0` and the
+  confirmation), so the applet keeps the invariant locally instead of
+  inheriting it from the transport.
 - **Secrets are sealed at rest.** Credential keys, OATH secrets, PIN-derived
   values and data objects are stored in sealed records (AES-256-GCM under the
   OTP root key); no applet response can export them.
+- **The state an accepted command writes survives the session.** The decoder
+  accepts the geometry its writer produces above the 48-octet slab, so the blob
+  a sealed store holds is the state the next boot and every `select()` read
+  back (OpenPGP: the decryption slot with `len = 104` — 32-octet ECDH scalar
+  plus 72 octets of RFC 6637 material — under `UNSET` or ECDH P-256); every
+  other width, slot or algorithm stays fail-closed. No `STATE_VERSION` bump and
+  no migration: a blob written before the decoder learned that geometry decodes
+  unchanged. The provisioned RFC 6637 material is card state, not a new secret:
+  the sender's ciphertext plus public parameters, with the private key staying
+  in the slot.
 - **The card's private key never leaves it, and the ECDH model is the one the
   specification defines.** The OpenPGP Card 3.4.1 §4.4.3.8 defines the ECDH
   `PSO:DECIPHER` as a *partial decrypt*: the card calculates the shared secret
@@ -148,14 +284,51 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   itself. The release of that derived value is gated by the verification of PW1
   in mode 82 (and by the touch policy, when enabled). The card can also
   decrypt on its own, following RFC 6637 §8 (KDF of §7, AES key wrap of
-  RFC 3394, the OpenPGP symmetric layer of RFC 4880 §13.9 with the
-  resynchronization, the quick check and the modification detection code); in
-  that mode the shared secret never leaves the card. Only ciphertext (the
-  wrapped session key) is importable; the private key of the slot is generated
-  on the device and never imported. The primitives live in
-  `aegis-applets::ecdh` and `aegis-applets::pgp_sym`, covered by the RFC 3394
-  test vectors and by an independent reference implementation of the symmetric
-  layer (`tests/openpgp_sym_reference.py`).
+  RFC 3394, the OpenPGP symmetric layer of RFC 4880 §13.9 with the continuous
+  CFB chain, the quick check and the modification detection code); in that mode
+  the shared secret never leaves the card. Only ciphertext (the wrapped session
+  key) and public material (the recipient fingerprint) are importable; the
+  private key of the slot is generated on the device and never imported.
+  Provisioning only accepts material the decipher can actually consume
+  (`PUT DATA D2`: P-256 with the KDF of SHA-256, AES-128/192/256 as the KEK
+  and a wrapped key in the RFC 3394 block domain); anything outside the
+  domain is refused with `0x6A80` at the border, so nothing accepted can
+  fail only at the first real decipher. The
+  primitives live in `aegis-applets::ecdh` and `aegis-applets::pgp_sym`, covered
+  by the RFC 3394 test vectors, by an independent reference implementation of
+  the symmetric layer (`tests/openpgp_sym_reference.py`) and by an end-to-end
+  interoperability test with a real GnuPG (`openpgp::tests::gnupg_interop`).
+  The symmetric layer of RFC 4880 §13.9 compares its key-derived material —
+  the quick-check octets, the MDC packet structure and the SHA-1 of the
+  modification detection code — in constant time, through the same
+  `constant_time_eq` accumulator discipline as the PIN comparison; the failure
+  categories stay distinguishable by status word (`0x6F00` vs `0x6A80`) on
+  purpose, for protocol interoperability, and only the timing *inside* each
+  category is uniform — a documented behavior, not a gap. The adversarial
+  contract of the data-heavy commands is pinned by the host suite
+  (`openpgp::tests::adversarial_apdu`): every structurally malformed
+  `PSO:DECIPHER` frame and every `PUT DATA D2` body out of the domain answers
+  a single closed status word (`0x6A80` at the border, `0x6F00` when the size
+  or the wrap can only fail later) with an empty body, no panic, no save and
+  no state change, and no refusal ever echoes the private scalar, the wrapped
+  session key or a shared secret off its documented route (window-checked per
+  refusal). The deterministic `0x9000` + `Z` of the partial decrypt remains
+  the only route where derived secret material leaves the card, gated by PW1
+  in mode 82; an all-zero X25519 point agrees to the all-zero shared secret —
+  the card accepts it as curve behavior, and refusing non-contributory points
+  is a documented non-goal; ciphertext the card cannot decrypt answers
+  `0x6F00` without ever being decoded upstream; the 2048-octet response
+  window of the full-RFC 6637 decipher is a recorded interop decision — it is
+  kept, not widened (`specs/openpgp-decipher-response-window.md`): at the
+  applet boundary a 2048-octet message answers `0x9000` byte for byte and
+  2049 answers `0x6A84` with an empty body. Over the real CCID transport that
+  window is unreachable because the command input closes first: the largest
+  scdaemon-shaped command (`86‖80`, extended frame) that fits one 2100-octet
+  CCID message answers `0x9000` byte for byte, and one octet of frame more
+  dies in the assembler with `CcidError::Overflow` before any applet code
+  runs — the firmware then resets the card silently and answers nothing
+  (documented, not negotiated). Messages over the window are the documented
+  partial decrypt (card spec `0x9000` + `Z`) or a host-side job.
 - **Each signing operation honours its touch policy.** When a slot or
   credential requires touch, the applet arms the contextual presence machine
   and fails with the applet's standard error on absence or timeout.
@@ -181,3 +354,45 @@ The PIV, OpenPGP and OATH applets must preserve the following invariants:
   the device is a YubiKey. Any VID/PID profile used to exercise tools that
   filter by Yubico identity is laboratory-only, requires authorization, and
   must never be distributed.
+
+## Host tooling
+
+The host side is part of the trust boundary: a secret that leaks on the host
+defeats the on-device protections. The host tools follow these rules:
+
+- **A secret is never accepted in `argv`.** The OS exposes a process command
+  line to other local processes (`ps`, `/proc/<pid>/cmdline`, Task Manager,
+  WMI) and keeps it in shell history. `aegistoken-host` rejects `--key` and
+  `--old-key` (and a positional key for `piv-set-mgmt-key`), and
+  `scripts/set_pin.py` and `scripts/validate_fido.py` reject `--pin` and
+  `--old-pin`, with exit code 2. The refusal names the option but never echoes
+  the value or a fragment of it.
+- **The channels are a hidden prompt or stdin.** With a terminal, the secret
+  is read through a hidden prompt (`rpassword`/`getpass`, host-only,
+  Apache-2.0). For automation it arrives on stdin
+  (`--key-stdin`/`--old-key-stdin`, `--pin-stdin`/`--old-pin-stdin`,
+  `validate_fido.py --pin-stdin`); the mode is all-or-nothing, and `--change`
+  reads the current secret first and the new one second. `validate_fido.py`
+  without a PIN flag still runs the presence-only checks. Without a terminal
+  and without the flags the tool fails instead of prompting or echoing. Stdin
+  keys are parsed by a shape-only parser that reports length and encoding
+  class, never the bytes.
+- **Errors and logs stay redacted.** `set_pin.py` and `validate_fido.py` remove
+  every acquired secret from the error text before printing it. No secret is
+  written to a temporary file, a config file or a log. In `set_pin.py`,
+  `--help` is processed before any secret is touched, so `--help --pin <value>`
+  prints the usage without reading or echoing the value; the Rust CLI and
+  `validate_fido.py` reject a secret option at parse time even when `--help` is
+  also present (it never reaches a prompt). `validate_fido.py` also never prints
+  the temporary PIN used by its `changePIN` round trip.
+- **The OATH URI is a secret carrier too.** An `otpauth://` URI contains the
+  shared `secret=`, so `aegistoken-host oath add` accepts it only from
+  `--uri-stdin` (pipe) or the hidden prompt, refuses a positional URI without
+  echoing it, and the parser reports the shape of an invalid URI or Base32
+  input without echoing the value or a character of it. `OtpAuthCredential` has
+  no `Debug` implementation, so the decoded secret cannot be printed by `{:?}`.
+- **A leaked secret is rotated, not deprecated.** There is no compatibility
+  opt-in for argv secrets: the only remediation is to rotate the exposed key
+  or PIN and clear the shell history. The `rpassword` dependency is
+  host-only and never enters the firmware workspace members.
+

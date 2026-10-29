@@ -131,6 +131,31 @@ no `build.rs` e é exercitado por testes de host em `crates/aegis-build-support`
 O CI usa `-Release` nas **tags versionadas** (o job de nightly continua em
 modo de desenvolvimento, com o aviso embutido e a nota no release).
 
+### Registro da imagem de release local
+
+| Item | Valor |
+|------|-------|
+| Chave privada de update | `C:\Users\<usuário>\.aegistoken\release-update-key.pem` (fora do repositório, nunca commitada) |
+| Chave pública injetada | `AEGIS_UPDATE_VENDOR_PUBKEY` (65 bytes SEC1, hex) — só o valor, nunca a privada |
+| Artefato | `AegisToken-0.2.1.uf2` (≈ 674 KiB), `picotool info` → `target chip: RP2350`, `image type: ARM Secure` |
+| Verificação | a chave pública de release está no binário e a chave de desenvolvimento (ponto gerador do P-256) **não** está |
+
+A chave privada é o segredo de assinatura dos pacotes de atualização: perdê-la
+impede de assinar updates futuros, e vazá-la permite assinar imagens
+arbitrárias. Guarde-a offline (cópia cifrada) e nunca no repositório — o
+`.gitignore` bloqueia `*.pem` como segunda barreira.
+
+**Como refazer a imagem de release**
+
+```powershell
+python scripts/gen-update-key.py "$env:USERPROFILE\.aegistoken\release-update-key.pem"
+$env:AEGIS_UPDATE_VENDOR_PUBKEY="<hex de 65 bytes>"
+& scripts/build-uf2.ps1 -Release
+```
+
+O gate falha antes de compilar quando a chave está ausente, malformada ou é a
+chave de desenvolvimento.
+
 ## U2F_REGISTER (atestação)
 
 `U2F_REGISTER` exige um certificado de atestação e retorna
@@ -180,6 +205,9 @@ do próprio libusb (sem WinUSB/Zadig):
 ```powershell
 cargo run -p aegistoken-host -- validate
 ```
+
+Operações que exigem a chave de gestão PIV nunca a recebem em `argv`: use o
+prompt oculto ou `--key-stdin`/`--old-key-stdin` com pipe (ver `README.md`).
 
 ## Publicação automatizada de releases (GitHub Actions)
 

@@ -20,7 +20,7 @@ Documento vivo: cada fase é marcada conforme concluída e verificada.
 | 10 | Validação de hardware (AC-001..AC-015) | Concluída (bootrom/OTP pendentes) |
 | 11 | `aegis-applets`: APDU, CCID e roteamento de applets | Concluída (hardware pendente) |
 | 12 | PIV (NIST SP 800-73-4) | Concluída (hardware pendente; persistência selada entregue) |
-| 13 | OATH (TOTP/HOTP) | Concluída (hardware pendente; persistência selada entregue) |
+| 13 | OATH (TOTP/HOTP) | Concluída (hardware pendente; persistência selada, `RESET` e leitura fail-closed entregues) |
 | 14 | OpenPGP card (v3.4) | Concluída (P-256 slice; hardware pendente; persistência selada entregue) |
 | 15 | SSH/Git signing + Ed25519 no CTAP2 | Concluída (firmware; hardware pendente) |
 | 16 | RSA (PIV/OpenPGP) | Em andamento (16a–16d em firmware; hardware pendente) |
@@ -35,6 +35,13 @@ Documento vivo: cada fase é marcada conforme concluída e verificada.
 - **Host:** `aegistoken-host` acessa o Management HID via **libusb** (crate
   `rusb`, libusb embutida), sem WinUSB/Zadig; no Windows usa o backend HID do
   libusb sobre o driver HID inbox.
+- **Segredos de host:** nunca em `argv` (visível a outros processos e no
+  histórico do shell). O canal é prompt oculto (`rpassword`/`getpass`, host-only)
+  em TTY ou stdin (`--key-stdin`/`--old-key-stdin`, `--pin-stdin`/`--old-pin-stdin`,
+  `--uri-stdin`, e `--pin-stdin` do `validate_fido.py`); `--key`/`--old-key`/
+  `--pin`/`--old-pin` são recusados (exit 1 no CLI, 2 em `set_pin.py` e
+  `validate_fido.py`) (`specs/host-secrets-not-in-argv.md`,
+  `specs/oath-cli-wiring.md`, `specs/validate-fido-pin-channel.md`, AC-034/035/036).
 - **Desktop Manager:** ainda não existe crate de Desktop Manager nem integração
   de "Ejetar" no repositório; por ora há apenas o CLI de host
   (`aegistoken-host`).
@@ -550,13 +557,14 @@ adiado.
 - 228 testes de host em `aegis-core` (3 novos: ordem dos candidatos, contagem
   de credenciais e assinatura do próximo candidato), clippy limpo em host e
   alvo, build de firmware e UF2 gerados.
-- `scripts/validate_fido.py --pin <PIN>` prova o PIN em todas as operações e
-  exercita a rotação e a enumeração em hardware.
+- `scripts/validate_fido.py --pin-prompt` (ou `--pin-stdin`) prova o PIN em
+  todas as operações e exercita a rotação e a enumeração em hardware.
 
 **Limitações registradas**
 
 - Com PIN configurado, clientes que não provem o PIN recebem `PinRequired`:
-  é o comportamento esperado, mas exige que o validador use `--pin`.
+  é o comportamento esperado, mas exige que o validador use `--pin-prompt` ou
+  `--pin-stdin`.
 
 ### 7g — Escopo e ciclo de vida do `pinUvAuthToken` (CTAP2.1) (concluída)
 
@@ -610,7 +618,7 @@ adiado.
   `deleteCredential` restrito ao RP, token sem vínculo de RP apaga qualquer
   credencial e invalidação pelo reset), clippy limpo em host e alvo, build de
   firmware gerado.
-- Gate de hardware (`scripts/validate_fido.py --pin <PIN>`) **pendente**:
+- Gate de hardware (`scripts/validate_fido.py --pin-prompt`) **pendente**:
   não há RP2350 físico nesta sessão. O validador **já cobre** os casos
   negativos desta fatia (token legado em credential management → 0x33; token
   `cm` com `rpId` → `enumerateRPsBegin` recusado; token `mc` vinculado a
@@ -945,6 +953,19 @@ adiado.
   `SELECT`, políticas de PIN (`never`/`once`/`always`) e de touch
   (`never`/`always`/`cached`), e enforcement de administrador em
   `PUT DATA`/`GENERATE ASYMMETRIC KEY PAIR`.
+- **Persistência fail-closed de PIN/PUK (fatia `specs/piv-pin-persistence.md`,
+  entregue):** `persist_pin` deixou de descartar o resultado da gravação — cada
+  mutação grava **só o record do slot mutado** (`RECORD_PIN`/`RECORD_PUK`) e
+  devolve o `bool`; `VERIFY` que consome tentativa, `CHANGE REFERENCE DATA` e
+  `RESET RETRY COUNTER` respondem **`6A84`** quando a store recusa a gravação,
+  nunca `63Cx`/`9000`. `VERIFY` bem-sucedido, `VERIFY` vazio e as recusas
+  (`6A86`/`6A88`/`6A80`/`6985`/`6700`/`6983`) não gravam — o save inútil depois
+  da recusa `6985` do `RESET` foi removido. Um **piso sticky por slot**
+  (`pin_floor`/`puk_floor`, volátil de sessão, clampeado no `load_state`)
+  impede que um `SELECT` ressuscite tentativas consumidas e um unblock não
+  persistido não sobe o piso (o `SELECT` seguinte continua bloqueado). 13
+  testes novos de host (238 em `aegis-applets`); a indução de falha de gravação
+  em hardware fica pendente em `validation.md`.
 - Cripto: ECDSA P-256/P-384 com assinatura sobre o *prehash* fornecido pelo
   host (padding à esquerda quando menor que a curva) e ponto público SEC1
   não comprimido em `7F49 { 86 }`; 3DES e AES em ECB de bloco único para o
@@ -1026,11 +1047,55 @@ adiado.
   totalizando **104 testes** em `aegis-applets`.
 - `scripts/validate_oath.py` (AC-018) com PC/SC, PUT/LIST/CALCULATE/DELETE e
   vetor RFC 6238.
+- **`RESET` fail-closed (fatia `specs/oath-reset-fail-closed.md`):** o `RESET`
+  (`DE AD`, sem autenticação) apaga a store **antes** de limpar a RAM e
+  responde `6A84` quando a gravação é recusada — credenciais, access code e
+  flags de sessão intactos, só o toque armado cai; `9000` só depois de o erase
+  persistir. Uma escrita por `RESET` (o `save_state()` redundante do blob
+  vazio foi removido) e `P1`/`P2` fora do par canônico → `6D00` sem tocar a
+  store. 7 testes novos, totalizando **245 testes** em `aegis-applets`.
+- **Leitura fail-closed (fatia `specs/oath-load-fail-closed.md`):** o contrato
+  de `OathStore::load` agora distingue `Some(0)` (store em branco, estado vazio
+  legítimo) de `None` (IO, corrupção ou blob indecifrável), e
+  `SealedOathStore::load` mapeia `Err → None` em vez de colapsar a falha em
+  "sem estado". `load_state` é a única autoridade sobre aberto/fechado: uma
+  leitura que falha (ou um blob que o decoder recusa) fecha o applet, que
+  responde `6F00` a todo comando de estado (`LIST`, `CALCULATE`,
+  `CALCULATE ALL`, `PUT`, `DELETE`, `SET CODE`, `VALIDATE` e
+  `confirm_presence`) e normaliza a RAM para o estado de boot — o "vazio" do
+  OATH é o lado permissivo. O `SELECT` continua respondendo `9000` com o FCI
+  (sem bloco de access code) e cada seleção é uma nova tentativa; o `RESET`
+  (`DE AD`) é a exceção deliberada (apaga sem revelar) e continua fail-closed
+  (`6A84` mantém o applet fechado). Nove testes novos (8 em `oath.rs`, 1 em
+  `sealed.rs`), totalizando **254 testes** em `aegis-applets`.
+- **`pending` com bound e desarme na mutação (fatia
+  `specs/oath-pending-bounds.md`):** o pedido de toque guarda um índice no
+  vetor de credenciais e o `confirm_presence` o valida contra o `len` corrente
+  antes de indexar — um índice velho responde `6985`, colapsado no mesmo SW de
+  "sem pedido pendente", em vez de indexar fora do bound (panic que pararia o
+  firmware inteiro) ou devolver o código de outra credencial. `PUT` e `DELETE`
+  desarmam o pedido incondicionalmente na entrada do handler, inclusive quando
+  o comando é recusado (`6982`/`6984`/`6A80`) ou a gravação falha (`6A84`);
+  `CALCULATE ALL` (somente leitura) e o incremento HOTP de `calculate_index`
+  (depois do `take()`) ficam fora do desarme. 5 testes novos, totalizando
+  **259 testes** em `aegis-applets`.
 
 **Pendências**
 
 - **AC-018 em hardware:** validação com `validate_oath.py`, `ykman oath` e
-  `pcscd`/`usbccid` ainda pendente.
+  `pcscd`/`usbccid` ainda pendente; a indução de falha de flash no `RESET`
+  (`6A84` com credenciais intactas) e na leitura (store ilegível → `6F00` com
+  `RESET` recuperando) também não é exercida pelo script e fica para
+  dispositivo real. Recomendação operacional: **reselecionar antes de
+  resetar** — durante uma falha transitória o `RESET` apaga credenciais que
+  um `SELECT` seguinte teria recuperado.
+- **Follow-ups deliberados fora desta fatia:** o fallback do firmware para
+  `MemoryOathStore` quando `SealedOathStore::open` falha (`main.rs` serve um
+  applet vazio, mutável e sem access code — decisão de firmware/HAL); e a
+  robustez do `SealedBlob`
+  quando um slot de commit antigo passa no CRC mas não abre no GCM (derruba o
+  load inteiro e pode impedir o `RESET`, que fica fail-closed sem recuperação
+  pelo protocolo até reflash/recovery/update).
 - **Persistência selada:** entregue via `SealedOathStore`
   (ver Persistência selada dos applets); sem chave raiz o firmware usa
   `MemoryOathStore` como antes.
@@ -1095,20 +1160,227 @@ adiado.
   precisam de validação externa.
 - **Cripto fora desta slice:** RSA, Ed25519/EdDSA e X25519/KDF OpenPGP ficam
   para as Fases 15–16.
-- **ECDH OpenPGP (S1 e S2 entregues, interop pendente):** o *partial decrypt*
-  da OpenPGP Card 3.4.1 §4.4.3.8 foi **mantido** (o cartão devolve o segredo
-  compartilhado, como a especificação define — a chave efêmera foi escolhida
-  pelo remetente, e a liberação é condicionada a PW1 modo 82), e o cartão
-  **ganhou** o modo em que decifra sozinho pela RFC 6637 §8, ativado quando o
-  host provisiona a chave de sessão embrulhada. As primitivas (KDF da §7, AES
-  Key Wrap da RFC 3394, camada simétrica da RFC 4880 §13.9 com *resync*,
-  *quick check* e MDC) estão em `aegis-applets::ecdh` e
-  `aegis-applets::pgp_sym`, com os vetores da RFC 3394, um vetor de referência
-  da KDF e uma implementação de referência independente da camada simétrica
-  (`tests/openpgp_sym_reference.py`). O material importado é cifrado; a chave
-  privada do slot nunca é importada. **Pendente:** o formato do
-  provisionamento é **provisório** (`PUT DATA 0xD2`) e a validação `gpg -d`
-  exige hardware. Spec: `specs/openpgp-rfc6637-ecdh.md`.
+- **ECDH OpenPGP (S1-S3 entregues, interop com o GnuPG verificada em host):**
+  o *partial decrypt* da OpenPGP Card 3.4.1 §4.4.3.8 foi **mantido** (o cartão
+  devolve o segredo compartilhado, como a especificação define — a chave
+  efêmera foi escolhida pelo remetente, e a liberação é condicionada a PW1 modo
+  82), e o cartão **ganhou** o modo em que decifra sozinho pela RFC 6637 §8,
+  ativado quando o host provisiona a chave de sessão embrulhada (mais o
+  fingerprint do destinatário, porque o `ctime` da chave não existe sem
+  relógio). As primitivas (KDF da §7, AES Key Wrap da RFC 3394, camada
+  simétrica da RFC 4880 §13.9 com *quick check* e MDC) estão em
+  `aegis-applets::ecdh` e `aegis-applets::pgp_sym`. A interop é exercida de
+  ponta a ponta com um GnuPG real
+  (`openpgp::tests::gnupg_interop`): o GnuPG gera a chave ECDH P-256, cifra uma
+  mensagem e o applet a decifra pelo caminho APDU; a mesma mensagem fixa o
+  vetor da camada simétrica nos dois sentidos. O material importado é cifrado;
+  a chave privada do slot nunca é importada. A interop também achou e corrigiu
+  dois desvios de conformidade: o ponto EC saía sob a tag `81` (a especificação
+  manda `86`) e o CFB tratava os dois octetos de *quick check* como ponto de
+  ressincronização (a cadeia é contínua com IV zero). **Pendente:** o formato
+  do provisionamento é **provisório** (`PUT DATA 0xD2`) e o ensaio `gpg -d`
+  contra o cartão físico exige hardware. Spec:
+  `specs/openpgp-rfc6637-ecdh.md`.
+- **OpenPGP S4 — `RESET RETRY COUNTER` exige PW3 verificado (entregue):** o
+  unblock do OpenPGP deixou de ser um caminho público (achado CRÍTICO do
+  `sec-audit`): o comando (`00 2C 02 81`, corpo de 8 bytes) agora exige
+  `pw3_verified` e responde `6982` sem alterar nenhum estado na negativa; o
+  caminho do Resetting Code (`P1=0x00`) responde `6A81` enquanto o BC não é
+  provisionado; `P1`/`P2` desconhecidos respondem `6A86` (antes `6A80`). O
+  desbloqueio autenticado restaura os retries do PW1 para o máximo da
+  política, nunca mexe no PW3 e **não** consome a sessão de PW3 (§7.2.14 da
+  card spec). A exigência de autoridade mora no handler do applet; a
+  primitiva `PinSlot::unblock` continua sem sessão, com o contrato de
+  chamadores (PUK no PIV, PW3 no OpenPGP) documentado em `pin.rs`. 7 testes
+  novos de host (179 em `aegis-applets`); a validação física do `0x2C` fica
+  pendente em `validation.md`. Spec: `specs/openpgp-unblock-auth.md`.
+- **OpenPGP S5 — persistência fail-closed dos mutadores de PIN (entregue):**
+  os quatro handlers que descartavam o resultado de `save_state()` (achado
+  MÉDIO do `sec-audit`) agora o propagam: `VERIFY` que consome tentativa,
+  `CHANGE REFERENCE DATA`, `RESET RETRY COUNTER` autenticado e `PUT DATA`
+  aceito respondem **`6A84`** quando a gravação falha (consistentes com
+  `generate`/`sign`); `VERIFY` bem-sucedido **não grava mais** (nada
+  persistível muda: flags são de sessão e sucesso não repõe contador — menos
+  desgaste e nenhum erro no caminho feliz). Ao falhar, o estado em RAM
+  permanece restritivo e um **piso sticky por slot** (`pw1_floor`/`pw3_floor`,
+  volátil de sessão: sobrevive a `select()`, não a power cycle) registra o
+  menor contador garantido persistido-ou-consumido; todo reload (`SELECT`,
+  inclusive o reprovisionamento de defaults) é clampeado a
+  `min(restaurado, piso)`, então um re-select nunca ressuscita tentativas —
+  e um persist ok subsequente reancora o piso. Gravação por tentativa
+  (*write-ahead*) ficou deliberadamente de fora por desgaste de flash; o
+  resíduo entre power cycles (o persistido governa) está documentado como
+  modelo de degradação física em `docs/security-model.md`. O mesmo gap no PIV
+  (`persist_pin` fail-open) foi entregue em `specs/piv-pin-persistence.md`
+  (Fase 12, mesma mecânica, arquivo próprio), mantendo a rastreabilidade. 10
+  testes novos de host (189 em `aegis-applets`); a falha de gravação não é
+  induzida em hardware neste ciclo (pendência em `validation.md`). Spec:
+  `specs/openpgp-pin-persistence.md`.
+- **OpenPGP S6 — `PUT DATA D2` fail-closed na fronteira (`kdf_hash`/
+  `wrapped_len`, entregue):** o material ECDH do slot de decifra
+  (`00 DA 00 D2`, achado MÉDIO do `sec-audit`) deixou de aceitar estado que o
+  cartão jamais conseguiria usar: o `kdf_hash` só é aceito se **SHA-256**
+  (`ecdh::HASH_SHA256` — o KDF da §7 do RFC 6637 implementado no cartão é
+  SHA-256 fixo e o GnuPG com P-256 usa SHA-256/AES-128, que o interop
+  comprova), o `wrapped_len` passou a exigir o domínio real do *key wrap* do
+  RFC 3394 (24/32/40/48 octets — a sessão OpenPGP mínima: alg + AES-128 +
+  checksum; len 8/16/25 e 49 viram `6A80` na provisionação em vez de `6F00` na
+  primeira decifra) e o KEK continua restrito a AES-128/192/256. A recusa
+  responde `WRONG_DATA` (`6A80`), não grava o slot e não emite save —
+  indistinguível das outras recusas de DO (sem oráculo de parse). D2 válido
+  idêntico ao interop (`0x08 0x07`) segue `9000` byte a byte e os atributos
+  X25519 (KDF-DO `0x0A 0x09` informativo) não são tocados (o X25519 não passa
+  pela D2). 5 testes novos de host além da extensão do interop (194 em
+  `aegis-applets`); a validação física fica pendente em `validation.md`. Spec:
+  `specs/openpgp-kdf-validation.md`.
+- **OpenPGP S7 — decifrador simétrico (quick-check e MDC) em tempo constante
+  (entregue):** as três verificações de material derivado da chave de sessão
+  no caminho `PSO: DECIPHER` (achado BAIXO do `sec-audit`) saíram do regime de
+  early-exit: o *quick check* dos dois octetos repetidos, o tag/length do
+  pacote MDC (`D3 14`) e o compare do SHA-1 do MDC — este último pelo
+  `constant_time_eq` do `pin.rs` (agora `pub(crate)`, o comparador do crate),
+  com `black_box` no resultado — são absorvidos por um acumulador
+  constante-tempo e decididos uma única vez no fim, por categoria; o SHA-1
+  também roda nos caminhos que terminam em `None`, então o tempo dentro das
+  classes `0x6F00` e `0x6A80` não depende de qual octeto ou de quantos bytes
+  do hash falharam. Nenhum SW, resultado ou API muda: quick-check/estrutura
+  ruim continua `6F00`, MDC corrupto continua `6A80` (`WRONG_DATA`) — a
+  distinção entre categorias é um comportamento de protocolo documentado
+  (interop GnuPG), não um gap, e o residual está em
+  `docs/security-model.md`. O vetor do GnuPG decifra igual e o `encrypt`
+  reproduz o ciphertext octeto a octeto. Timing não é medido em host nem em
+  hardware neste ciclo: a disciplina é estática (revisão + o helper testado
+  do `pin.rs`). 4 testes novos de host (3 em `pgp_sym` paramétricos por byte:
+  quick-check quebrado em qualquer posição e largura, flips de cada um dos 20
+  bytes do MDC com dados intactos, tag/length corrompidos; 1 SW em
+  `openpgp`). Spec: `specs/openpgp-mdc-constant-time.md`.
+
+- **OpenPGP S8 — suíte adversarial de APDU do caminho de decifra (entregue):**
+  testes de host exclusivos (8 novos em
+  `crates/aegis-applets/src/openpgp/tests/adversarial_apdu.rs`) que acusarão as
+  rotas de dados do decifrador através do SW real do cartão: frames
+  estruturalmente malformados de `PSO: DECIPHER` nas três famílias de slot
+  (RSA, ECDH P-256, X25519) → um SW fechado, corpo vazio, sem pânico, sem
+  gravação, sem mudança de estado; as quatro fronteiras de `wrapped_len`
+  (24/32/40/48) × KEK ids (7/8/9) × com/sem fingerprint de remetente em
+  `PUT DATA D2` importam byte a byte; corpos curtos ou fora da base declarada
+  → `6A80` zero gravações; material RFC 6637 fora da fronteira de leitura →
+  decifra parcial determinística (`9000` + Z, portão PW1 `82`); corpo além do
+  `MAX_DATA` (~4,3 KB via APDU estendido) → um único SW fechado sem pânico;
+  ponto zero X25519 → `9000` + 32 zeros como comportamento da curva (recusa de
+  pontos não contributivos é não-objetivo); e, embutido em cada recusa, um
+  anti-serialização por janela que garante que nenhuma resposta ecoa chave
+  privada, chave de sessão embrulhada ou segredo compartilhado fora da rota
+  documentada. Limitação registrada e **decidida pela fatia S12** (ver
+  abaixo): mensagens de 2049+ bytes respondem `6A84` com corpo vazio (2048
+  ainda cabe) — a janela foi mantida, com o teto real de transporte congelado
+  por teste. Achado do ciclo, sem fix nesta fatia: `PUT DATA D2` aceito
+  persiste `len = 104`, e o `decode_state` recusa slot não-RSA com
+  `len > 48` — numa sessão nova o applet perde chaves e PINs e reseta para os
+  padrões; recarregas na mesma sessão mascaram (chaves em RAM sobrevivem ao
+  decode falho e são salvas de volta). Fixado deliberadamente por
+  `d2_provisioned_state_survives_across_sessions` (assert invertido pela
+  fatia S9 abaixo). Spec: `specs/openpgp-apdu-adversarial-tests.md`. Suite em
+  206 testes de host em `aegis-applets`.
+
+- **OpenPGP S9 — o estado gravado por `PUT DATA D2` sobrevive à sessão (bug de
+  produção do S8 corrigido, entregue):** o `decode_state` aprendeu a única
+  geometria que `PUT DATA D2` aceito grava — slot de decifra, algoritmo UNSET
+  ou ECDH P-256, `len = 104` (32 octets de escalar + 72 octets de material RFC
+  6637) — além da laje de 48: o estado que o card escreve sobrevive ao boot
+  frio e ao re-`select` (chaves, PINs, contadores e DOs byte a byte; decifra
+  RFC 6637 fim a fim pós-reboot com o PIN persistido). Larguras desconhecidas
+  seguem fail-closed (103/105, 104 em slot 0/2, 104 com X25519/EdDSA/RSA) e o
+  material rasgado continua caindo no fallback parcial documentado (a leitura
+  em `EcdhMaterial::from_slot` é a fronteira que sobra). Sem bump de
+  `STATE_VERSION` nem migração: o blob gravado antes do reparo é byte-idêntico
+  e decodifica (livro-in); o escalar do `GENERATE` (`len` 32) segue aceito no
+  mesmo teste e v1/v2 (laje 48) ficam com as migrações
+  `state_v1_migrates_to_p256_defaults`/`state_v2_migrates_to_v3`. 5 testes
+  novos em `crates/aegis-applets/src/openpgp/tests/state_roundtrip.rs` +
+  inversão do teste S8 em `adversarial_apdu.rs`. Suite em **211 testes** de
+  host em `aegis-applets`. Física de hardware pendente: power cycle real com
+  material provisionado + decifra via GnuPG em RP2350; registrado em
+  `validation.md`.
+
+- **OpenPGP S10 — `CHANGE REFERENCE DATA` do PW3 exige a sessão de admin
+  (entregue):** fechou o último mutador administrativo fora da regra de
+  autorização da casa (irmão do achado da fatia S4): o `verify_change` agora
+  exige `pw3_verified` para `P2=0x83`, como `reset_retry`, `put_data` e
+  `generate` — sem sessão, responde `6982` antes de tocar o slot, sem
+  decrementar o contador do PW3, sem alterar o hash e sem `persist_state()`
+  (a recusa por falta de sessão não é adjudicação de PIN, nem verify de
+  graça). O PIN corrente no corpo permanece fator (`slot.change`): o gate
+  soma um segundo fator. O **PW1** (`0x81`/`0x82`) fica intocado — troca com
+  o corrente no corpo sem sessão é comportamento da card spec (o scdaemon só
+  pre-verifica o admin para `chvno == 3`, `app-openpgp.c::do_change_pin`),
+  inclusive o `6A80` de comprimento errado. A sessão de admin sobrevive à
+  troca (bem ou mal sucedida no corpo); a única limpeza segue sendo o
+  `select()`. Piso da S5 preservado na troca autorizada (`6A84` em falha de
+  gravação). 6 testes novos + 2 testes da S5 atualizados para pre-verificar
+  o admin em `openpgp.rs`. Suite em **217 testes** de host em
+  `aegis-applets`. Física de hardware pendente: extensão do
+  `validate_openpgp.py` ("`CHANGE` 0x83 sem `VERIFY` → `6982`") + interop
+  `gpg --card-edit` em RP2350; registrado em `validation.md`. Spec:
+  `specs/openpgp-pw3-change-authority.md`.
+
+- **OpenPGP S11 — troca do PW1 com corpo de comprimento variável
+  (entregue):** fechou o gap L4 da S10 (interop com viés administrativo, não
+  escaleração): `CHANGE REFERENCE DATA` do PW1 (`0x81`/`0x82`) aceita agora
+  o corpo `atual‖novo` da card spec §7.2.3 — concatenação exata, sem
+  delimitador nem padding (caminho real do scdaemon verificado no
+  código-fonte, `app-openpgp.c::do_change_pin` + `iso7816.c`) com
+  `12 ≤ Lc ≤ 254`; fora do intervalo → `6A80` antes de qualquer interação
+  com o slot (nenhuma tentativa consumida, nenhum save). A delimitação do
+  corrente ("o comprimento conhecido no cartão") é resolvida pelo **hash
+  armazenado**: nova capacidade read-only `PinSlot::resolve_change` em
+  `pin.rs` — a varredura dos candidatos `L` não consome tentativa, o match
+  alimenta o `slot.change` de sempre e a negativa consome **exatamente uma**
+  tentativa (`63Cx` com persist), o mesmo preço que o corpo fixo 16 já
+  cobrava por corrente errado. Sem bump de `PIN_STATE_VERSION`, sem
+  delimitador, sem novo segredo. PW3 (`0x83`) intocado: gate S10 + corpo
+  fixo 16. Piso S5 preservado (`6A84` na falha de gravação, piso sticky). O
+  default de fábrica (`123456`, 6 octetos) é finalmente trocável pela porta
+  pública `0x24`. 7 testes novos + comentário do teste S10 atualizado
+  (corpos de 11/15 octetos: `< 12` continua recusa de formato, `15`
+  in-intervalo com corrente errado passa a sem-match `63Cx` — contradição
+  interna da spec registrada em `validation.md`) em `openpgp.rs`. Suite em
+  **224 testes** de host em `aegis-applets`. Física de hardware pendente:
+  extensão do `validate_openpgp.py` (troca do default de 6 → corpo 12 →
+  `9000` + fluxo `gpg --card-edit` → `passwd`) em RP2350; registrado em
+  `validation.md`. Spec: `specs/openpgp-pw1-min-length-change.md`.
+
+- **OpenPGP S12 — janela de resposta da decifra: decisão de manter `0x6A84` +
+  teto real de transporte registrado (entregue):** decisão de política (rota C)
+  sobre custo de RAM × janela decifrável, fechada com evidência do código e do
+  ecossistema: **manter a janela de 2048 octets** — nenhum buffer muda (`out`
+  do applet, `Chainer` do roteador, entrada e `out_buf` CCID; a rota (A)
+  "ampliar buffers" custa ≈ +8,1 KB e não muda nada em hardware sem tocar a
+  entrada, e a rota (B) "resposta parcial `61xx`" colapsa em (A) porque a
+  maquinaria do `Chainer` já existe — rejeitadas por números na spec). O que
+  fecha é o contrato observável, congelado por teste: (i) a fronteira do
+  applet passa a contrato executável — o INFO da S8 em `adversarial_apdu.rs`
+  foi re-ancorado em
+  `decipher_response_window_boundary_is_the_frozen_contract` (2047/2048 →
+  `9000` byte-exata; 2049 → `6A84` com corpo vazio, zero bytes além da
+  janela, anti-serialização por `assert_never_leaks` e sessão intacta — slot,
+  `save_calls`, flags PW1 — com decifra pequena no mesmo slot logo após);
+  (ii) o **teto real no transporte** é teste de host novo
+  (`openpgp::tests::response_window`): no pipeline CCID completo
+  (assembler → card → router → applet, o `DefaultCard` do firmware,
+  2048/2100) a janela do applet é inalcançável — a **entrada** é o limite: o
+  maior comando decifrável do molde `86‖80` estendido do scdaemon que cabe
+  numa mensagem CCID de 2100 octets responde `9000` byte-exata, e um octeto a
+  mais de frame → `CcidError::Overflow` antes do applet rodar — sem SW, sem
+  bytes, sem gravação (o `card.reset()` silencioso que o firmware aplica no
+  erro fica documentado, não resolvido: não-objetivo). Mensagens > ~2 KB são
+  decifra parcial (card spec, `9000` + Z) ou no host, por decisão; ampliações
+  futuras (ex.: mensagem maior que o arquivo) são fatias novas com a
+  evidência da §3. Sem mudança de produção, de `unsafe`, de dependência ou de
+  versão de estado; sem hardware neste ciclo (verificação física em cliente
+  real pendente em `validation.md`). Spec:
+  `specs/openpgp-decipher-response-window.md`. Suite em **225 testes** de
+  host em `aegis-applets`.
 
 ## Persistência selada dos applets (entregue)
 
@@ -1354,13 +1626,26 @@ linha de comando (`aegistoken-host`) e estruturando a base tecnológica do futur
   comandos `piv-list` (inspeção X.509 detalhada dos slots 9A, 9C, 9D, 9E), `piv-import-cert`
   (importação PEM/DER com autenticação de chave de gestão) e `piv-set-mgmt-key`
   (troca de Management Key 3DES/AES). 15 testes unitários aprovados no host CLI.
+- **Fatia de hardening entregue — segredos de host fora de `argv`**
+  (`specs/host-secrets-not-in-argv.md`, AC-034): `aegistoken-host` recusa
+  `--key`/`--old-key` e o posicional do `piv-set-mgmt-key` sem ecoar o valor; a
+  chave entra por prompt oculto (`rpassword`, host-only, Apache-2.0) ou por
+  `--key-stdin`/`--old-key-stdin`; `scripts/set_pin.py` recusa `--pin`/`--old-pin`
+  e o posicional, exige TTY sem flags e redige segredos no erro. 18 testes novos
+  no host (33 no crate) e 20 em `tests/test_set_pin_args.py`.
 
 **Pendências e próximos passos**
 
-- **Etapa 2.4 entregue:** subcomando OATH/TOTP no CLI (`oath list|code|add|delete|reset`
-  em `crates/aegistoken-host/src/oath_cmd.rs`, com parsing de `otpauth://` e testes de
-  host).
+- **Etapa 2.4 entregue:** subcomando OATH/TOTP no CLI (`oath list|code|add|delete|reset`)
+  com `crates/aegistoken-host/src/oath_cmd.rs` declarado em `main.rs` e coberto por
+  16 testes. A URI `otpauth://` do `oath add` nunca entra em `argv`: vem de
+  `--uri-stdin` (pipe) ou prompt oculto (TTY), e o positional é recusado sem eco;
+  `--reader` vale para `oath`/`piv-set-mgmt-key` (fatia `specs/oath-cli-wiring.md`).
 - **Etapa 2.5:** Avaliação do `nusb`.
+- **Follow-up da fatia host-secrets entregue:** `scripts/validate_fido.py` agora
+  aceita o PIN por `--pin-prompt` (TTY) ou `--pin-stdin` (pipe), recusa
+  `--pin`/`--old-pin` sem eco e redige o valor (AC-036,
+  `specs/validate-fido-pin-channel.md`).
 - **Eixo 3:** Protótipo do Desktop Manager em Rust (`tauri` v2).
 
 **Critério de saída**

@@ -11,6 +11,7 @@ aegis-core.workspace = true
 minicbor.workspace = true
 rusb.workspace = true
 pcsc.workspace = true
+rpassword.workspace = true
 iso7816.workspace = true
 x509-cert.workspace = true
 des.workspace = true

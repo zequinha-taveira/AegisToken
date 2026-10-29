@@ -1,11 +1,10 @@
 """Reference implementation of the OpenPGP symmetric layer (RFC 4880 §13.9).
 
-This script is **not** part of the firmware. It exists to generate the test
-vectors embedded in `crates/aegis-applets/src/pgp_sym.rs`: it was written
-directly from the text of RFC 4880 §13.9 ("OpenPGP CFB Mode") and §5.13 (the
-Sym. Encrypted Integrity Protected Data Packet), independently of the Rust
-implementation, so that both agree on the byte layout of the CFB stream, the
-resynchronization step and the modification detection code.
+This script is **not** part of the firmware. It exists to cross-check the
+symmetric layer of `crates/aegis-applets/src/pgp_sym.rs` against a second
+implementation written from the text of RFC 4880 §13.9 ("OpenPGP CFB Mode") and
+§5.13 (the Sym. Encrypted Integrity Protected Data Packet): the CFB stream, the
+quick check of the prefix and the modification detection code.
 
 Run it to print the vectors:
 
@@ -40,30 +39,21 @@ def encrypt(session_key: bytes, plaintext: bytes) -> bytes:
     """Encrypt `plaintext` with the OpenPGP CFB of RFC 4880 §13.9.
 
     The plaintext must already carry the BS+2 octet prefix and the
-    modification detection code; this function only performs the CFB with the
-    resynchronization step.
+    modification detection code. The CFB stream starts with an all-zero
+    feedback register and runs over the whole plaintext with the block
+    boundaries of the stream: the two octets of the prefix that repeat the two
+    before them are inside the stream (they are the quick check of the key).
     """
     if len(plaintext) < BS + 2:
         raise ValueError("the plaintext must carry the BS+2 octet prefix")
     out = bytearray()
     fr = b"\x00" * BS
-    # Steps 1 to 5: the first BS octets of the prefix.
-    fre = _keystream_block(session_key, fr)
-    first = bytes(a ^ b for a, b in zip(fre, plaintext[:BS]))
-    out += first
-    fr = first
-    # Step 6: the two quick-check octets.
-    fre = _keystream_block(session_key, fr)
-    out += bytes(a ^ b for a, b in zip(fre[:2], plaintext[BS : BS + 2]))
-    # Step 7: the resynchronization loads C[3]..C[BS+2] into FR.
-    fr = bytes(out[2 : BS + 2])
-    rest = plaintext[BS + 2 :]
-    for offset in range(0, len(rest), BS):
-        block = rest[offset : offset + BS]
+    for offset in range(0, len(plaintext), BS):
+        block = plaintext[offset : offset + BS]
         fre = _keystream_block(session_key, fr)
         cipher_block = bytes(a ^ b for a, b in zip(fre, block))
         out += cipher_block
-        fr = cipher_block
+        fr = cipher_block.ljust(BS, b"\x00")
     return bytes(out)
 
 
@@ -73,20 +63,11 @@ def decrypt(session_key: bytes, ciphertext: bytes) -> bytes:
         raise ValueError("the ciphertext is shorter than the prefix")
     out = bytearray()
     fr = b"\x00" * BS
-    fre = _keystream_block(session_key, fr)
-    first = bytes(a ^ b for a, b in zip(fre, ciphertext[:BS]))
-    out += first
-    fr = ciphertext[:BS]
-    fre = _keystream_block(session_key, fr)
-    out += bytes(a ^ b for a, b in zip(fre[:2], ciphertext[BS : BS + 2]))
-    fr = ciphertext[2 : BS + 2]
-    rest = ciphertext[BS + 2 :]
-    for offset in range(0, len(rest), BS):
-        block = rest[offset : offset + BS]
+    for offset in range(0, len(ciphertext), BS):
+        block = ciphertext[offset : offset + BS]
         fre = _keystream_block(session_key, fr)
-        plain_block = bytes(a ^ b for a, b in zip(fre, block))
-        out += plain_block
-        fr = block
+        out += bytes(a ^ b for a, b in zip(fre, block))
+        fr = block.ljust(BS, b"\x00")
     return bytes(out)
 
 

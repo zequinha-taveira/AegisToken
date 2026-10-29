@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AegisToken â€” Phase 14/15 OpenPGP Card validation (AC-019) + Phase 16 RSA.
+"""AegisToken - Phase 14/15 OpenPGP Card validation (AC-019) + Phase 16 RSA.
 
 Requires ``pyscard`` and ``cryptography``. The validator exercises the P-256
 and Ed25519/X25519 OpenPGP Card slices plus RSA-2048: application data,
@@ -91,7 +91,7 @@ ATTRS_RSA2048_STORED = bytes.fromhex("010800002000")
 def record(name: str, passed: bool, detail: str = "") -> None:
     RESULTS.append((name, passed, detail))
     flag = "PASS" if passed else "FAIL"
-    print(f"[{flag}] {name}" + (f" â€” {detail}" if detail else ""))
+print(f"[{flag}] {name}" + (f" - {detail}" if detail else ""))
 
 
 def transmit(connection, apdu: list[int]) -> tuple[bytes, int]:
@@ -216,7 +216,7 @@ def main() -> int:
     # Generate the signature key (CRT B6 = signature key).
     data, sw = transmit(connection, [0x00, 0x47, 0x80, 0x00, 0x02, 0xB6, 0x00])
     public_template = find_tlv(data, 0x7F49) if sw == 0x9000 else None
-    point = find_tlv(public_template, 0x81) if public_template is not None else None
+    point = find_tlv(public_template, 0x86) if public_template is not None else None
     record(
         "AC-019 GENERATE P-256 signature key",
         point is not None and len(point) == 65 and point[0] == 0x04,
@@ -261,7 +261,7 @@ def main() -> int:
 
     data, sw = transmit(connection, [0x00, 0x47, 0x80, 0x00, 0x02, 0xB6, 0x00])
     public_template = find_tlv(data, 0x7F49) if sw == 0x9000 else None
-    ed_point = find_tlv(public_template, 0x81) if public_template is not None else None
+    ed_point = find_tlv(public_template, 0x86) if public_template is not None else None
     record(
         "AC-019 GENERATE Ed25519 signature key",
         ed_point is not None and len(ed_point) == 32,
@@ -290,7 +290,7 @@ def main() -> int:
 
     data, sw = transmit(connection, [0x00, 0x47, 0x80, 0x00, 0x02, 0xB8, 0x00])
     public_template = find_tlv(data, 0x7F49) if sw == 0x9000 else None
-    x_point = find_tlv(public_template, 0x81) if public_template is not None else None
+    x_point = find_tlv(public_template, 0x86) if public_template is not None else None
     record(
         "AC-019 GENERATE X25519 decryption key",
         x_point is not None and len(x_point) == 32,
@@ -332,7 +332,7 @@ def main() -> int:
     if ec_point is None:
         return summarize()
 
-    # The fingerprint of the decryption slot is the KDF parameter of RFC 6637 Â§8.
+    # The fingerprint of the decryption slot is the KDF parameter of RFC 6637 section 8.
     data, sw = transmit(connection, [0x00, 0xCA, 0x00, 0xC8, 0x00])
     fingerprint = data if sw == 0x9000 and len(data) == 20 else None
     record("AC-019 GET DATA C8 DEC fingerprint", fingerprint is not None, f"sw={sw:04X}")
@@ -356,7 +356,9 @@ def main() -> int:
     record("AC-019 PSO ECDH P-256 shared secret agrees", secret_ok, f"sw={sw:04X}")
 
     # The card-side mode: the host provisions the session key already wrapped
-    # and the card decrypts on its own (RFC 6637 Â§8).
+    # and the card decrypts on its own (RFC 6637 section 8). The fingerprint
+    # goes with it: the card has no clock and cannot recompute the value that
+    # the sender used in the KDF parameters.
     if fingerprint is not None and secret_ok:
         param = sender.kdf_parameters(fingerprint)
         kek = sender.kdf(param, expected_secret, 16)
@@ -366,6 +368,7 @@ def main() -> int:
             bytes([len(wrapped)])
             + wrapped
             + bytes([sender.HASH_SHA256, sender.KEK_AES128])
+            + fingerprint
         )
         _, sw = transmit(
             connection,

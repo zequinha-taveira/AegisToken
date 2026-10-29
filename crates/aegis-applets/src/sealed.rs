@@ -818,7 +818,13 @@ impl<S: Storage + Clone> SealedOathStore<S> {
 
 impl<S: Storage + Clone> OathStore for SealedOathStore<S> {
     fn load(&mut self, out: &mut [u8]) -> Option<usize> {
-        self.inner.load(out).ok()?
+        // `Ok(None)` is a blank record (virgin region or tombstone); an `Err`
+        // is corruption or IO and must fail closed, never read as "empty".
+        match self.inner.load(out) {
+            Ok(None) => Some(0),
+            Ok(len) => len,
+            Err(_) => None,
+        }
     }
 
     fn save(&mut self, data: &[u8]) -> bool {
@@ -1086,6 +1092,31 @@ mod tests {
         let mut store =
             SealedOathStore::open(flash, [8192 * 20, 8192 * 21], 8192 * 22, 4096, &key).unwrap();
         assert!(!store.save(&[0u8; OATH_SHARDS * SHARD_BODY_MAX + 1]));
+    }
+
+    #[test]
+    fn sealed_oath_load_distinguishes_blank_from_corrupt() {
+        let key = test_key();
+        let data = [8192 * 20, 8192 * 21];
+        let commit = 8192 * 22;
+        let mut out = [0u8; 4096];
+
+        let (flash, _mem) = TestFlash::new(0);
+        let mut store = SealedOathStore::open(flash, data, commit, 4096, &key).unwrap();
+        assert_eq!(store.load(&mut out), Some(0));
+        assert!(store.save(&[0x55; 300]));
+        assert_eq!(store.load(&mut out), Some(300));
+        assert!(store.clear());
+        assert_eq!(store.load(&mut out), Some(0));
+
+        let (flash, mem) = TestFlash::new(0);
+        let mut store = SealedOathStore::open(flash.clone(), data, commit, 4096, &key).unwrap();
+        assert_eq!(store.load(&mut out), Some(0));
+        assert!(store.save(&[0x11; 100]));
+        drop(store);
+        mem.borrow_mut()[data[0] as usize + 32] ^= 0xFF;
+        let mut store = SealedOathStore::open(flash, data, commit, 4096, &key).unwrap();
+        assert_eq!(store.load(&mut out), None);
     }
 
     #[test]

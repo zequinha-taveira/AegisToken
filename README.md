@@ -9,6 +9,9 @@ com **descoberta automática de hardware** — sem seleção manual de placa.
 - Produto USB: `AegisToken FIDO2 USB Authenticator` (VID `0x1209`, PID `0x0001`)
 - Família de firmware: `Universal RP2350 Firmware`
 - Artefato de release: `rp2350-universal.uf2`
+- Marcos e Capacidades: [`docs/MILESTONES.md`](docs/MILESTONES.md) | [`docs/status.json`](docs/status.json)
+
+[![AegisToken Milestones Dashboard](docs/images/status.svg)](docs/MILESTONES.md)
 
 ## Interfaces USB
 
@@ -185,8 +188,13 @@ são testados no host. A HAL atual permanece isolada em `board-generic-rp2350`.
 - Toolchain Rust fixada em `rust-toolchain.toml` (canal `1.97.1`), com os
   componentes `rustfmt` e `clippy` e o alvo `thumbv8m.main-none-eabihf`.
 - [`probe-rs`](https://probe.rs) — flash e RTT.
-- [`picotool`](https://github.com/raspberrypi/picotool) — conversão de UF2 e
-  `picotool info`.
+- [`picotool`](https://github.com/raspberrypi/picotool) **>= 2.0** — conversão de
+  UF2 (`uf2 convert`, imagens RP2350) e `picotool info`. O
+  `scripts/build-uf2.ps1` resolve o conversor antes de compilar e falha se
+  nenhum servir; sem picotool 2.x ele cai para o
+  [`elf2uf2-rs`](https://github.com/JoNil/elf2uf2-rs) compilado do git (a versão
+  publicada 2.2.0 só conhece RP2040). Use `PICOTOOL`/`ELF2UF2` para apontar o
+  caminho completo quando a ferramenta não estiver no PATH.
 - Python 3 com `fido2`, `hidapi`, `cbor2` e `pyscard` para os scripts de
   validação.
 
@@ -273,6 +281,46 @@ Opções globais: `--vid`/`--pid` (padrão `0x1209:0x0001`), `--interface N` e
 VID/PID da placa (ex.: `--vid 0x2E8A --pid 0x10B0`); rode
 `cargo run -p aegistoken-host -- --help` para a lista completa de comandos.
 
+**Segredos nunca vão em `argv`.** A linha de comando é visível para outros
+processos locais (`ps`, `/proc/<pid>/cmdline`, Gerenciador de Tarefas, WMI) e
+fica no histórico do shell. A chave de gestão PIV entra por prompt oculto (quando
+o stdin é um terminal) ou por pipe:
+
+```powershell
+# interativo: prompt oculto (nova chave, confirmação e chave atual)
+cargo run -p aegistoken-host -- piv-set-mgmt-key
+
+# automação: uma linha por chave, sem eco
+Get-Content new-key.txt | cargo run -p aegistoken-host -- piv-set-mgmt-key --key-stdin
+Get-Content keys.txt    | cargo run -p aegistoken-host -- piv-set-mgmt-key --key-stdin --old-key-stdin
+Get-Content key.txt     | cargo run -p aegistoken-host -- piv-import-cert 9A cert.pem --key-stdin
+```
+
+`--key`/`--old-key` são **recusados** (exit 1) com mensagem que não ecoa o
+valor. O filtro de leitor do `piv-set-mgmt-key` é `--reader <SUBSTR>`. Se uma
+chave já passou por `argv`, rotacione-a e limpe o histórico do shell. Apague os
+arquivos de segredo depois do uso e prefira o prompt ou um gerenciador de
+segredos.
+
+A URI `otpauth://` do `oath add` também carrega o segredo compartilhado
+(`secret=`), então nunca entra em `argv`:
+
+```powershell
+# interativo: prompt oculto
+cargo run -p aegistoken-host -- oath add
+
+# automação: a URI vem por stdin (pipe)
+Get-Content otpauth.txt | cargo run -p aegistoken-host -- oath add --uri-stdin
+
+# os demais subcomandos usam --reader, não um positional ambíguo
+cargo run -p aegistoken-host -- oath list --reader Aegis
+cargo run -p aegistoken-host -- oath code "30/Example:alice" --reader Aegis
+```
+
+`oath add <URI>` posicional é **recusado** sem ecoar o valor; `--uri-stdin` só
+vale para `oath add` e exige pipe (recusa TTY). `--reader` vale para `oath` e
+`piv-set-mgmt-key`.
+
 ## Validação
 
 ```powershell
@@ -286,13 +334,20 @@ python scripts/set_pin.py               # define/altera o PIN do clientPIN
 ```
 
 Os scripts imprimem `[PASS]/[FAIL]` por critério (AC) e retornam código de saída
-diferente de zero em falha. No Windows, a interface FIDO é reivindicada pelo
+diferente de zero em falha. `set_pin.py` usa prompt oculto por padrão e
+`--pin-stdin`/`--old-pin-stdin` para automação; `--pin`/`--old-pin` em `argv`
+são recusados (exit 2). O `validate_fido.py` segue a mesma regra: `--pin-prompt`
+(prompt oculto, TTY) ou `--pin-stdin` (pipe); sem flag ele roda só presença.
+No Windows, a interface FIDO é reivindicada pelo
 driver `fidohid`, que a mantém com exclusividade; veja
 [`validation.md`](validation.md) para as opções de acesso (WebAuthn no navegador
 ou remapeamento para o driver HID genérico).
 
 ## Documentação
 
+- [`docs/MILESTONES.md`](docs/MILESTONES.md) — plano de marcos (M1..M6), capacidades da chave de segurança e cronograma de entrega.
+- [`CHANGELOG.md`](CHANGELOG.md) — histórico de releases (v0.0…v0.2.1, canais nightly).
+- [`docs/status.json`](docs/status.json) — base de dados canônica em JSON com status e progresso do ecossistema.
 - [`roadmap.md`](roadmap.md) — fases do projeto, decisões arquiteturais e status.
 - [`validation.md`](validation.md) — matriz AC-001..AC-021, evidências e
   limitações conhecidas.

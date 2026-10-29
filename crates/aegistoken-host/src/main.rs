@@ -8,7 +8,9 @@
 mod card;
 mod cli;
 mod framing;
+mod oath_cmd;
 mod piv_cmd;
+mod secret;
 mod transport;
 
 use std::process::ExitCode;

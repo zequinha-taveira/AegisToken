@@ -5,6 +5,7 @@
 //! that runs the Management HID acceptance checks on attached hardware.
 
 use core::fmt::Write as _;
+use std::io::BufRead;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use aegis_core::management_protocol::{
 use aegis_core::recovery::DiagnosticsReport;
 
 use crate::framing::Response;
+use crate::secret;
 use crate::transport::{self, ManagementDevice, Options};
 
 /// `GET_LAST_FIDO_STATUS`, a diagnostics-only extension command.
@@ -28,8 +30,14 @@ struct Cli {
     positional: Vec<String>,
     help: bool,
     version: bool,
-    key: Option<String>,
-    old_key: Option<String>,
+    /// `--key-stdin`: read the new PIV management key from stdin.
+    key_stdin: bool,
+    /// `--old-key-stdin`: read the current PIV management key from stdin.
+    old_key_stdin: bool,
+    /// `--uri-stdin`: read the `otpauth://` URI for `oath add` from stdin.
+    uri_stdin: bool,
+    /// `--reader`: reader filter for `oath` and `piv-set-mgmt-key`.
+    reader: Option<String>,
     alg: Option<String>,
 }
 
@@ -49,6 +57,8 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<ExitCode, String> {
         print_help();
         return Ok(ExitCode::SUCCESS);
     }
+
+    reject_misplaced_options(&cli, command)?;
 
     if command == "list" {
         return list(&cli.options);
@@ -89,21 +99,31 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<ExitCode, String> {
                 .get(1)
                 .ok_or("piv-import-cert requires <CERT_FILE>")?;
             let reader = cli.positional.get(2).map(|s| s.as_str());
-            return crate::piv_cmd::piv_import_cert(slot, cert_path, cli.key.as_deref(), reader);
+            let mut stdin = std::io::stdin().lock();
+            let mgmt_key = acquire_import_key(&cli, secret::stdin_is_tty(), &mut stdin)?;
+            return crate::piv_cmd::piv_import_cert(slot, cert_path, mgmt_key.as_deref(), reader);
         }
         "piv-set-mgmt-key" => {
-            let new_key = cli
-                .positional
-                .first()
-                .ok_or("piv-set-mgmt-key requires <NEW_KEY_HEX>")?;
-            let reader = cli.positional.get(1).map(|s| s.as_str());
+            if !cli.positional.is_empty() {
+                // Never echo the positional: it may be a legacy key.
+                return Err(
+                    "piv-set-mgmt-key does not accept positional arguments: the key comes \
+                     from --key-stdin or the interactive prompt, and the reader from --reader"
+                        .to_string(),
+                );
+            }
+            let mut stdin = std::io::stdin().lock();
+            let mut prompt = |text: &str| secret::prompt(text);
+            let (new_key, old_key) =
+                acquire_mgmt_key(&cli, secret::stdin_is_tty(), &mut stdin, &mut prompt)?;
             return crate::piv_cmd::piv_set_mgmt_key(
-                new_key,
-                cli.old_key.as_deref(),
+                &new_key,
+                old_key.as_deref(),
                 cli.alg.as_deref(),
-                reader,
+                cli.reader.as_deref(),
             );
         }
+        "oath" => return oath(&cli),
         _ => {}
     }
 
@@ -121,8 +141,10 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         positional: Vec::new(),
         help: false,
         version: false,
-        key: None,
-        old_key: None,
+        key_stdin: false,
+        old_key_stdin: false,
+        uri_stdin: false,
+        reader: None,
         alg: None,
     };
     let mut args = args.into_iter();
@@ -141,11 +163,41 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                 let millis = parse_u64(&option_value(inline, &mut args, name)?)?;
                 cli.options.timeout = Duration::from_millis(millis.max(1));
             }
-            "--key" => cli.key = Some(option_value(inline, &mut args, name)?),
-            "--old-key" => cli.old_key = Some(option_value(inline, &mut args, name)?),
+            "--key" | "--old-key" => {
+                return Err(format!(
+                    "option {name} is not accepted: a secret must never be passed in argv; \
+                     use {} or the interactive prompt",
+                    if name == "--key" {
+                        "--key-stdin"
+                    } else {
+                        "--old-key-stdin (with --key-stdin)"
+                    }
+                ));
+            }
+            "--key-stdin" => {
+                if inline.is_some() {
+                    return Err("option --key-stdin takes no value".to_string());
+                }
+                cli.key_stdin = true;
+            }
+            "--old-key-stdin" => {
+                if inline.is_some() {
+                    return Err("option --old-key-stdin takes no value".to_string());
+                }
+                cli.old_key_stdin = true;
+            }
+            "--uri-stdin" => {
+                if inline.is_some() {
+                    return Err("option --uri-stdin takes no value".to_string());
+                }
+                cli.uri_stdin = true;
+            }
+            "--reader" => cli.reader = Some(option_value(inline, &mut args, name)?),
             "--alg" => cli.alg = Some(option_value(inline, &mut args, name)?),
             _ if arg.starts_with('-') && arg.len() > 1 => {
-                return Err(format!("unknown option: {arg}"));
+                // Report the option name only: `--key=value` must not echo the
+                // value, and an unknown option is not a place to log a secret.
+                return Err(format!("unknown option: {name}"));
             }
             _ => {
                 if cli.command.is_none() {
@@ -159,10 +211,12 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     Ok(cli)
 }
 
-/// Split `--opt=value` into `("--opt", Some("value"))`.
+/// Split `-opt=value`/`--opt=value` into `("--opt", Some("value"))`.
 fn split_option(arg: &str) -> (&str, Option<&str>) {
     match arg.split_once('=') {
-        Some((name, value)) if name.starts_with("--") => (name, Some(value)),
+        // Split on the first `=` for any dash-prefixed token: a single-dash
+        // typo (`-key=secret`) must not smuggle the value into the message.
+        Some((name, value)) if name.starts_with('-') && name.len() > 1 => (name, Some(value)),
         _ => (arg, None),
     }
 }
@@ -177,6 +231,204 @@ fn option_value(
     }
     args.next()
         .ok_or_else(|| format!("option {name} requires a value"))
+}
+
+/// Reject options that only make sense for a different command.
+fn reject_misplaced_options(cli: &Cli, command: &str) -> Result<(), String> {
+    let mgmt = command == "piv-set-mgmt-key";
+    let import = command == "piv-import-cert";
+    let oath = command == "oath";
+    let oath_add = oath && cli.positional.first().map(String::as_str) == Some("add");
+    if cli.reader.is_some() && !(mgmt || oath) {
+        return Err("--reader is only valid with piv-set-mgmt-key or oath".to_string());
+    }
+    if cli.uri_stdin && !oath_add {
+        return Err("--uri-stdin is only valid with oath add".to_string());
+    }
+    if cli.old_key_stdin && !mgmt {
+        return Err("--old-key-stdin is only valid with piv-set-mgmt-key".to_string());
+    }
+    if cli.key_stdin && !(mgmt || import) {
+        return Err(
+            "--key-stdin is only valid with piv-set-mgmt-key or piv-import-cert".to_string(),
+        );
+    }
+    if cli.alg.is_some() && !mgmt {
+        return Err("--alg is only valid with piv-set-mgmt-key".to_string());
+    }
+    Ok(())
+}
+
+/// Acquire the new and (optional) current management key for
+/// `piv-set-mgmt-key`.
+///
+/// `stdin` and `prompt` are injected so the acquisition rules are testable
+/// without a terminal or hardware.
+fn acquire_mgmt_key(
+    cli: &Cli,
+    is_tty: bool,
+    stdin: &mut impl BufRead,
+    prompt: &mut impl FnMut(&str) -> Result<String, String>,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
+    let (new_text, old_text) = if cli.key_stdin {
+        if is_tty {
+            return Err(
+                "--key-stdin expects a pipe: redirect stdin or use the interactive prompt"
+                    .to_string(),
+            );
+        }
+        let new_text = secret::read_line(stdin)?;
+        let old_text = if cli.old_key_stdin {
+            Some(secret::read_line(stdin)?)
+        } else {
+            None
+        };
+        (new_text, old_text)
+    } else {
+        if cli.old_key_stdin {
+            return Err("--old-key-stdin requires --key-stdin".to_string());
+        }
+        if !is_tty {
+            return Err(
+                "no terminal for the interactive prompt: use --key-stdin (and \
+                 --old-key-stdin) with a pipe"
+                    .to_string(),
+            );
+        }
+        let first = prompt("New PIV management key (hex): ")?;
+        let second = prompt("Repeat the new PIV management key: ")?;
+        if first != second {
+            return Err("the two prompted keys do not match".to_string());
+        }
+        let old = prompt("Current PIV management key (empty = NIST default): ")?;
+        (first, if old.is_empty() { None } else { Some(old) })
+    };
+    let new_key = secret::parse_hex(&new_text, "new management key")?;
+    let old_key = match old_text {
+        Some(text) => Some(secret::parse_hex(&text, "current management key")?),
+        None => None,
+    };
+    Ok((new_key, old_key))
+}
+
+/// Acquire the optional management key for `piv-import-cert`.
+///
+/// There is no prompt here: an import is a non-interactive operation, so a
+/// non-default key must arrive through `--key-stdin`.
+fn acquire_import_key(
+    cli: &Cli,
+    is_tty: bool,
+    stdin: &mut impl BufRead,
+) -> Result<Option<Vec<u8>>, String> {
+    if !cli.key_stdin {
+        return Ok(None);
+    }
+    if is_tty {
+        return Err("--key-stdin expects a pipe: redirect stdin".to_string());
+    }
+    let text = secret::read_line(stdin)?;
+    let key = secret::parse_hex(&text, "management key")?;
+    // Validate the length before opening PC/SC: a bad key must fail in the
+    // acquisition layer, without touching the card.
+    match key.len() {
+        16 | 24 | 32 => Ok(Some(key)),
+        len => Err(format!(
+            "invalid management key length {len} bytes (must be 16, 24, or 32)"
+        )),
+    }
+}
+
+/// Dispatch an `oath` subcommand. The reader is always `--reader`, never a
+/// positional, so a mistyped URI cannot be echoed as a reader name.
+fn oath(cli: &Cli) -> Result<ExitCode, String> {
+    let subcommand = cli.positional.first().map(String::as_str).ok_or_else(|| {
+        "oath requires a subcommand: list, code, add, delete or reset".to_string()
+    })?;
+    let reader = cli.reader.as_deref();
+
+    match subcommand {
+        "list" => {
+            reject_oath_positional(cli, 1)?;
+            crate::oath_cmd::oath_list(reader)
+        }
+        "reset" => {
+            reject_oath_positional(cli, 1)?;
+            crate::oath_cmd::oath_reset(reader)
+        }
+        "code" => {
+            let name = oath_name(cli, "code")?;
+            crate::oath_cmd::oath_code(name, reader)
+        }
+        "delete" => {
+            let name = oath_name(cli, "delete")?;
+            crate::oath_cmd::oath_delete(name, reader)
+        }
+        "add" => {
+            // The URI carries the shared secret: refuse a positional without
+            // echoing it, and acquire the value from stdin or a hidden prompt.
+            if cli.positional.len() > 1 {
+                return Err(
+                    "oath add does not accept a positional URI: the otpauth:// URI comes \
+                     from --uri-stdin (pipe) or the hidden interactive prompt"
+                        .to_string(),
+                );
+            }
+            let mut stdin = std::io::stdin().lock();
+            let mut prompt = |text: &str| secret::prompt(text);
+            let uri = acquire_otpauth_uri(cli, secret::stdin_is_tty(), &mut stdin, &mut prompt)?;
+            crate::oath_cmd::oath_add(&uri, reader)
+        }
+        _ => Err("unknown oath subcommand: expected list, code, add, delete or reset".to_string()),
+    }
+}
+
+/// Reject extra positionals for an OATH subcommand without echoing them: a
+/// stray value may be an `otpauth://` URI carrying a secret.
+fn reject_oath_positional(cli: &Cli, allowed: usize) -> Result<(), String> {
+    if cli.positional.len() > allowed {
+        return Err(
+            "unexpected positional argument: use --reader for the reader filter".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The single `<NAME>` argument of `oath code`/`oath delete`.
+fn oath_name<'a>(cli: &'a Cli, subcommand: &str) -> Result<&'a str, String> {
+    match cli.positional.as_slice() {
+        [_, name] => Ok(name.as_str()),
+        _ => Err(format!(
+            "oath {subcommand} requires exactly one <NAME> argument"
+        )),
+    }
+}
+
+/// Acquire the `otpauth://` URI for `oath add`.
+///
+/// The URI contains the shared secret (`secret=`), so it never comes from
+/// `argv`. `stdin` and `prompt` are injected so the acquisition rules are
+/// testable without a terminal or hardware.
+fn acquire_otpauth_uri(
+    cli: &Cli,
+    is_tty: bool,
+    stdin: &mut impl BufRead,
+    prompt: &mut impl FnMut(&str) -> Result<String, String>,
+) -> Result<String, String> {
+    if cli.uri_stdin {
+        if is_tty {
+            return Err(
+                "--uri-stdin expects a pipe: redirect stdin or use the interactive prompt"
+                    .to_string(),
+            );
+        }
+        return secret::read_line(stdin);
+    }
+    if !is_tty {
+        return Err(
+            "no terminal for the interactive prompt: use --uri-stdin with a pipe".to_string(),
+        );
+    }
+    prompt("otpauth:// URI: ")
 }
 
 fn list(options: &Options) -> Result<ExitCode, String> {
@@ -793,11 +1045,19 @@ OPTIONS:
   --pid <HEX>           USB product id (default 0x0001)
   -i, --interface <N>   Management HID interface number (skip name discovery)
   --timeout <MS>        transfer timeout in milliseconds (default 2000)
-  --key <HEX>           PIV management key (default: standard NIST 3DES)
-  --old-key <HEX>       current PIV management key (for piv-set-mgmt-key)
+  --key-stdin           read the PIV management key from stdin (pipe, no echo)
+  --old-key-stdin       read the current PIV management key from stdin (needs --key-stdin)
+  --uri-stdin           read the otpauth:// URI for oath add from stdin (pipe, no echo)
+  --reader <SUBSTR>     reader filter for oath and piv-set-mgmt-key
   --alg <ALG>           PIV management algorithm (tdes, aes128, aes192, aes256)
   -h, --help            show this help
   -V, --version         show version
+
+SECRETS:
+  Secrets are never accepted in argv (the OS exposes the command line and shell
+  history). Use the hidden interactive prompt when stdin is a terminal, or pipe
+  the secret through --key-stdin/--old-key-stdin/--uri-stdin for automation. If a
+  secret was ever passed in argv, rotate it and clear the shell history.
 
 COMMANDS:
   list                  list matching USB devices and HID interfaces
@@ -827,7 +1087,329 @@ SMART CARD / CCID COMMANDS (PC/SC):
 
 PIV / NIST SP 800-73-4 COMMANDS (PC/SC):
   piv-list [READER]                           list certificates in slots (9A, 9C, 9D, 9E)
-  piv-import-cert <SLOT> <CERT_FILE> [READER] import X.509 cert (PEM/DER) into PIV slot
-  piv-set-mgmt-key <NEW_KEY_HEX> [READER]     replace PIV management key (3DES/AES)"
+  piv-import-cert <SLOT> <CERT_FILE> [READER] [--key-stdin]
+                                              import X.509 cert (PEM/DER) into PIV slot
+  piv-set-mgmt-key [--reader SUBSTR] [--alg ALG] [--key-stdin [--old-key-stdin]]
+                                              replace PIV management key (3DES/AES)
+
+OATH / TOTP COMMANDS (PC/SC):
+  oath list [--reader SUBSTR]                 list stored OATH credentials
+  oath code <NAME> [--reader SUBSTR]          calculate a TOTP/HOTP code
+  oath add [--uri-stdin] [--reader SUBSTR]    add a credential from an otpauth:// URI
+  oath delete <NAME> [--reader SUBSTR]        delete a credential by name
+  oath reset [--reader SUBSTR]                erase all OATH credentials"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    const SECRET: &str = "00112233445566778899aabbccddeeff";
+
+    fn parse_ok(args: &[&str]) -> Cli {
+        parse(args.iter().map(|arg| arg.to_string())).expect("parse")
+    }
+
+    #[test]
+    fn secret_options_are_rejected_without_echoing_the_value() {
+        let cases = [
+            vec![
+                "piv-set-mgmt-key".to_string(),
+                "--key".to_string(),
+                SECRET.to_string(),
+            ],
+            vec!["piv-set-mgmt-key".to_string(), format!("--key={SECRET}")],
+            vec![
+                "piv-set-mgmt-key".to_string(),
+                "--old-key".to_string(),
+                SECRET.to_string(),
+            ],
+            vec![
+                "piv-set-mgmt-key".to_string(),
+                format!("--old-key={SECRET}"),
+            ],
+            // Single-dash typos must not smuggle the value into the message.
+            vec!["piv-set-mgmt-key".to_string(), format!("-key={SECRET}")],
+            vec!["piv-set-mgmt-key".to_string(), format!("-old-key={SECRET}")],
+            // The import command shares the same option parser.
+            vec![
+                "piv-import-cert".to_string(),
+                "9A".to_string(),
+                "cert.pem".to_string(),
+                "--key".to_string(),
+                SECRET.to_string(),
+            ],
+            vec![
+                "piv-import-cert".to_string(),
+                "9A".to_string(),
+                "cert.pem".to_string(),
+                format!("--key={SECRET}"),
+            ],
+        ];
+        for args in cases {
+            let error = parse(args).err().expect("rejected");
+            assert!(
+                error.contains("--key-stdin")
+                    || error.contains("--old-key-stdin")
+                    || error.contains("unknown option"),
+                "{error}"
+            );
+            assert!(!error.contains(SECRET), "{error}");
+        }
+    }
+
+    #[test]
+    fn unknown_option_reports_only_the_name() {
+        for token in [format!("--keyx={SECRET}"), format!("-keyx={SECRET}")] {
+            let error = parse([token]).err().expect("rejected");
+            assert!(error.contains("keyx"), "{error}");
+            assert!(!error.contains(SECRET), "{error}");
+        }
+    }
+
+    #[test]
+    fn stdin_flags_reject_an_inline_value() {
+        for args in [
+            vec!["piv-set-mgmt-key", "--key-stdin=x"],
+            vec!["piv-set-mgmt-key", "--key-stdin", "--old-key-stdin=x"],
+        ] {
+            let error = parse(args.iter().map(|arg| arg.to_string()))
+                .err()
+                .expect("rejected");
+            assert!(error.contains("takes no value"), "{error}");
+        }
+    }
+
+    #[test]
+    fn positional_management_key_is_rejected_without_echo() {
+        let error = run(["piv-set-mgmt-key".to_string(), SECRET.to_string()]).unwrap_err();
+        assert!(error.contains("positional"), "{error}");
+        assert!(!error.contains(SECRET), "{error}");
+    }
+
+    #[test]
+    fn stdin_key_needs_no_terminal_and_reads_new_then_old() {
+        let cli = parse_ok(&["piv-set-mgmt-key", "--key-stdin", "--old-key-stdin"]);
+        let mut stdin = Cursor::new(format!("{SECRET}\nffeeddccbbaa99887766554433221100\n"));
+        let (new_key, old_key) =
+            acquire_mgmt_key(&cli, false, &mut stdin, &mut |_| unreachable!()).unwrap();
+        assert_eq!(new_key, secret::parse_hex(SECRET, "k").unwrap());
+        assert_eq!(
+            old_key,
+            Some(secret::parse_hex("ffeeddccbbaa99887766554433221100", "k").unwrap())
+        );
+    }
+
+    #[test]
+    fn stdin_key_without_old_key_keeps_the_nist_default() {
+        let cli = parse_ok(&["piv-set-mgmt-key", "--key-stdin"]);
+        let mut stdin = Cursor::new(format!("{SECRET}\n"));
+        let (_, old_key) =
+            acquire_mgmt_key(&cli, false, &mut stdin, &mut |_| unreachable!()).unwrap();
+        assert_eq!(old_key, None);
+    }
+
+    #[test]
+    fn stdin_key_refuses_a_terminal() {
+        let cli = parse_ok(&["piv-set-mgmt-key", "--key-stdin"]);
+        let mut stdin = Cursor::new(format!("{SECRET}\n"));
+        let error = acquire_mgmt_key(&cli, true, &mut stdin, &mut |_| unreachable!()).unwrap_err();
+        assert!(error.contains("pipe"), "{error}");
+    }
+
+    #[test]
+    fn old_key_stdin_requires_key_stdin() {
+        let cli = parse_ok(&["piv-set-mgmt-key", "--old-key-stdin"]);
+        let mut stdin = Cursor::new("");
+        let error = acquire_mgmt_key(&cli, false, &mut stdin, &mut |_| unreachable!()).unwrap_err();
+        assert!(error.contains("--key-stdin"), "{error}");
+    }
+
+    #[test]
+    fn prompt_path_requires_a_terminal() {
+        let cli = parse_ok(&["piv-set-mgmt-key"]);
+        let mut stdin = Cursor::new("");
+        let error = acquire_mgmt_key(&cli, false, &mut stdin, &mut |_| unreachable!()).unwrap_err();
+        assert!(error.contains("--key-stdin"), "{error}");
+    }
+
+    #[test]
+    fn prompt_path_confirms_and_defaults_an_empty_old_key() {
+        let cli = parse_ok(&["piv-set-mgmt-key"]);
+        let mut stdin = Cursor::new("");
+        let mut answers = vec![SECRET, SECRET, ""].into_iter();
+        let mut prompt = |_: &str| Ok(answers.next().expect("prompted").to_string());
+        let (new_key, old_key) = acquire_mgmt_key(&cli, true, &mut stdin, &mut prompt).unwrap();
+        assert_eq!(new_key.len(), 16);
+        assert_eq!(old_key, None);
+    }
+
+    #[test]
+    fn prompt_path_rejects_a_mismatch_without_echo() {
+        let cli = parse_ok(&["piv-set-mgmt-key"]);
+        let mut stdin = Cursor::new("");
+        let mut answers = vec![SECRET, "ffeeddccbbaa99887766554433221100"].into_iter();
+        let mut prompt = |_: &str| Ok(answers.next().expect("prompted").to_string());
+        let error = acquire_mgmt_key(&cli, true, &mut stdin, &mut prompt).unwrap_err();
+        assert!(error.contains("match"), "{error}");
+        assert!(!error.contains(SECRET), "{error}");
+    }
+
+    #[test]
+    fn import_key_is_stdin_only() {
+        let cli = parse_ok(&["piv-import-cert", "9A", "cert.pem", "--key-stdin"]);
+        let mut stdin = Cursor::new(format!("{SECRET}\n"));
+        assert_eq!(
+            acquire_import_key(&cli, false, &mut stdin).unwrap(),
+            Some(secret::parse_hex(SECRET, "k").unwrap())
+        );
+
+        let cli = parse_ok(&["piv-import-cert", "9A", "cert.pem"]);
+        let mut stdin = Cursor::new("");
+        assert_eq!(acquire_import_key(&cli, false, &mut stdin).unwrap(), None);
+
+        let cli = parse_ok(&["piv-import-cert", "9A", "cert.pem", "--key-stdin"]);
+        let mut stdin = Cursor::new(format!("{SECRET}\n"));
+        assert!(acquire_import_key(&cli, true, &mut stdin).is_err());
+    }
+
+    #[test]
+    fn import_key_validates_the_length_before_touching_the_card() {
+        let cli = parse_ok(&["piv-import-cert", "9A", "cert.pem", "--key-stdin"]);
+        let mut stdin = Cursor::new("001122334455\n");
+        let error = acquire_import_key(&cli, false, &mut stdin).unwrap_err();
+        assert!(error.contains("length 6"), "{error}");
+        assert!(error.contains("16, 24, or 32"), "{error}");
+    }
+
+    #[test]
+    fn misplaced_options_are_rejected() {
+        let cli = parse_ok(&["--reader", "X", "info"]);
+        assert!(reject_misplaced_options(&cli, "info").is_err());
+
+        let cli = parse_ok(&["--alg", "aes256", "info"]);
+        assert!(reject_misplaced_options(&cli, "info").is_err());
+
+        // `list` must not silently swallow secret/reader options either.
+        let cli = parse_ok(&["--key-stdin", "list"]);
+        assert!(reject_misplaced_options(&cli, "list").is_err());
+
+        let cli = parse_ok(&["piv-set-mgmt-key", "--reader", "X", "--alg", "aes256"]);
+        assert!(reject_misplaced_options(&cli, "piv-set-mgmt-key").is_ok());
+    }
+
+    // -- OATH wiring ------------------------------------------------------
+
+    const OTPAUTH: &str = "otpauth://totp/Example:alice?secret=JBSWY3DPEHPK3PXP";
+
+    #[test]
+    fn uri_stdin_rejects_an_inline_value() {
+        let error = parse(
+            ["oath", "add", "--uri-stdin=x"]
+                .iter()
+                .map(|arg| arg.to_string()),
+        )
+        .err()
+        .expect("rejected");
+        assert!(error.contains("takes no value"), "{error}");
+    }
+
+    #[test]
+    fn uri_stdin_is_only_valid_with_oath_add() {
+        for args in [
+            vec!["oath", "list", "--uri-stdin"],
+            vec!["oath", "code", "name", "--uri-stdin"],
+            vec!["info", "--uri-stdin"],
+        ] {
+            let cli = parse_ok(&args);
+            let command = cli.command.clone().expect("command");
+            let error = reject_misplaced_options(&cli, &command).unwrap_err();
+            assert!(error.contains("--uri-stdin"), "{error}");
+        }
+
+        let cli = parse_ok(&["oath", "add", "--uri-stdin"]);
+        assert!(reject_misplaced_options(&cli, "oath").is_ok());
+    }
+
+    #[test]
+    fn reader_is_valid_for_oath_and_mgmt_only() {
+        let cli = parse_ok(&["oath", "list", "--reader", "Aegis"]);
+        assert!(reject_misplaced_options(&cli, "oath").is_ok());
+
+        let cli = parse_ok(&["piv-list", "--reader", "Aegis"]);
+        assert!(reject_misplaced_options(&cli, "piv-list").is_err());
+    }
+
+    #[test]
+    fn uri_stdin_reads_one_line_from_a_pipe() {
+        let cli = parse_ok(&["oath", "add", "--uri-stdin"]);
+        let mut stdin = Cursor::new(format!("{OTPAUTH}\r\n"));
+        let uri = acquire_otpauth_uri(&cli, false, &mut stdin, &mut |_| unreachable!()).unwrap();
+        assert_eq!(uri, OTPAUTH);
+    }
+
+    #[test]
+    fn uri_stdin_refuses_a_terminal_without_echo() {
+        let cli = parse_ok(&["oath", "add", "--uri-stdin"]);
+        let mut stdin = Cursor::new(format!("{OTPAUTH}\n"));
+        let error =
+            acquire_otpauth_uri(&cli, true, &mut stdin, &mut |_| unreachable!()).unwrap_err();
+        assert!(error.contains("pipe"), "{error}");
+        assert!(!error.contains("JBSWY3DPEHPK3PXP"), "{error}");
+    }
+
+    #[test]
+    fn uri_prompt_requires_a_terminal() {
+        let cli = parse_ok(&["oath", "add"]);
+        let mut stdin = Cursor::new("");
+        let error =
+            acquire_otpauth_uri(&cli, false, &mut stdin, &mut |_| unreachable!()).unwrap_err();
+        assert!(error.contains("--uri-stdin"), "{error}");
+    }
+
+    #[test]
+    fn uri_prompt_reads_without_echo() {
+        let cli = parse_ok(&["oath", "add"]);
+        let mut stdin = Cursor::new("");
+        let mut prompt = |_: &str| Ok(OTPAUTH.to_string());
+        assert_eq!(
+            acquire_otpauth_uri(&cli, true, &mut stdin, &mut prompt).unwrap(),
+            OTPAUTH
+        );
+    }
+
+    #[test]
+    fn oath_add_rejects_a_positional_uri_without_echo() {
+        let error = run(["oath".to_string(), "add".to_string(), OTPAUTH.to_string()]).unwrap_err();
+        assert!(error.contains("positional"), "{error}");
+        assert!(!error.contains("JBSWY3DPEHPK3PXP"), "{error}");
+        assert!(!error.contains(OTPAUTH), "{error}");
+    }
+
+    #[test]
+    fn unknown_oath_subcommand_does_not_echo_the_value() {
+        let sentinel = "S3NT1NELzz";
+        let error = run(["oath".to_string(), sentinel.to_string()]).unwrap_err();
+        assert!(error.contains("unknown oath subcommand"), "{error}");
+        assert!(!error.contains(sentinel), "{error}");
+    }
+
+    #[test]
+    fn oath_code_and_delete_require_exactly_one_name() {
+        for subcommand in ["code", "delete"] {
+            let error = run(["oath".to_string(), subcommand.to_string()]).unwrap_err();
+            assert!(error.contains("exactly one"), "{error}");
+        }
+    }
+
+    #[test]
+    fn oath_list_rejects_extra_positionals_without_echo() {
+        let sentinel = "S3NT1NELzz";
+        let error =
+            run(["oath".to_string(), "list".to_string(), sentinel.to_string()]).unwrap_err();
+        assert!(error.contains("positional"), "{error}");
+        assert!(!error.contains(sentinel), "{error}");
+    }
 }
