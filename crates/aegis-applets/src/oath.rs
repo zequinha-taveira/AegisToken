@@ -942,6 +942,12 @@ mod tests {
         }
     }
 
+    fn test_key<const N: usize>(rng: &mut TestRng) -> [u8; N] {
+        let mut key = [0u8; N];
+        rng.fill_bytes(&mut key);
+        key
+    }
+
     fn applet_with<S: OathStore>(store: S) -> Oath<S> {
         let mut oath = Oath::new(store);
         assert_eq!(oath.select().sw, Sw::OK);
@@ -1517,7 +1523,7 @@ mod tests {
     fn reset_retries_successfully_after_the_store_recovers() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let key = rng.gen_array::<10>();
+        let key = test_key::<10>(&mut rng);
         let data = put_data(
             b"reset-me",
             TYPE_TOTP,
@@ -1566,10 +1572,7 @@ mod tests {
     fn failed_reset_leaves_the_persisted_state_reachable_from_a_reload() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let mut key = Vec::<u8, 10>::new();
-        for _ in 0..10 {
-            key.push(rng.next_u32() as u8).unwrap();
-        }
+        let key = test_key::<10>(&mut rng);
         let data = put_data(
             b"keep-me",
             TYPE_TOTP,
@@ -1852,7 +1855,7 @@ mod tests {
     fn failed_load_closes_the_applet_and_never_confirms_state_commands() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let key = rng.array::<10>();
+        let key = test_key::<10>(&mut rng);
         put_totp(&mut oath, &mut rng, b"30/closed");
         assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
         assert_eq!(oath.select().sw, Sw::OK);
@@ -1919,7 +1922,7 @@ mod tests {
     fn closed_applet_never_writes_or_overwrites_the_blob() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let key = rng.random::<[u8; 10]>();
+        let key = test_key::<10>(&mut rng);
         put_totp(&mut oath, &mut rng, b"30/keep");
         assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
         assert_eq!(oath.select().sw, Sw::OK);
@@ -1969,7 +1972,7 @@ mod tests {
     fn reset_stays_available_and_fail_closed_while_the_read_fails() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let key = rng.random::<[u8; 10]>();
+        let key = test_key::<10>(&mut rng);
         put_totp(&mut oath, &mut rng, b"30/reset");
         assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
         assert_eq!(oath.select().sw, Sw::OK);
@@ -2047,7 +2050,7 @@ mod tests {
     fn a_good_reselect_reopens_and_preserves_credentials_and_access_code() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let key = random_key::<10>(&mut rng);
+        let key = test_key::<10>(&mut rng);
         let name = b"30/persist";
         put_totp(&mut oath, &mut rng, name);
         assert_eq!(set_access_code(&mut oath, &mut rng, &key), Sw::OK);
@@ -2103,13 +2106,7 @@ mod tests {
     fn repeated_failed_loads_stay_closed_without_leaking_ram() {
         let mut oath = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         let mut rng = TestRng;
-        let mut key = Vec::<u8, 10>::new();
-        while key.len() < 10 {
-            let bytes = rng.next_u32().to_be_bytes();
-            let remaining = 10 - key.len();
-            let take = remaining.min(bytes.len());
-            key.extend_from_slice(&bytes[..take]).unwrap();
-        }
+        let key = test_key::<10>(&mut rng);
         put_totp(&mut oath, &mut rng, b"30/ram");
         assert_eq!(set_access_code(&mut oath, &mut rng, key.as_slice()), Sw::OK);
         assert_eq!(oath.select().sw, Sw::OK);
@@ -2452,7 +2449,7 @@ mod tests {
         let mut authed = applet_with(FailingOathStore::new(MemoryOathStore::new()));
         put_touch_totp(&mut authed, &mut rng, armed);
         put_totp(&mut authed, &mut rng, other);
-        let key = rng.bytes::<10>();
+        let key = test_key::<10>(&mut rng);
         assert_eq!(set_access_code(&mut authed, &mut rng, &key), Sw::OK);
         assert_eq!(authed.select().sw, Sw::OK);
         assert_eq!(validate_access_code(&mut authed, &mut rng, &key), Sw::OK);

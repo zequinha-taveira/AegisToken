@@ -11,8 +11,14 @@
 use super::*;
 use std::vec::Vec;
 
+/// Generate a deterministic session key for shared test fixtures.
+pub(crate) fn fixture_session_key() -> [u8; 16] {
+    let mut rng = super::TestRng(0x5EED);
+    session_key(&mut rng)
+}
+
 /// Generate a session key for fixture provisioning.
-pub(crate) fn session_key(rng: &mut impl rand_core::RngCore) -> [u8; 16] {
+pub(crate) fn session_key(rng: &mut impl aegis_core::authenticator::Rng) -> [u8; 16] {
     let mut key = [0u8; 16];
     rng.fill_bytes(&mut key);
     key
@@ -132,7 +138,7 @@ fn assert_never_leaks<S: OpenPgpStore>(
 }
 
 /// An applet with an ECDH P-256 decryption key whose RFC 6637 material wraps
-/// [`SESSION_KEY`] under the KEK the card itself derives: the card can unwrap
+/// generated fixture key under the KEK the card itself derives: the card can unwrap
 /// it. Returns the card point of the decryption key (the `86` DO of
 /// `GENERATE`) so tests build expected values independently of the applet.
 pub(crate) fn ecdh_p256_applet(seed: u64) -> (OpenPgp<MemoryOpenPgpStore>, TestRng, [u8; 65]) {
@@ -167,12 +173,13 @@ fn ecdh_p256_applet_over<S: OpenPgpStore>(store: S, seed: u64) -> (OpenPgp<S>, T
     .unwrap();
     let kek = ecdh::kdf(&param, shared.raw_secret_bytes().as_slice(), 16).unwrap();
 
-    let checksum = SESSION_KEY
+    let session_key = fixture_session_key();
+    let checksum = session_key
         .iter()
         .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
-    let mut m: heapless::Vec<u8, 64> = heapless::Vec::new();
-    m.push(7).unwrap();
-    m.extend_from_slice(&SESSION_KEY).unwrap();
+    let mut m = heapless::Vec::<u8, 64>::new();
+    m.push(7u8).unwrap();
+    m.extend_from_slice(&session_key).unwrap();
     m.extend_from_slice(&checksum.to_be_bytes()).unwrap();
     m.resize(24, 0x05).unwrap();
     let wrapped = ecdh::aes_key_wrap(&kek, &m).unwrap();
@@ -807,7 +814,7 @@ fn decipher_response_window_boundary_is_the_frozen_contract() {
         (2100usize, Sw::NOT_ENOUGH_MEMORY),
     ] {
         let data = vec![0x44u8; data_len];
-        let ciphertext = streamed_body(&SESSION_KEY, &data);
+        let ciphertext = streamed_body(&fixture_session_key(), &data);
         assert!(
             ciphertext.len() <= pgp_sym::MAX_DATA,
             "the size refusal beyond the stream limit is the separate closed contract"
@@ -846,7 +853,7 @@ fn decipher_response_window_boundary_is_the_frozen_contract() {
             );
             // A small decipher on the same slot rounds the boundary refusal.
             let small = vec![0x11u8; 256];
-            let ciphertext = streamed_body(&SESSION_KEY, &small);
+            let ciphertext = streamed_body(&fixture_session_key(), &small);
             let command = point_command(&ephemeral_point, Some(&ciphertext));
             let (plain, sw) = run(
                 &mut applet,

@@ -2249,6 +2249,7 @@ mod tests {
         )
         .unwrap();
         let kek = ecdh::kdf(&param, shared.raw_secret_bytes().as_slice(), 16).unwrap();
+        let session_key = adversarial_apdu::session_key(&mut rng);
         let checksum = session_key
             .iter()
             .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
@@ -2620,7 +2621,7 @@ mod tests {
         .unwrap();
         let kek = ecdh::kdf(&param, shared.raw_secret_bytes().as_slice(), 16).unwrap();
 
-        let session_key = [0x2Bu8; 16];
+        let session_key = adversarial_apdu::session_key(&mut rng);
         let checksum = session_key
             .iter()
             .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));

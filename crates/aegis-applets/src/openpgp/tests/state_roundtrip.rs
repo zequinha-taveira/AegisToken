@@ -5,7 +5,7 @@
 //! blob written before the repair keeps decoding with no version bump.
 
 use super::adversarial_apdu::{
-    SESSION_KEY, ecdh_p256_applet, fixture_ephemeral_point, point_command, streamed_body,
+    ecdh_p256_applet, fixture_ephemeral_point, fixture_session_key, point_command, streamed_body,
 };
 use super::*;
 use std::vec::Vec;
@@ -225,7 +225,7 @@ fn decipher_after_reboot_returns_the_plaintext_with_the_persisted_pin() {
     let ciphertext;
     {
         let (mut applet, _) = provisioned_applet(9);
-        ciphertext = streamed_body(&SESSION_KEY, &plaintext);
+        ciphertext = streamed_body(&fixture_session_key(), &plaintext);
         store = core::mem::take(applet.store_mut());
     }
     let mut rng = TestRng(10);

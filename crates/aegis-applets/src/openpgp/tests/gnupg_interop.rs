@@ -6,8 +6,8 @@
 //! exercised against a real implementation: the KDF parameters, the KDF, the
 //! AES key wrap and the OpenPGP symmetric layer.
 //!
-//! The test is skipped when GnuPG is not installed. Set `AEGIS_GPG` to point
-//! at the executable (the CI job installs `gnupg`).
+//! The test is skipped when GnuPG is not installed or only emits AEAD packets,
+//! which the applet does not support yet. Set `AEGIS_GPG` to select the binary.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -218,6 +218,7 @@ fn gnupg_encrypts_and_the_card_decrypts() {
     let output = run_gpg(
         &home,
         &[
+            "--rfc4880",
             "--quick-generate-key",
             "AegisToken Interop <interop@aegistoken.local>",
             "default",
@@ -297,6 +298,8 @@ fn gnupg_encrypts_and_the_card_decrypts() {
     let output = run_gpg(
         &home,
         &[
+            "--rfc4880",
+            "--force-mdc",
             "--trust-model",
             "always",
             "--compress-algo",
@@ -338,9 +341,24 @@ fn gnupg_encrypts_and_the_card_decrypts() {
             _ => {}
         }
     }
+    if ciphertext.is_empty()
+        && walk_packets(&encrypted)
+            .iter()
+            .any(|packet| packet.tag == 20)
+    {
+        eprintln!("GnuPG selected AEAD (tag 20), which the applet does not support: skipping");
+        return;
+    }
     assert_eq!(ephemeral.len(), 65, "the ephemeral key is a point");
     assert!(!wrapped.is_empty(), "the session key is wrapped");
-    assert!(!ciphertext.is_empty(), "the data is encrypted");
+    assert!(
+        !ciphertext.is_empty(),
+        "the data is encrypted; GnuPG packet tags: {:?}",
+        walk_packets(&encrypted)
+            .iter()
+            .map(|packet| packet.tag)
+            .collect::<Vec<_>>()
+    );
 
     // --- The card decrypts --------------------------------------------------
     let mut rng = TestRng(1);

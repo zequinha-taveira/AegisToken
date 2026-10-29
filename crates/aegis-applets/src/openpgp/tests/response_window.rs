@@ -26,7 +26,7 @@ use crate::ccid::{
 use crate::router::Applet;
 
 use super::adversarial_apdu::{
-    EPHEMERAL_SCALAR, SESSION_KEY, fixture_ephemeral_point, point_command, streamed_body,
+    EPHEMERAL_SCALAR, fixture_ephemeral_point, fixture_session_key, point_command, streamed_body,
 };
 use super::*;
 
@@ -179,12 +179,13 @@ fn transport_ceiling_of_the_full_decipher_is_the_ccid_input() {
     .unwrap();
     let kek = ecdh::kdf(&param, shared.raw_secret_bytes().as_slice(), 16).unwrap();
 
-    let checksum = SESSION_KEY
+    let session_key = fixture_session_key();
+    let checksum = session_key
         .iter()
         .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
     let mut m = heapless::Vec::<u8, 64>::new();
-    m.push(7).unwrap();
-    m.extend_from_slice(&SESSION_KEY).unwrap();
+    m.push(7u8).unwrap();
+    m.extend_from_slice(&session_key).unwrap();
     m.extend_from_slice(&checksum.to_be_bytes()).unwrap();
     m.resize(24, 0x05).unwrap();
     let wrapped = ecdh::aes_key_wrap(&kek, &m).unwrap();
@@ -226,7 +227,7 @@ fn transport_ceiling_of_the_full_decipher_is_the_ccid_input() {
     );
 
     let boundary_message = vec![0x44u8; ceiling];
-    let cipher = streamed_body(&SESSION_KEY, &boundary_message);
+    let cipher = streamed_body(&fixture_session_key(), &boundary_message);
     assert_eq!(
         cipher.len(),
         boundary_message.len() + 40,
@@ -262,7 +263,7 @@ fn transport_ceiling_of_the_full_decipher_is_the_ccid_input() {
     // --- (ii) one octet of frame more: refused before the applet ------------
     let before_overflow = saves.get();
     let message = vec![0x44u8; ceiling + 1];
-    let cipher = streamed_body(&SESSION_KEY, &message);
+    let cipher = streamed_body(&fixture_session_key(), &message);
     let command = point_command(&fixture_ephemeral_point(), Some(&cipher));
     let frame = xfr_frame(10, &decipher_apdu(&command));
     assert_eq!(frame.len(), MAX_MESSAGE_BYTES + 1);
