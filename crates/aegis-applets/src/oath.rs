@@ -943,9 +943,11 @@ mod tests {
     }
 
     fn test_key<const N: usize>(rng: &mut TestRng) -> [u8; N] {
-        let mut key = [0u8; N];
-        rng.fill_bytes(&mut key);
-        key
+        core::array::from_fn(|_| {
+            let mut b = [0u8; 1];
+            rng.fill_bytes(&mut b);
+            b[0]
+        })
     }
 
     fn applet_with<S: OathStore>(store: S) -> Oath<S> {
