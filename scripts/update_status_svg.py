@@ -288,7 +288,7 @@ def main():
             sys.exit(1)
 
     STATUS_SVG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATUS_SVG_PATH.write_text(new_svg, encoding="utf-8")
+    STATUS_SVG_PATH.write_text(new_svg, encoding="utf-8", newline="\n")
     print(f"Sucesso: {STATUS_SVG_PATH} atualizado a partir de {STATUS_JSON_PATH}.")
 
 if __name__ == "__main__":
